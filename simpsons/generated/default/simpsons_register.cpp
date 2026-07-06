@@ -49,6 +49,8 @@ DECLARE_REX_FUNC(sub_82783F50);
 DECLARE_REX_FUNC(sub_8296B118);
 DECLARE_REX_FUNC(sub_82C42EB8);
 DECLARE_REX_FUNC(sub_82C462F0);
+DECLARE_REX_FUNC(sub_8297AEB0);
+DECLARE_REX_FUNC(sub_8297AEC8);
 
 
 
@@ -75030,6 +75032,8 @@ void simpsons_RegisterFunctions(rex::runtime::IModuleRegistrar* registrar) {
   registrar->SetFunction(0x8296B118, sub_8296B118);  // HAND PATCH
   registrar->SetFunction(0x82C42EB8, sub_82C42EB8);  // HAND PATCH
   registrar->SetFunction(0x82C462F0, sub_82C462F0);  // HAND PATCH
+  registrar->SetFunction(0x8297AEB0, sub_8297AEB0);  // HAND PATCH
+  registrar->SetFunction(0x8297AEC8, sub_8297AEC8);  // HAND PATCH
   registrar->SetFunction(0x82BE26D8, sub_82BE26D8);
   registrar->SetFunction(0x82BE2748, sub_82BE2748);
   registrar->SetFunction(0x82BE2860, sub_82BE2860);

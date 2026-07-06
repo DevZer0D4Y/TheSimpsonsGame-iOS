@@ -80865,6 +80865,8 @@ DECLARE_REX_FUNC(sub_82CB7858);
 DECLARE_REX_FUNC(sub_82CB7868);
 DECLARE_REX_FUNC(sub_82CB7918);
 DECLARE_REX_FUNC(sub_82CB7928);
+DECLARE_REX_FUNC(sub_8297AEB0);
+DECLARE_REX_FUNC(sub_8297AEC8);
 
 DEFINE_REX_FUNC(sub_82267E20) {
 	REX_FUNC_PROLOGUE();
@@ -514521,6 +514523,34 @@ loc_82CB7934:
 	ctx.lr = ctx.r12.u64;
 	// ld r31,-16(r1)
 	ctx.r31.u64 = REX_LOAD_U64(ctx.r1.u32 + -16);
+	// blr 
+	return;
+}
+
+// HAND PATCH: analyzer-missed vtable thunk at 0x8297AEB0, byte-identical to
+// sub_8297AE98: this-adjust by stored delta, tail call through stored
+// function pointer. Reached only via vtables (hit playing as Lisa).
+DEFINE_REX_FUNC(sub_8297AEB0) {
+	REX_FUNC_PROLOGUE();
+	// lwz r11,8(r3)
+	ctx.r11.u64 = REX_LOAD_U32(ctx.r3.u32 + 8);
+	// lwz r10,0(r3)
+	ctx.r10.u64 = REX_LOAD_U32(ctx.r3.u32 + 0);
+	// lwz r9,4(r3)
+	ctx.r9.u64 = REX_LOAD_U32(ctx.r3.u32 + 4);
+	// add r3,r11,r10
+	ctx.r3.u64 = ctx.r11.u64 + ctx.r10.u64;
+	// mtctr r9
+	ctx.ctr.u64 = ctx.r9.u64;
+	// bctr 
+	REX_CALL_INDIRECT_FUNC(ctx.ctr.u32);
+	return;
+}
+
+// HAND PATCH: analyzer-missed empty virtual at 0x8297AEC8 (single blr),
+// sibling in the same gap.
+DEFINE_REX_FUNC(sub_8297AEC8) {
+	REX_FUNC_PROLOGUE();
 	// blr 
 	return;
 }
