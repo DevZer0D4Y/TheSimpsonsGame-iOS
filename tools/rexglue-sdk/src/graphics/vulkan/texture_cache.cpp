@@ -1111,15 +1111,6 @@ uint32_t VulkanTextureCache::GetMaxHostTextureDepthOrArraySize(
 }
 
 std::unique_ptr<TextureCache::Texture> VulkanTextureCache::CreateTexture(TextureKey key) {
-  // HAND PATCH DIAGNOSTIC: log every large-texture creation (video frames
-  // are 320x240+ / 640x480+) with format and TILED flag -- hunting the
-  // green periodic-stripe corruption in videos (tiled/linear mismatch and
-  // wrong-size dcbz are the suspects; dcbz is fixed, this checks tiling).
-  if (key.GetWidth() >= 320 && key.GetHeight() >= 240) {
-    REXGPU_WARN("[BIGTEX] Create fmt={} base=0x{:08X} {}x{} pitch={} tiled={} packed_mips={}",
-                uint32_t(key.format), key.base_page << 12, key.GetWidth(), key.GetHeight(),
-                uint32_t(key.pitch), uint32_t(key.tiled), uint32_t(key.packed_mips));
-  }
   VkFormat formats[] = {VK_FORMAT_UNDEFINED, VK_FORMAT_UNDEFINED};
   const HostFormatPair& host_format = GetHostFormatPair(key);
   if (host_format.format_signed.format == VK_FORMAT_UNDEFINED) {

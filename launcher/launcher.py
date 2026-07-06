@@ -15,6 +15,7 @@ import http.server
 import json
 import os
 import platform
+import re
 import secrets
 import shutil
 import socket
@@ -223,8 +224,53 @@ def patch_skip_intro(enable):
     return True, f"{'skipped' if enable else 'restored'} {n} intro videos"
 
 
+def _toml_flag(key, default="false"):
+    if not GAME_TOML.exists():
+        return default
+    m = re.search(rf"^{key}\s*=\s*(\S+)", GAME_TOML.read_text(), re.M)
+    return m.group(1) if m else default
+
+
+def patch_instant_popin_state():
+    return "on" if _toml_flag("gpu_allow_invalid_fetch_constants") == "true" else "off"
+
+
+def patch_instant_popin(enable):
+    """Community fix for characters/props loading in late (they exist on the
+    disc with 'invalid' vertex descriptors; real hardware drew them anyway --
+    xenia-project/game-compatibility#542). Trade-off on Steam Deck: rarely, a
+    level load can hand the GPU garbage and hang it, so a shader runaway cap
+    is enabled alongside as a guardrail. If a level load freezes, turn this
+    patch off."""
+    if not GAME_TOML.exists():
+        return False, "game config not found"
+    text = GAME_TOML.read_text()
+    subs = [
+        (r"^gpu_allow_invalid_fetch_constants\s*=.*$",
+         f"gpu_allow_invalid_fetch_constants = {'true' if enable else 'false'}"),
+        (r"^gpu_shader_max_cf_iterations\s*=.*$",
+         f"gpu_shader_max_cf_iterations = {'4096' if enable else '0'}"),
+    ]
+    for pat, rep in subs:
+        if not re.search(pat, text, re.M):
+            return False, "config keys missing - reinstall/repair first"
+        text = re.sub(pat, rep, text, flags=re.M)
+    GAME_TOML.write_text(text)
+    # the runaway cap is baked into translated shaders - force a rebuild
+    shutil.rmtree(USER_DATA / "cache", ignore_errors=True)
+    return True, ("instant pop-in ON (shader cache rebuilds on next launch)"
+                  if enable else "instant pop-in OFF (maximum stability)")
+
+
 def patches_list():
     return [
+        {"id": "instant_popin", "name": "Instant character pop-in (community fix)",
+         "desc": "Characters/props appear immediately instead of loading in late. "
+                 "Same fix Xenia players use for this game. Steam Deck caution: "
+                 "rare level-load freezes possible - if that happens, switch this "
+                 "off and relaunch. First launch after toggling rebuilds shaders "
+                 "(brief stutter).",
+         "state": patch_instant_popin_state(), "available": GAME_TOML.exists()},
         {"id": "skip_intro", "name": "Skip intro logo videos",
          "desc": "Boots straight past the EA / Fox / Gracie logo movies.",
          "state": patch_skip_intro_state(), "available": patch_skip_intro_state() != "unavailable"},
@@ -643,9 +689,6 @@ def launch_game():
         # "device lost" on level load -- the 2026-07-05 crash saga). Hard-disable
         # it for the game regardless of the user's global LS settings.
         env["DISABLE_LSFG"] = "1"
-        # TEMP diagnostics: write a RADV GPU hang dump (~/radv_dumps_*) if the
-        # level-load device-loss reproduces on the clean environment
-        env["RADV_DEBUG"] = "hang"  # capture a driver dump if the GPU ever hangs
         libs = [str(_resolve(d)) for d in CONFIG["lib_dirs"].get(PLAT, [])]
         if libs:
             env["LD_LIBRARY_PATH"] = ":".join(libs) + ":" + env.get("LD_LIBRARY_PATH", "")
@@ -786,6 +829,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if path == "/api/patch":
             if body.get("id") == "skip_intro":
                 ok, msg = patch_skip_intro(bool(body.get("enable")))
+                return self._send(200, {"ok": ok, "msg": msg})
+            if body.get("id") == "instant_popin":
+                if game_running_pids():
+                    return self._send(200, {"ok": False, "msg": "close the game first"})
+                ok, msg = patch_instant_popin(bool(body.get("enable")))
                 return self._send(200, {"ok": ok, "msg": msg})
             return self._send(404, {"ok": False, "msg": "unknown patch"})
         if path == "/api/check-updates":

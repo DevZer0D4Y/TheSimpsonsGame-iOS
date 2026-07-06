@@ -18015,25 +18015,14 @@ DEFINE_REX_FUNC(sub_82844398) {
 	ctx.r4.u64 = REX_LOAD_U32(ctx.r1.u32 + 484);
 	// mtctr r11
 	ctx.ctr.u64 = ctx.r11.u64;
-	// HAND PATCH DIAGNOSTIC: this is luaD_rawrunprotected's protected call
-	// (setjmp above via sub_82A43E50, longjmp target). Log the protected
-	// function and its completion status to see whether Lua state init
-	// (f_luaopen) runs and how it exits.
-	fprintf(stderr, "[HANDPATCH-PCALL] rawrunprotected: L=0x%08x f=0x%08x calling...\n",
-	        ctx.r31.u32, ctx.r11.u32);
-	fflush(stderr);
 	// bctrl
 	ctx.lr = 0x828443F8;
 	REX_CALL_INDIRECT_FUNC(ctx.ctr.u32);
-	fprintf(stderr, "[HANDPATCH-PCALL] rawrunprotected: f returned normally\n");
-	fflush(stderr);
 loc_828443F8:
 	// lwz r11,80(r1)
 	ctx.r11.u64 = REX_LOAD_U32(ctx.r1.u32 + 80);
 	// lwz r3,416(r1)
 	ctx.r3.u64 = REX_LOAD_U32(ctx.r1.u32 + 416);
-	fprintf(stderr, "[HANDPATCH-PCALL] rawrunprotected: status=%d\n", ctx.r3.s32);
-	fflush(stderr);
 	// stw r11,80(r31)
 	REX_STORE_U32(ctx.r31.u32 + 80, ctx.r11.u32);
 	// addi r1,r1,448
