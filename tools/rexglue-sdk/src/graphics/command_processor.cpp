@@ -9,6 +9,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <atomic>
 #include <algorithm>
 #include <cinttypes>
 #include <cmath>
@@ -1526,17 +1527,26 @@ bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32
       draw_succeeded = IssueDraw(vgt_draw_initiator.prim_type, vgt_draw_initiator.num_indices,
                                  is_indexed ? &index_buffer_info : nullptr, major_mode_explicit);
       if (!draw_succeeded) {
-        auto vgt_output_path_cntl = register_file_->Get<reg::VGT_OUTPUT_PATH_CNTL>();
-        auto vgt_hos_cntl = register_file_->Get<reg::VGT_HOS_CNTL>();
-        auto rb_modecontrol = register_file_->Get<reg::RB_MODECONTROL>();
-        REXGPU_ERROR(
-            "{}({}, {}, {}): Failed in backend "
-            "(major_mode={}, explicit_major={}, path_select={}, tess_mode={}, edram_mode={})",
-            opcode_name, static_cast<uint32_t>(vgt_draw_initiator.num_indices),
-            uint32_t(vgt_draw_initiator.prim_type), uint32_t(vgt_draw_initiator.source_select),
-            uint32_t(vgt_draw_initiator.major_mode), uint32_t(major_mode_explicit),
-            uint32_t(vgt_output_path_cntl.path_select), uint32_t(vgt_hos_cntl.tess_mode),
-            uint32_t(rb_modecontrol.edram_mode));
+        // HAND PATCH: rate-limit this log. This game rejects hundreds of draws
+        // per frame while streaming (invalid vertex fetch constants during
+        // entity load), producing tens of thousands of identical lines in
+        // seconds -- enough I/O to rotate away the useful log context.
+        static std::atomic<uint64_t> draw_failed_count{0};
+        uint64_t n = draw_failed_count.fetch_add(1, std::memory_order_relaxed);
+        if (n < 20 || (n & 1023) == 0) {
+          auto vgt_output_path_cntl = register_file_->Get<reg::VGT_OUTPUT_PATH_CNTL>();
+          auto vgt_hos_cntl = register_file_->Get<reg::VGT_HOS_CNTL>();
+          auto rb_modecontrol = register_file_->Get<reg::RB_MODECONTROL>();
+          REXGPU_ERROR(
+              "{}({}, {}, {}): Failed in backend "
+              "(major_mode={}, explicit_major={}, path_select={}, tess_mode={}, edram_mode={}) "
+              "[occurrence {}; rate-limited]",
+              opcode_name, static_cast<uint32_t>(vgt_draw_initiator.num_indices),
+              uint32_t(vgt_draw_initiator.prim_type), uint32_t(vgt_draw_initiator.source_select),
+              uint32_t(vgt_draw_initiator.major_mode), uint32_t(major_mode_explicit),
+              uint32_t(vgt_output_path_cntl.path_select), uint32_t(vgt_hos_cntl.tess_mode),
+              uint32_t(rb_modecontrol.edram_mode), n + 1);
+        }
       }
     }
   }
