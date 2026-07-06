@@ -697,8 +697,13 @@ def launch_game():
         # it for the game regardless of the user's global LS settings.
         env["DISABLE_LSFG"] = "1"
         if patch_instant_popin_state() == "on":
-            # experimental patch active: capture a driver hang dump for forensics
-            env["RADV_DEBUG"] = "hang"
+            # experimental patch active: capture a driver hang dump for
+            # forensics, and disable the driver's NGG-culling fast path -- the
+            # remaining wedge executes the big skinned-character vertex
+            # shaders and stalls pixel waves waiting on their outputs (a
+            # parameter-cache deadlock signature); nonggc removes the culling
+            # variant of exactly those shaders.
+            env["RADV_DEBUG"] = "hang,nonggc"
         libs = [str(_resolve(d)) for d in CONFIG["lib_dirs"].get(PLAT, [])]
         if libs:
             env["LD_LIBRARY_PATH"] = ":".join(libs) + ":" + env.get("LD_LIBRARY_PATH", "")
