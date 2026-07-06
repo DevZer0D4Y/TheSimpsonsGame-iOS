@@ -2818,16 +2818,34 @@ spv::Id SpirvShaderTranslator::SanitizeVertexPosition(spv::Id position) {
   if (!REXCVAR_GET(gpu_sanitize_vertex_position)) {
     return position;
   }
+  // A position is poison if any component is non-finite OR if w == 0. The
+  // (0,0,0,0) case is the worst: it passes homogeneous clipping (|0| <= 0 on
+  // every plane) and then hits 0/0 in the fixed-function perspective divide --
+  // NaN screen coordinates reach the scan converter, whose edge walk never
+  // converges on VanGogh (pixel pipe wedges at the next PS_PARTIAL_FLUSH).
+  // This game's skinning shaders produce exactly (0,0,0,0) while an entity's
+  // vertex streams are still null during level streaming.
   spv::Id type_bool4 = type_bool_vectors_[3];
   spv::Id is_nan = builder_->createUnaryOp(spv::OpIsNan, type_bool4, position);
   spv::Id is_inf = builder_->createUnaryOp(spv::OpIsInf, type_bool4, position);
   spv::Id non_finite = builder_->createBinOp(spv::OpLogicalOr, type_bool4, is_nan, is_inf);
-  spv::Id const_float_0 = builder_->makeFloatConstant(0.0f);
+  spv::Id any_non_finite = builder_->createUnaryOp(spv::OpAny, type_bool_, non_finite);
+  spv::Id position_w = builder_->createCompositeExtract(position, type_float_, 3);
+  spv::Id w_is_zero = builder_->createBinOp(spv::OpFOrdEqual, type_bool_, position_w,
+                                            builder_->makeFloatConstant(0.0f));
+  spv::Id poison =
+      builder_->createBinOp(spv::OpLogicalOr, type_bool_, any_non_finite, w_is_zero);
+  // Replacement: a point past the far plane (z > w), guaranteed to be clipped
+  // away entirely rather than rasterized as a degenerate.
   id_vector_temp_.clear();
-  id_vector_temp_.insert(id_vector_temp_.end(), 4, const_float_0);
-  spv::Id const_float4_0 = builder_->makeCompositeConstant(type_float4_, id_vector_temp_);
-  return builder_->createTriOp(spv::OpSelect, type_float4_, non_finite, const_float4_0,
-                               position);
+  id_vector_temp_.push_back(builder_->makeFloatConstant(0.0f));
+  id_vector_temp_.push_back(builder_->makeFloatConstant(0.0f));
+  id_vector_temp_.push_back(builder_->makeFloatConstant(2.0f));
+  id_vector_temp_.push_back(builder_->makeFloatConstant(1.0f));
+  spv::Id clipped_away = builder_->makeCompositeConstant(type_float4_, id_vector_temp_);
+  return builder_->createTriOp(
+      spv::OpSelect, type_float4_,
+      SpirvSmearScalarResultOrConstant(poison, type_bool4), clipped_away, position);
 }
 
 void SpirvShaderTranslator::StartFragmentShaderBeforeMain() {
