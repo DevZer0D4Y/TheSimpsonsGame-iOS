@@ -4030,6 +4030,33 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
                            vfetch_constant.size != 0 &&
                            (uint64_t(vfetch_constant.size) << 2) <= (64u << 20);
           bool null_stream = vfetch_constant.address == 0 && vfetch_constant.size == 0;
+          // A null stream is only safe when it is a SECONDARY binding
+          // (stride 0 -- e.g. this game's absent blend-shape streams, which
+          // the shader skips via a dynamic branch and never actually reads).
+          // A null MAIN stream (stride > 0) means the entity is still
+          // streaming in: all-zero vertex data collapses skinned positions to
+          // (0,0,0,0)-class geometry whose pixel work wedges the GPU. Keep
+          // vetoing those draws -- that is a few frames of genuine loading,
+          // not the permanent pop-in.
+          if (null_stream) {
+            for (const Shader::VertexBinding& vfetch_binding : vertex_shader->vertex_bindings()) {
+              if (vfetch_binding.fetch_constant == vfetch_index) {
+                if (vfetch_binding.stride_words != 0) {
+                  null_stream = false;
+                  static std::atomic<uint32_t> null_main_logs{0};
+                  uint32_t null_main_n = null_main_logs.fetch_add(1, std::memory_order_relaxed);
+                  if (null_main_n < 16 || (null_main_n & 1023) == 0) {
+                    REXGPU_WARN(
+                        "[NULL-MAIN-STREAM] draw vetoed: slot={} stride_words={} vs={:016X} "
+                        "(entity still streaming; occurrence {})",
+                        vfetch_index, vfetch_binding.stride_words,
+                        vertex_shader->ucode_data_hash(), null_main_n + 1);
+                  }
+                }
+                break;
+              }
+            }
+          }
           if (REXCVAR_GET(gpu_allow_invalid_fetch_constants) && (plausible || null_stream)) {
             // HAND PATCH DIAGNOSTIC: characterize every allowed-invalid draw so
             // the poison ones (GPU overdraw storms at level load) can be told
