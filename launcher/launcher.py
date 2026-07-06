@@ -250,6 +250,11 @@ def patch_instant_popin(enable):
          f"gpu_allow_invalid_fetch_constants = {'true' if enable else 'false'}"),
         (r"^gpu_shader_max_cf_iterations\s*=.*$",
          f"gpu_shader_max_cf_iterations = {'4096' if enable else '0'}"),
+        # FSI/POPS pixel-ordered interlock deadlocked in the captured hang dump;
+        # run the simpler host render path while this patch is on (side effect:
+        # in-engine cutscenes may show static until the patch is turned off).
+        (r"^render_target_path_vulkan\s*=.*$",
+         f"render_target_path_vulkan = {'\"\"' if enable else '\"fsi\"'}"),
     ]
     for pat, rep in subs:
         if not re.search(pat, text, re.M):
@@ -265,11 +270,11 @@ def patch_instant_popin(enable):
 def patches_list():
     return [
         {"id": "instant_popin", "name": "Instant character pop-in (community fix)",
-         "desc": "Characters/props appear immediately instead of loading in late. "
-                 "Same fix Xenia players use for this game. Steam Deck caution: "
-                 "rare level-load freezes possible - if that happens, switch this "
-                 "off and relaunch. First launch after toggling rebuilds shaders "
-                 "(brief stutter).",
+         "desc": "EXPERIMENTAL. Characters/props appear immediately instead of "
+                 "loading in late (same fix Xenia players use). While enabled, "
+                 "in-engine cutscenes may show static, and a level load can still "
+                 "freeze the system - if it does, power off fully, turn this off, "
+                 "and relaunch. First launch after toggling rebuilds shaders.",
          "state": patch_instant_popin_state(), "available": GAME_TOML.exists()},
         {"id": "skip_intro", "name": "Skip intro logo videos",
          "desc": "Boots straight past the EA / Fox / Gracie logo movies.",
@@ -689,6 +694,9 @@ def launch_game():
         # "device lost" on level load -- the 2026-07-05 crash saga). Hard-disable
         # it for the game regardless of the user's global LS settings.
         env["DISABLE_LSFG"] = "1"
+        if patch_instant_popin_state() == "on":
+            # experimental patch active: capture a driver hang dump for forensics
+            env["RADV_DEBUG"] = "hang"
         libs = [str(_resolve(d)) for d in CONFIG["lib_dirs"].get(PLAT, [])]
         if libs:
             env["LD_LIBRARY_PATH"] = ":".join(libs) + ":" + env.get("LD_LIBRARY_PATH", "")
