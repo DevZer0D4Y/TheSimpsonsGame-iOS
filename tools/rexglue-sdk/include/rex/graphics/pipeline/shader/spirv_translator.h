@@ -636,6 +636,9 @@ class SpirvShaderTranslator : public ShaderTranslator {
   // replaces the value with +0 if the minimum of the two operands is 0. This
   // must be called with absolute values of operands - use GetAbsoluteOperand!
   spv::Id ZeroIfAnyOperandIsZero(spv::Id value, spv::Id operand_0_abs, spv::Id operand_1_abs);
+  // HAND PATCH: returns `position` with NaN/Inf components replaced by 0
+  // (cvar gpu_sanitize_vertex_position; see flags.cpp for the rationale).
+  spv::Id SanitizeVertexPosition(spv::Id position);
   // Conditionally discard the current fragment. Changes the build point.
   void KillPixel(spv::Id condition, uint8_t memexport_eM_potentially_written_before);
   // Return type is a rex::bit_count(result.GetUsedResultComponents())-component

@@ -2719,7 +2719,7 @@ void SpirvShaderTranslator::CompleteVertexOrTessEvalShaderInMain() {
       position = composite_construct_op->getResultId();
       builder_->getBuildPoint()->addInstruction(std::move(composite_construct_op));
     }
-    builder_->createStore(position, position_ptr);
+    builder_->createStore(SanitizeVertexPosition(position), position_ptr);
 
     // Write the point coordinates.
     if (output_point_coordinates_ != spv::NoResult) {
@@ -2803,8 +2803,31 @@ void SpirvShaderTranslator::CompleteVertexOrTessEvalShaderInMain() {
       position = composite_construct_op->getResultId();
       builder_->getBuildPoint()->addInstruction(std::move(composite_construct_op));
     }
-    builder_->createStore(position, position_ptr);
+    builder_->createStore(SanitizeVertexPosition(position), position_ptr);
   }
+}
+
+
+spv::Id SpirvShaderTranslator::SanitizeVertexPosition(spv::Id position) {
+  // HAND PATCH: neutralize non-finite clip-space positions. This game leaves
+  // optional vertex streams as null fetch constants while entities stream in;
+  // zero attribute data can reach 0/0 in skinning weight normalization,
+  // producing NaN positions. NaN primitives never drain from the VanGogh
+  // pixel pipeline (PS_PARTIAL_FLUSH stall -> device loss), while other
+  // GPUs/drivers discard them - so discard them explicitly here.
+  if (!REXCVAR_GET(gpu_sanitize_vertex_position)) {
+    return position;
+  }
+  spv::Id type_bool4 = type_bool_vectors_[3];
+  spv::Id is_nan = builder_->createUnaryOp(spv::OpIsNan, type_bool4, position);
+  spv::Id is_inf = builder_->createUnaryOp(spv::OpIsInf, type_bool4, position);
+  spv::Id non_finite = builder_->createBinOp(spv::OpLogicalOr, type_bool4, is_nan, is_inf);
+  spv::Id const_float_0 = builder_->makeFloatConstant(0.0f);
+  id_vector_temp_.clear();
+  id_vector_temp_.insert(id_vector_temp_.end(), 4, const_float_0);
+  spv::Id const_float4_0 = builder_->makeCompositeConstant(type_float4_, id_vector_temp_);
+  return builder_->createTriOp(spv::OpSelect, type_float4_, non_finite, const_float4_0,
+                               position);
 }
 
 void SpirvShaderTranslator::StartFragmentShaderBeforeMain() {

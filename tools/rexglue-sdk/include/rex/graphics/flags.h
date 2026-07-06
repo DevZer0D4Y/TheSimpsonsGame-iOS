@@ -86,6 +86,7 @@ REXCVAR_DECLARE(std::string, swap_post_effect);
 // invocation. See spirv_translator.cpp (var_main_cf_iteration_guard_) for how
 // this is enforced. 0 disables the guard.
 REXCVAR_DECLARE(int32_t, gpu_shader_max_cf_iterations);
+REXCVAR_DECLARE(bool, gpu_sanitize_vertex_position);
 
 // Vulkan
 REXCVAR_DECLARE(bool, vulkan_sparse_shared_memory);

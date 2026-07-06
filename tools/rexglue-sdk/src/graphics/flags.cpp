@@ -49,6 +49,13 @@ REXCVAR_DEFINE_INT32(gpu_shader_max_cf_iterations, 100000, "GPU",
                     "0 disables the guard.")
     .range(0, INT32_MAX);
 
+// HAND PATCH: replace non-finite vertex positions (NaN/Inf, e.g. from 0/0 in
+// skinning weight normalization when optional streams are null) with zeros in
+// translated vertex shaders. NaN primitives wedge the rasterizer on
+// RADV/VanGogh (pixel pipe never drains -> ring timeout).
+REXCVAR_DEFINE_BOOL(gpu_sanitize_vertex_position, true, "GPU",
+                    "Neutralize NaN/Inf vertex shader position outputs (degenerate instead).");
+
 bool IsGpuDebugMarkersEnabled() {
   static bool cached = false;
   static bool result = false;
