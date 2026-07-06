@@ -479,9 +479,9 @@ async function refresh(){
     $("#patchlist").innerHTML = (st.patches||[]).map(p => `
       <div class="patchrow">
         <div><b>${p.name}</b><div class="desc">${p.desc}</div></div>
-        ${p.id === "skip_intro"
-          ? `<button class="bigbtn ${p.state==="on"?"alt":""}" onclick="togglePatch('skip_intro', ${p.state!=="on"})">
-               ${p.state==="on" ? "ENABLED — CLICK TO RESTORE" : "ENABLE"}</button>`
+        ${p.available && (p.state === "on" || p.state === "off")
+          ? `<button class="bigbtn ${p.state==="on"?"alt":""}" onclick="togglePatch('${p.id}', ${p.state!=="on"})">
+               ${p.state==="on" ? "ENABLED — CLICK TO DISABLE" : "ENABLE"}</button>`
           : `<span class="muted">${p.state}</span>`}
       </div>`).join("");
   }catch(e){ $("#playstatus").textContent = "launcher backend unreachable"; }
