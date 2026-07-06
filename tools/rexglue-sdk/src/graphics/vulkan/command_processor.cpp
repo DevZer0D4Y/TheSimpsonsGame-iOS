@@ -56,6 +56,11 @@ REXCVAR_DEFINE_BOOL(vulkan_readback_memexport, false, "GPU/Vulkan",
                     "Read data written by memory export in shaders on the CPU")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+// HAND PATCH: sanity cap for per-draw synchronous memexport readbacks (see
+// the streaming-window readback skip in IssueDraw). 0 disables the cap.
+REXCVAR_DEFINE_INT32(gpu_memexport_readback_max_mb, 16, "GPU/Vulkan",
+                     "Maximum total memexport readback size per draw, in MB (0 = unlimited).");
+
 REXCVAR_DEFINE_BOOL(vulkan_async_skip_incomplete_frames, true, "GPU/Vulkan",
                     "When async shader compilation is enabled, skip presenting frames that "
                     "used placeholder pipelines to avoid visible flashing")
@@ -4201,11 +4206,49 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
 
   if (IsReadbackMemexportEnabled(REXCVAR_GET(vulkan_readback_memexport)) &&
       !memexport_ranges_.empty()) {
+    // HAND PATCH: readback safety for the invalid-fetch-constants compat mode.
+    // While an entity is still streaming in, this game's fetch constants
+    // (including memexport stream descriptors) are transiently stale: a stale
+    // stream that passes the eA signature checks can demand a huge synchronous
+    // readback mid-frame (queue drain + dedicated allocation + memcpy back to
+    // a stale guest address) -- observed as a multi-second GPU stall ending in
+    // a device loss on RADV/VanGogh, and guest memory corruption. Draws are
+    // only in that window when they reference kInvalidVertex constants, so:
+    //  - skip the readback for those draws (their export data is garbage for a
+    //    frame or two anyway; the CPU consumer sees the previous contents);
+    //  - regardless of the window, cap the total readback size per draw.
+    bool streaming_window = false;
+    if (REXCVAR_GET(gpu_allow_invalid_fetch_constants)) {
+      const Shader::ConstantRegisterMap& taint_map = vertex_shader->constant_register_map();
+      for (uint32_t i = 0; !streaming_window && i < rex::countof(taint_map.vertex_fetch_bitmap);
+           ++i) {
+        uint32_t taint_bits_remaining = taint_map.vertex_fetch_bitmap[i];
+        uint32_t j;
+        while (rex::bit_scan_forward(taint_bits_remaining, &j)) {
+          taint_bits_remaining &= ~(uint32_t(1) << j);
+          if (regs.GetVertexFetch(i * 32 + j).type == xenos::FetchConstantType::kInvalidVertex) {
+            streaming_window = true;
+            break;
+          }
+        }
+      }
+    }
     uint32_t memexport_total_size = 0;
     for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
       memexport_total_size += memexport_range.size_bytes;
     }
-    if (memexport_total_size) {
+    int32_t readback_max_mb = REXCVAR_GET(gpu_memexport_readback_max_mb);
+    bool readback_oversized =
+        readback_max_mb > 0 && memexport_total_size > (uint32_t(readback_max_mb) << 20);
+    if (streaming_window || readback_oversized) {
+      static std::atomic<uint32_t> readback_skip_logs{0};
+      uint32_t n = readback_skip_logs.fetch_add(1, std::memory_order_relaxed);
+      if (n < 8 || (n & 2047) == 0) {
+        REXGPU_WARN("Memexport readback skipped ({}; total size {} bytes, occurrence {})",
+                    streaming_window ? "fetch constants still streaming" : "oversized",
+                    memexport_total_size, n + 1);
+      }
+    } else if (memexport_total_size) {
       if (REXCVAR_GET(readback_memexport_fast)) {
         IssueDraw_MemexportReadbackFastPath(memexport_total_size);
       } else {

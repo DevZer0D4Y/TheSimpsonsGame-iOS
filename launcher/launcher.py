@@ -250,11 +250,6 @@ def patch_instant_popin(enable):
          f"gpu_allow_invalid_fetch_constants = {'true' if enable else 'false'}"),
         (r"^gpu_shader_max_cf_iterations\s*=.*$",
          f"gpu_shader_max_cf_iterations = {'4096' if enable else '0'}"),
-        # FSI/POPS pixel-ordered interlock deadlocked in the captured hang dump;
-        # run the simpler host render path while this patch is on (side effect:
-        # in-engine cutscenes may show static until the patch is turned off).
-        (r"^render_target_path_vulkan\s*=.*$",
-         f"render_target_path_vulkan = {'\"\"' if enable else '\"fsi\"'}"),
     ]
     for pat, rep in subs:
         if not re.search(pat, text, re.M):
@@ -270,11 +265,11 @@ def patch_instant_popin(enable):
 def patches_list():
     return [
         {"id": "instant_popin", "name": "Instant character pop-in (community fix)",
-         "desc": "EXPERIMENTAL. Characters/props appear immediately instead of "
-                 "loading in late (same fix Xenia players use). While enabled, "
-                 "in-engine cutscenes may show static, and a level load can still "
-                 "freeze the system - if it does, power off fully, turn this off, "
-                 "and relaunch. First launch after toggling rebuilds shaders.",
+         "desc": "Characters/props appear immediately instead of loading in "
+                 "late (same fix Xenia players use, plus engine guardrails for "
+                 "the Steam Deck). If a level load ever freezes: power off "
+                 "fully, turn this off, and relaunch. First launch after "
+                 "toggling rebuilds shaders (brief stutter).",
          "state": patch_instant_popin_state(), "available": GAME_TOML.exists()},
         {"id": "skip_intro", "name": "Skip intro logo videos",
          "desc": "Boots straight past the EA / Fox / Gracie logo movies.",
