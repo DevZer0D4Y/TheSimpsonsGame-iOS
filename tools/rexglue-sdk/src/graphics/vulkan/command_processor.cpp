@@ -4031,6 +4031,21 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
                            (uint64_t(vfetch_constant.size) << 2) <= (64u << 20);
           bool null_stream = vfetch_constant.address == 0 && vfetch_constant.size == 0;
           if (REXCVAR_GET(gpu_allow_invalid_fetch_constants) && (plausible || null_stream)) {
+            // HAND PATCH DIAGNOSTIC: characterize every allowed-invalid draw so
+            // the poison ones (GPU overdraw storms at level load) can be told
+            // apart from the benign pop-in draws (null optional streams).
+            static std::atomic<uint32_t> allowed_invalid_logs{0};
+            uint32_t log_n = allowed_invalid_logs.fetch_add(1, std::memory_order_relaxed);
+            if (log_n < 256 || (log_n & 255) == 0) {
+              REXGPU_WARN(
+                  "[INVALID-VFETCH-ALLOWED] slot={} dwords={:08X},{:08X} addr=0x{:08X} "
+                  "size_dw={} kind={} vs={:016X} ps={:016X} occurrence={}",
+                  vfetch_index, vfetch_constant.dword_0, vfetch_constant.dword_1,
+                  uint32_t(vfetch_constant.address) << 2, uint32_t(vfetch_constant.size),
+                  null_stream ? "null" : "plausible",
+                  vertex_shader->ucode_data_hash(),
+                  pixel_shader ? pixel_shader->ucode_data_hash() : 0, log_n + 1);
+            }
             break;
           }
           static std::atomic<uint32_t> invalid_vfetch_logs{0};
