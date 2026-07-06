@@ -1,0 +1,31 @@
+[iterate] waiting for codegen to finish...
+[iterate] codegen done. emitted cpp=92
+[iterate] building...
+[iterate] build exit=0 errors=0 exe=96726744
+[iterate] boot test (30s)...
+./iterate.sh: line 21:  3121 Aborted                    SDL_VIDEODRIVER=dummy timeout 30 ./simpsons --game_data_root $GR > boot2.log 2>&1
+[iterate] boot exit=134
+=== NEW FATAL (if any) ===
+[2026-06-30 07:28:01.516] [critical] [core] [t3148] [FATAL] Call to invalid or unregistered function at guest address 0x823F52B8
+=== boot progress tail ===
+[2026-06-30 07:28:00.313] [info] [sys] [t3135] XThread::Execute thid 1 (handle=F8000010, 'XMA Decoder (F8000010)', native=132256C0, <host>)
+[2026-06-30 07:28:00.314] [info] [sys] [t3122] Audio system initialized
+[2026-06-30 07:28:00.314] [info] [sys] [t3136] XThread::Execute thid 2 (handle=F8000014, 'Audio Worker (F8000014)', native=11E146C0, <host>)
+[2026-06-30 07:28:00.435] [info] [sys] [t3122]   Mounted /home/deck/simpsons-recomp/gamedata at \Device\Harddisk0\Partition1
+[2026-06-30 07:28:00.436] [info] [sys] [t3137] XThread::Execute thid 3 (handle=F8000018, 'GPU Commands (F8000018)', native=0BFFF6C0, <host>)
+[2026-06-30 07:28:00.437] [info] [sys] [t3122] GPU system initialized (presentation=true)
+[2026-06-30 07:28:00.437] [info] [sys] [t3122] Runtime initialized successfully
+[2026-06-30 07:28:00.437] [info] [sys] [t3138] XThread::Execute thid 4 (handle=F800001C, 'GPU VSync (F800001C)', native=0AFFE6C0, <host>)
+[2026-06-30 07:28:00.459] [info] [core] [t3122] Function table initialized for module: code=82230000-82CC3CE4, image=82000000-82EC0000
+[2026-06-30 07:28:00.602] [info] [gpu] [t3137] VulkanTextureCache: Format k_Cr_Y1_Cb_Y0_REP (unsigned) is supported via a fallback format (using the Vulkan format 37 instead of the preferred 1000156000)
+[2026-06-30 07:28:00.602] [info] [gpu] [t3137] VulkanTextureCache: Format k_Y1_Cr_Y0_Cb_REP (unsigned) is supported via a fallback format (using the Vulkan format 37 instead of the preferred 1000156001)
+[2026-06-30 07:28:01.300] [warning] [core] [t3122] SDL GameControllerDB: file 'gamecontrollerdb.txt' does not exist.
+[2026-06-30 07:28:01.300] [info] [core] [t3122] SDL input driver initialized successfully
+[2026-06-30 07:28:01.300] [info] [sys] [t3122] Loading XEX image: game:\default.xex
+[2026-06-30 07:28:01.457] [info] [sys] [t3145] XThread::Execute thid 5 (handle=F8000024, 'Kernel Dispatch (F8000024)', native=096886C0, <host>)
+[2026-06-30 07:28:01.478] [info] [core] [t3122] VulkanPresenter: Created 1280x752 swapchain with format 44, color space 0, presentation mode 0
+[2026-06-30 07:28:01.488] [info] [sys] [t3122] KernelState: Preparing module launch...
+[2026-06-30 07:28:01.490] [info] [core] [t3122] Initializing shader storage for title 45410809...
+[2026-06-30 07:28:01.509] [info] [gpu] [t3148] SetInterruptCallback(82456830, E3139380)
+[2026-06-30 07:28:01.516] [critical] [core] [t3148] [FATAL] Call to invalid or unregistered function at guest address 0x823F52B8
+[iterate] DONE

@@ -1,0 +1,623 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Simpsons Game — Recompiled</title>
+<style>
+  :root{
+    --yellow:#FFD90F; --yellow-dark:#F0B90B; --sky:#57B9E8; --sky-deep:#2E86C1;
+    --ink:#232629; --paper:#FFF9E3; --pink:#F06292; --green:#7CB342;
+    --card:#ffffff; --shadow:0 6px 0 rgba(0,0,0,.25);
+  }
+  *{box-sizing:border-box; margin:0; padding:0}
+  body{font-family:"Arial Black", Arial, sans-serif;
+    background:linear-gradient(180deg, var(--sky) 0%, #9AD9F5 55%, #CDEBFA 100%);
+    color:var(--ink); min-height:100vh; overflow-x:hidden;}
+  .cloud{position:fixed; background:#fff; border-radius:50px; opacity:.9; z-index:0;
+         animation:drift linear infinite;}
+  .cloud::before,.cloud::after{content:""; position:absolute; background:#fff; border-radius:50%}
+  .c1{width:140px;height:44px;top:70px;animation-duration:70s}
+  .c1::before{width:60px;height:60px;top:-28px;left:22px}
+  .c1::after{width:44px;height:44px;top:-18px;left:70px}
+  .c2{width:100px;height:34px;top:190px;animation-duration:95s;animation-delay:-30s}
+  .c2::before{width:44px;height:44px;top:-20px;left:16px}
+  .c2::after{width:34px;height:34px;top:-14px;left:52px}
+  .c3{width:170px;height:50px;top:330px;animation-duration:120s;animation-delay:-70s;opacity:.65}
+  .c3::before{width:70px;height:70px;top:-32px;left:28px}
+  .c3::after{width:50px;height:50px;top:-20px;left:88px}
+  @keyframes drift{from{left:-220px}to{left:110vw}}
+
+  .wrap{position:relative; z-index:1; max-width:1080px; margin:0 auto; padding:22px}
+  header{display:flex; align-items:center; gap:18px; margin-bottom:18px}
+  .donut{width:64px;height:64px;border-radius:50%;
+    background:radial-gradient(circle at 50% 50%, transparent 0 12px, #E8A33D 12px 15px, var(--pink) 15px 30px, #D5822B 30px 32px);
+    position:relative; flex:none; animation:spinSlow 14s linear infinite}
+  .donut i{position:absolute;width:7px;height:3px;border-radius:2px}
+  @keyframes spinSlow{to{transform:rotate(360deg)}}
+  h1{font-size:34px; letter-spacing:1px; color:var(--yellow);
+     text-shadow:3px 3px 0 var(--ink), -1px -1px 0 var(--ink), 1px -1px 0 var(--ink), -1px 1px 0 var(--ink);
+     transform:skew(-4deg); line-height:.95}
+  h1 small{display:block; font-size:14px; color:#fff; letter-spacing:6px}
+
+  nav{display:flex; gap:8px; margin-bottom:16px; flex-wrap:wrap}
+  nav button{font-family:inherit; font-size:15px; border:3px solid var(--ink); border-radius:12px;
+    background:var(--paper); padding:10px 20px; cursor:pointer; box-shadow:var(--shadow);
+    transition:transform .06s;}
+  nav button:hover{transform:translateY(-2px)}
+  nav button.active{background:var(--yellow)}
+
+  .card{background:var(--card); border:3px solid var(--ink); border-radius:16px;
+        box-shadow:var(--shadow); padding:20px; margin-bottom:16px}
+  h2{font-size:20px; margin-bottom:14px; transform:skew(-3deg)}
+  h3{font-size:15px; margin:16px 0 10px; color:var(--sky-deep)}
+
+  .hero{position:relative; border:3px solid var(--ink); border-radius:16px; overflow:hidden;
+        height:330px; box-shadow:var(--shadow); background:#111}
+  .hero img{width:100%; height:100%; object-fit:cover; display:block; transition:opacity .8s}
+  .hero .scrim{position:absolute; inset:0;
+       background:linear-gradient(180deg, transparent 40%, rgba(0,0,0,.75))}
+  .hero .inner{position:absolute; left:24px; right:24px; bottom:20px; display:flex;
+       align-items:flex-end; justify-content:space-between; gap:14px}
+  .playbtn{font-family:inherit; font-size:26px; padding:16px 44px; border-radius:16px;
+    border:4px solid var(--ink); background:var(--yellow); cursor:pointer;
+    box-shadow:0 8px 0 rgba(0,0,0,.35); letter-spacing:2px;}
+  .playbtn:hover{background:var(--yellow-dark)}
+  .playbtn:disabled{background:#bbb; cursor:not-allowed}
+  .stopbtn{font-family:inherit; font-size:14px; padding:10px 18px; border-radius:12px;
+    border:3px solid var(--ink); background:#ff7043; cursor:pointer; box-shadow:var(--shadow)}
+  .statusline{color:#fff; font-family:Arial; font-weight:bold; font-size:14px;
+    text-shadow:1px 1px 2px #000}
+  .banner{display:flex; gap:10px; align-items:center; background:var(--yellow);
+    border:3px solid var(--ink); border-radius:12px; padding:10px 14px; margin-top:14px;
+    font-family:Arial; font-weight:bold; font-size:14px; box-shadow:var(--shadow)}
+  .banner.kbm{background:#C5E1A5}
+  .banner .em{font-size:22px}
+  .badges{display:flex; gap:10px; margin-top:14px; flex-wrap:wrap}
+  .badge{font-family:Arial; font-weight:bold; font-size:13px; border:3px solid var(--ink);
+    padding:7px 14px; border-radius:999px; background:#eee; box-shadow:var(--shadow)}
+  .badge.ready{background:var(--green); color:#fff}
+  .badge .dot{display:inline-block;width:9px;height:9px;border-radius:50%;
+    background:rgba(255,255,255,.9); margin-right:7px}
+
+  .grid{display:grid; grid-template-columns:1fr 1fr; gap:14px}
+  .field{font-family:Arial; font-weight:bold; font-size:14px}
+  .field label{display:block; margin-bottom:6px}
+  .field select,.field input[type=text],.field input[type=number]{
+    width:100%; font-family:Arial; font-weight:bold; font-size:14px; padding:9px 10px;
+    border:3px solid var(--ink); border-radius:10px; background:var(--paper)}
+  .field .hint{font-weight:normal; color:#666; font-size:12px; margin-top:4px}
+  .field input[type=range]{width:100%}
+  .switch{display:flex; align-items:center; gap:10px; cursor:pointer; user-select:none}
+  .switch input{width:22px;height:22px; accent-color:var(--sky-deep)}
+  .savebtn{margin-top:16px; font-family:inherit; font-size:16px; padding:12px 30px;
+    border-radius:12px; border:3px solid var(--ink); background:var(--green); color:#fff;
+    cursor:pointer; box-shadow:var(--shadow)}
+  .saved{color:var(--green); font-family:Arial; font-weight:bold; margin-left:12px}
+  .warn{background:#FFF3CD; border:3px solid var(--ink); border-radius:10px; padding:10px 12px;
+    font-family:Arial; font-size:13px; margin-top:10px}
+
+  .console{background:#181c20; color:#c6e2ff; font:12px/1.5 monospace; border-radius:10px;
+    border:3px solid var(--ink); padding:12px; height:200px; overflow-y:auto;
+    white-space:pre-wrap; word-break:break-all}
+  .row{display:flex; gap:10px; align-items:center}
+  .row input[type=text]{flex:1}
+  .bigbtn{font-family:inherit; font-size:15px; padding:11px 22px; border-radius:12px;
+    border:3px solid var(--ink); background:var(--sky-deep); color:#fff; cursor:pointer;
+    box-shadow:var(--shadow); white-space:nowrap}
+  .bigbtn.alt{background:var(--pink)}
+  .bigbtn:disabled{background:#999; cursor:not-allowed}
+  .smallbtn{font-family:Arial; font-weight:bold; font-size:12px; padding:6px 12px;
+    border-radius:9px; border:2px solid var(--ink); background:var(--paper); cursor:pointer}
+  .ok{color:var(--green)} .err{color:#e53935}
+  .muted{font-family:Arial; color:#555; font-size:14px; line-height:1.6}
+  .lockart{font-size:64px; text-align:center; padding:26px 0 8px}
+  a{color:var(--sky-deep)}
+  .hidden{display:none}
+
+  table{width:100%; border-collapse:collapse; font-family:Arial; font-size:13px}
+  td,th{border-bottom:2px solid #eee; padding:8px 6px; text-align:left}
+
+  /* file browser modal */
+  .modal{position:fixed; inset:0; background:rgba(0,0,0,.55); z-index:50;
+    display:flex; align-items:center; justify-content:center}
+  .modal.hidden{display:none}
+  .modal .box{background:var(--card); border:4px solid var(--ink); border-radius:16px;
+    width:640px; max-width:92vw; max-height:80vh; display:flex; flex-direction:column;
+    box-shadow:0 12px 0 rgba(0,0,0,.3)}
+  .modal .head{padding:14px 18px; border-bottom:3px solid var(--ink);
+    display:flex; justify-content:space-between; align-items:center}
+  .modal .path{font-family:monospace; font-size:12px; color:#555; padding:6px 18px;
+    border-bottom:2px solid #eee; word-break:break-all}
+  .modal .list{overflow-y:auto; flex:1; padding:6px 0}
+  .modal .entry{padding:9px 18px; font-family:Arial; font-weight:bold; font-size:14px;
+    cursor:pointer; display:flex; justify-content:space-between}
+  .modal .entry:hover{background:var(--paper)}
+  .patchrow{display:flex; justify-content:space-between; align-items:center; gap:14px;
+    padding:12px 0; border-bottom:2px solid #eee; font-family:Arial}
+  .patchrow b{font-size:15px}
+  .patchrow .desc{font-size:13px; color:#555; font-weight:normal; margin-top:3px}
+</style>
+</head>
+<body>
+<div class="cloud c1"></div><div class="cloud c2"></div><div class="cloud c3"></div>
+<div class="wrap">
+  <header>
+    <div class="donut" id="donut"></div>
+    <h1>THE SIMPSONS GAME<small>R E C O M P I L E D</small></h1>
+  </header>
+
+  <nav>
+    <button data-tab="play" class="active">▶ PLAY</button>
+    <button data-tab="install">💿 INSTALL</button>
+    <button data-tab="settings">⚙ SETTINGS</button>
+    <button data-tab="patches">🩹 PATCHES</button>
+    <button data-tab="mods">🧩 MODS</button>
+    <button data-tab="about">ℹ ABOUT</button>
+  </nav>
+
+  <!-- ============================= PLAY ============================= -->
+  <section id="tab-play">
+    <div class="hero">
+      <img id="heroimg" alt="" src="">
+      <div class="scrim"></div>
+      <div class="inner">
+        <div class="statusline" id="playstatus">checking…</div>
+        <div style="display:flex; gap:10px; align-items:center">
+          <button class="stopbtn hidden" id="stopbtn">STOP</button>
+          <button class="playbtn" id="playbtn" disabled>PLAY</button>
+        </div>
+      </div>
+    </div>
+    <div class="banner" id="inputbanner">
+      <span class="em">🎮</span>
+      <span id="inputbannertext">A controller is currently <u>required</u> — keyboard &amp; mouse can be enabled in Settings → Input (experimental).</span>
+    </div>
+    <div class="badges" id="platformbadges"></div>
+    <div class="row" style="margin-top:14px">
+      <button class="bigbtn" id="steambtn">🎮 ADD TO STEAM (Gaming Mode)</button>
+      <span class="muted" id="steammsg"></span>
+    </div>
+    <div class="card" style="margin-top:16px">
+      <h2>GAME CONSOLE OUTPUT</h2>
+      <div class="console" id="gamelog">–</div>
+    </div>
+  </section>
+
+  <!-- ============================ INSTALL =========================== -->
+  <section id="tab-install" class="hidden">
+    <div class="card">
+      <h2>INSTALL FROM YOUR GAME DISC</h2>
+      <p class="muted" style="margin-bottom:12px">
+        This project ships <b>no copyrighted game files</b>. Provide an ISO of
+        <b>The Simpsons Game (Xbox&nbsp;360)</b> that you own — the launcher extracts your disc's
+        data and installs it next to the recompiled engine.
+      </p>
+      <div class="row">
+        <input type="text" id="isopath" placeholder="/path/to/Simpsons_Game.iso">
+        <button class="bigbtn alt" id="browsebtn">📂 BROWSE…</button>
+        <button class="bigbtn" id="installbtn">EXTRACT &amp; INSTALL</button>
+      </div>
+      <p class="muted" id="installstate" style="margin-top:10px"></p>
+      <div class="console" id="installlog" style="margin-top:10px">–</div>
+    </div>
+    <div class="card">
+      <h2>SAVE DATA</h2>
+      <div class="row">
+        <button class="bigbtn" id="backupbtn">💾 BACK UP SAVES</button>
+        <span class="muted" id="backupmsg"></span>
+      </div>
+      <table id="backuptable" style="margin-top:12px"></table>
+    </div>
+    <div class="card">
+      <h2>LAUNCHER ARTWORK</h2>
+      <p class="muted">Backgrounds are frame-grabs from the cutscenes in your installed copy.
+        <button class="smallbtn" id="regenart" style="margin-left:10px">REGENERATE</button>
+      </p>
+    </div>
+  </section>
+
+  <!-- =========================== SETTINGS =========================== -->
+  <section id="tab-settings" class="hidden">
+    <div class="card">
+      <h2>DISPLAY</h2>
+      <div class="grid">
+        <div class="field">
+          <label>Display mode</label>
+          <select id="s-fullscreen">
+            <option value="false">Windowed</option>
+            <option value="true">Fullscreen</option>
+          </select>
+        </div>
+        <div class="field">
+          <label>Resolution preset</label>
+          <select id="s-resolution">
+            <option value="">Automatic</option>
+            <option value="720p">720p</option>
+            <option value="1080p">1080p</option>
+            <option value="1440p">1440p</option>
+            <option value="4k">4K</option>
+          </select>
+          <div class="hint">⚠ Experimental — changes the game's internal video mode; can crash some scenes. Use Automatic if unstable. Restart needed.</div>
+        </div>
+        <div class="field">
+          <label class="switch"><input type="checkbox" id="s-vsync"> VSync</label>
+        </div>
+        <div class="field">
+          <label class="switch"><input type="checkbox" id="s-present_letterbox"> Letterbox non-native aspect ratios</label>
+        </div>
+      </div>
+      <h3>QUALITY</h3>
+      <div class="grid">
+        <div class="field">
+          <label>Render resolution scale</label>
+          <select id="s-resolution_scale">
+            <option value="1">1× — native (recommended on Steam Deck)</option>
+            <option value="2">2× — supersampled</option>
+            <option value="3">3× — supersampled (heavy)</option>
+          </select>
+        </div>
+        <div class="field">
+          <label>Anti-aliasing</label>
+          <select id="s-swap_post_effect">
+            <option value="none">Off</option>
+            <option value="fxaa">FXAA</option>
+            <option value="fxaa_extreme">FXAA Extreme</option>
+          </select>
+        </div>
+        <div class="field">
+          <label>Texture filtering (anisotropic)</label>
+          <select id="s-anisotropic_override">
+            <option value="0">Off</option>
+            <option value="2">2×</option>
+            <option value="3">4× (default)</option>
+            <option value="4">8×</option>
+            <option value="5">16×</option>
+          </select>
+        </div>
+      </div>
+      <h3>FRAMERATE</h3>
+      <div class="grid">
+        <div class="field">
+          <label>Refresh rate / FPS target</label>
+          <select id="s-video_mode_refresh_rate">
+            <option value="30">30 FPS — original console behavior</option>
+            <option value="60">60 FPS — smooth (default)</option>
+            <option value="90">90 FPS — experimental</option>
+            <option value="120">120 FPS — experimental</option>
+          </select>
+          <div class="hint">Above 60, game logic quirks may appear in some scenes. Restart needed.</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>INPUT</h2>
+      <div class="grid">
+        <div class="field">
+          <label class="switch"><input type="checkbox" id="s-mnk_mode"> Enable keyboard &amp; mouse (experimental)</label>
+          <div class="hint">Emulates a controller with keyboard + mouse. A real controller is still recommended.</div>
+        </div>
+        <div class="field">
+          <label>Mouse sensitivity: <span id="senslabel">1.0</span></label>
+          <input type="range" id="s-mnk_sensitivity" min="0.2" max="3" step="0.1" value="1">
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>GAME</h2>
+      <div class="grid">
+        <div class="field">
+          <label>Language</label>
+          <select id="s-user_language">
+            <option value="1">English</option>
+            <option value="2">日本語 (Japanese)</option>
+            <option value="3">Deutsch (German)</option>
+            <option value="4">Français (French)</option>
+            <option value="5">Español (Spanish)</option>
+            <option value="6">Italiano (Italian)</option>
+          </select>
+          <div class="hint">Only languages present on your disc will have translated assets.</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>AUDIO</h2>
+      <div class="grid">
+        <div class="field">
+          <label class="switch"><input type="checkbox" id="s-audio_mute"> Mute all audio</label>
+        </div>
+        <div class="field">
+          <label>Audio buffer</label>
+          <select id="s-audio_maxqframes">
+            <option value="16">Small — lowest latency</option>
+            <option value="32">Normal (recommended)</option>
+            <option value="64">Large — most stutter-resistant</option>
+          </select>
+        </div>
+      </div>
+    </div>
+    <button class="savebtn" id="savebtn">SAVE SETTINGS</button><span class="saved hidden" id="savedmark">✔ saved — restart the game for some changes</span>
+  </section>
+
+  <!-- ============================ PATCHES =========================== -->
+  <section id="tab-patches" class="hidden">
+    <div class="card">
+      <h2>GAME PATCHES</h2>
+      <p class="muted">One-click tweaks applied to your installed copy. Everything is reversible.</p>
+      <div id="patchlist"></div>
+    </div>
+  </section>
+
+  <!-- ============================= MODS ============================= -->
+  <section id="tab-mods" class="hidden">
+    <div class="card">
+      <div class="lockart">🔒🍩</div>
+      <h2 style="text-align:center">MODS — COMING SOON</h2>
+      <p class="muted" style="text-align:center">
+        A mod loader (texture packs, model swaps, gameplay tweaks) is planned.<br>
+        Drop files into <code>launcher/mods/</code> — they'll be listed here, ready for the loader.
+      </p>
+      <table id="modtable" style="margin-top:14px"></table>
+    </div>
+  </section>
+
+  <!-- ============================= ABOUT ============================ -->
+  <section id="tab-about" class="hidden">
+    <div class="card">
+      <h2>UPDATES</h2>
+      <div class="row">
+        <button class="bigbtn" id="updatebtn">🔄 CHECK FOR UPDATES</button>
+        <span class="muted" id="updatemsg"></span>
+      </div>
+    </div>
+    <div class="card">
+      <h2>ABOUT</h2>
+      <p class="muted">
+        <b>The Simpsons Game — Recompiled</b> <span id="verlabel"></span> — a fan-made static
+        recompilation of the Xbox&nbsp;360 game to a native executable.<br><br>
+        • You must own the original game; this project contains no game assets.<br>
+        • Platform status: <b>Linux / Steam Deck</b> playable today · <b>Windows</b> in development
+          (builds via CI once open-sourced) · <b>Android</b> planned.<br>
+        • Powered by the ReXGlue recompilation SDK (Xenia-derived GPU/kernel emulation).<br><br>
+        <span id="aboutgithub">Source code: GitHub link coming soon.</span>
+      </p>
+    </div>
+  </section>
+</div>
+
+<!-- file browser modal -->
+<div class="modal hidden" id="browsemodal">
+  <div class="box">
+    <div class="head"><b>Choose your game ISO</b>
+      <button class="smallbtn" id="browseclose">✕ CLOSE</button></div>
+    <div class="path" id="browsepath"></div>
+    <div class="list" id="browselist"></div>
+  </div>
+</div>
+
+<script>
+const TOKEN = "__TOKEN__";
+const $ = s => document.querySelector(s);
+const api = {
+  get: p => fetch(p).then(r => r.json()),
+  post: (p, body) => fetch(p, {method:"POST", headers:{"X-Token":TOKEN,"Content-Type":"application/json"},
+                              body: JSON.stringify(body||{})}).then(r => r.json()),
+};
+
+/* donut sprinkles */
+(() => {
+  const d = $("#donut"), colors = ["#fff","#57B9E8","#FFD90F","#7CB342","#8E24AA"];
+  for (let i=0;i<10;i++){
+    const s=document.createElement("i"), a=i/10*2*Math.PI, r=22;
+    s.style.left=(32+Math.cos(a)*r-4)+"px"; s.style.top=(32+Math.sin(a)*r-2)+"px";
+    s.style.background=colors[i%colors.length];
+    s.style.transform=`rotate(${(a*57+90)|0}deg)`; d.appendChild(s);
+  }
+})();
+
+/* tabs */
+document.querySelectorAll("nav button").forEach(b => b.onclick = () => {
+  document.querySelectorAll("nav button").forEach(x => x.classList.remove("active"));
+  b.classList.add("active");
+  document.querySelectorAll("section").forEach(s => s.classList.add("hidden"));
+  $("#tab-" + b.dataset.tab).classList.remove("hidden");
+});
+
+/* hero art rotation */
+let artList = [], artIdx = 0;
+setInterval(() => {
+  if (artList.length < 2) return;
+  artIdx = (artIdx + 1) % artList.length;
+  const img = $("#heroimg");
+  img.style.opacity = 0;
+  setTimeout(() => { img.src = "/art/" + artList[artIdx]; img.style.opacity = 1; }, 600);
+}, 9000);
+
+/* status polling */
+let lastStatus = null;
+async function refresh(){
+  try{
+    const st = await api.get("/api/status");
+    lastStatus = st;
+    artList = st.art || [];
+    const img = $("#heroimg");
+    if (artList.length && !img.src) img.src = "/art/" + artList[0];
+    const ready = st.engine_ready && st.gamedata_ready;
+    $("#playbtn").disabled = !ready || st.running;
+    $("#playbtn").textContent = st.running ? "RUNNING…" : "PLAY";
+    $("#stopbtn").classList.toggle("hidden", !st.running);
+    $("#playstatus").textContent = st.running ? "Game is running — have fun in Springfield!" :
+      ready ? `Ready to play · engine build ${st.engine_date} · launcher v${st.version}` :
+      !st.engine_ready ? "Engine binary missing — build the project first" :
+      "Game data not installed — open the INSTALL tab and use your ISO";
+    $("#platformbadges").innerHTML = st.platforms.map(p =>
+      `<span class="badge ${p.state==="ready"?"ready":""}"><span class="dot"></span>${p.name} — ${p.state.toUpperCase()}</span>`).join("");
+    $("#verlabel").textContent = "v" + st.version;
+    if (st.update && st.update.checked) $("#updatemsg").textContent = st.update.msg;
+    /* install progress */
+    const inst = st.install;
+    $("#installlog").textContent = (inst.log && inst.log.length) ? inst.log.join("\n") : "–";
+    $("#installlog").scrollTop = 1e9;
+    $("#installbtn").disabled = inst.running;
+    $("#installstate").innerHTML = inst.running ? "⏳ Working…" :
+      inst.ok === true ? '<span class="ok">✔ Installed successfully!</span>' :
+      inst.ok === false ? '<span class="err">✘ Install failed — see log below.</span>' :
+      st.gamedata_ready ? "Game data is installed. You can re-install over it from another ISO." :
+      "No game data found yet.";
+    /* backups */
+    $("#backuptable").innerHTML = (st.backups||[]).map(b =>
+      `<tr><td>${b.name}</td><td>${b.date}</td><td>${b.size_kb} KB</td>
+       <td><button class="smallbtn" onclick="restoreSave('${b.name}')">RESTORE</button></td></tr>`).join("") ||
+      "<tr><td class='muted'>No backups yet.</td></tr>";
+    /* mods */
+    $("#modtable").innerHTML = (st.mods||[]).map(m => `<tr><td>🧩 ${m}</td><td class="muted">waiting for mod loader</td></tr>`).join("") ||
+      "<tr><td class='muted'>No mod files found.</td></tr>";
+    /* patches */
+    $("#patchlist").innerHTML = (st.patches||[]).map(p => `
+      <div class="patchrow">
+        <div><b>${p.name}</b><div class="desc">${p.desc}</div></div>
+        ${p.id === "skip_intro"
+          ? `<button class="bigbtn ${p.state==="on"?"alt":""}" onclick="togglePatch('skip_intro', ${p.state!=="on"})">
+               ${p.state==="on" ? "ENABLED — CLICK TO RESTORE" : "ENABLE"}</button>`
+          : `<span class="muted">${p.state}</span>`}
+      </div>`).join("");
+  }catch(e){ $("#playstatus").textContent = "launcher backend unreachable"; }
+}
+setInterval(refresh, 2000); refresh();
+
+/* input banner reflects mnk setting */
+function updateBanner(mnk){
+  const b = $("#inputbanner"), t = $("#inputbannertext");
+  if (mnk){
+    b.classList.add("kbm");
+    t.innerHTML = "Keyboard &amp; mouse emulation is <u>enabled</u> (experimental). A controller also works.";
+  } else {
+    b.classList.remove("kbm");
+    t.innerHTML = "A controller is currently <u>required</u> — keyboard &amp; mouse can be enabled in Settings → Input (experimental).";
+  }
+}
+
+/* game log */
+setInterval(async () => {
+  if ($("#tab-play").classList.contains("hidden")) return;
+  const r = await api.get("/api/log").catch(()=>null);
+  if (r && r.lines){ const el=$("#gamelog"); el.textContent = r.lines.join("\n") || "–"; el.scrollTop = 1e9; }
+}, 3000);
+
+/* play / stop / steam */
+$("#playbtn").onclick = () => api.post("/api/launch").then(refresh);
+$("#stopbtn").onclick = () => api.post("/api/stop").then(refresh);
+$("#steambtn").onclick = async () => {
+  const r = await api.post("/api/add-to-steam");
+  $("#steammsg").textContent = r.msg;
+};
+
+/* install + browse modal */
+$("#installbtn").onclick = () => {
+  const iso = $("#isopath").value.trim();
+  if (!iso) { alert("Choose your ISO file first (BROWSE…)."); return; }
+  api.post("/api/install", {iso_path: iso}).then(refresh);
+};
+$("#regenart").onclick = () => api.post("/api/regen-art");
+function closeBrowse(){ $("#browsemodal").classList.add("hidden"); }
+$("#browsebtn").onclick = () => { $("#browsemodal").classList.remove("hidden"); loadBrowse("").catch(closeBrowse); };
+$("#browseclose").addEventListener("click", closeBrowse);
+$("#browsemodal").addEventListener("click", e => { if (e.target === $("#browsemodal")) closeBrowse(); });
+document.addEventListener("keydown", e => { if (e.key === "Escape") closeBrowse(); });
+async function loadBrowse(path){
+  const d = await api.get("/api/browse?path=" + encodeURIComponent(path));
+  $("#browsepath").textContent = d.path || "Choose a starting location";
+  const list = $("#browselist");
+  list.textContent = "";
+  const addEntry = (label, extra, fn) => {
+    const div = document.createElement("div");
+    div.className = "entry";
+    const s1 = document.createElement("span"); s1.textContent = label; div.appendChild(s1);
+    if (extra){ const s2 = document.createElement("span"); s2.className = "muted"; s2.textContent = extra; div.appendChild(s2); }
+    div.onclick = fn;
+    list.appendChild(div);
+  };
+  if (d.up !== null && d.path) addEntry("⬆ ..", "", () => loadBrowse(d.up));
+  for (const e of d.entries){
+    if (e.dir) addEntry("📁 " + e.name, "", () => loadBrowse(e.path));
+    else addEntry("💿 " + e.name, e.size_mb + " MB", () => pickIso(e.path));
+  }
+  if (!d.entries.length && !(d.up !== null && d.path)){
+    const div = document.createElement("div"); div.className = "entry muted";
+    div.textContent = "No folders or ISO files here."; list.appendChild(div);
+  }
+}
+function pickIso(p){ $("#isopath").value = p; closeBrowse(); }
+
+/* saves */
+$("#backupbtn").onclick = async () => {
+  const r = await api.post("/api/backup-saves");
+  $("#backupmsg").textContent = r.ok ? "✔ " + r.msg : r.msg;
+  refresh();
+};
+async function restoreSave(name){
+  if (!confirm("Restore this backup? Current saves will be overwritten.")) return;
+  const r = await api.post("/api/restore-saves", {name});
+  $("#backupmsg").textContent = r.ok ? "✔ restored" : r.msg;
+}
+
+/* patches */
+async function togglePatch(id, enable){
+  await api.post("/api/patch", {id, enable});
+  refresh();
+}
+
+/* updates */
+$("#updatebtn").onclick = async () => {
+  $("#updatemsg").textContent = "checking…";
+  await api.post("/api/check-updates");
+  setTimeout(refresh, 1500);
+};
+
+/* settings */
+async function loadSettings(){
+  const s = await api.get("/api/settings"); const v = s.values;
+  $("#s-fullscreen").value = String(v.fullscreen);
+  $("#s-resolution").value = v.resolution || "";
+  $("#s-vsync").checked = v.vsync;
+  $("#s-present_letterbox").checked = v.present_letterbox;
+  $("#s-resolution_scale").value = String(v.resolution_scale);
+  $("#s-swap_post_effect").value = v.swap_post_effect || "none";
+  $("#s-anisotropic_override").value = String(v.anisotropic_override);
+  $("#s-video_mode_refresh_rate").value = String(Math.round(v.video_mode_refresh_rate));
+  $("#s-mnk_mode").checked = v.mnk_mode;
+  $("#s-mnk_sensitivity").value = v.mnk_sensitivity;
+  $("#senslabel").textContent = Number(v.mnk_sensitivity).toFixed(1);
+  $("#s-user_language").value = String(v.user_language);
+  $("#s-audio_mute").checked = v.audio_mute;
+  $("#s-audio_maxqframes").value = String(v.audio_maxqframes);
+  updateBanner(v.mnk_mode);
+}
+loadSettings();
+$("#s-mnk_sensitivity").oninput = e => $("#senslabel").textContent = Number(e.target.value).toFixed(1);
+$("#savebtn").onclick = async () => {
+  await api.post("/api/settings", {values:{
+    fullscreen: $("#s-fullscreen").value === "true",
+    resolution: $("#s-resolution").value,
+    vsync: $("#s-vsync").checked,
+    present_letterbox: $("#s-present_letterbox").checked,
+    resolution_scale: Number($("#s-resolution_scale").value),
+    swap_post_effect: $("#s-swap_post_effect").value,
+    anisotropic_override: Number($("#s-anisotropic_override").value),
+    video_mode_refresh_rate: Number($("#s-video_mode_refresh_rate").value),
+    mnk_mode: $("#s-mnk_mode").checked,
+    mnk_sensitivity: Number($("#s-mnk_sensitivity").value),
+    user_language: Number($("#s-user_language").value),
+    audio_mute: $("#s-audio_mute").checked,
+    audio_maxqframes: Number($("#s-audio_maxqframes").value),
+  }});
+  updateBanner($("#s-mnk_mode").checked);
+  $("#savedmark").classList.remove("hidden");
+  setTimeout(() => $("#savedmark").classList.add("hidden"), 4000);
+};
+</script>
+</body>
+</html>

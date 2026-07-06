@@ -1,0 +1,27 @@
+# Manually-declared function boundaries for functions the analyzer missed.
+# These are reached only via function pointers (callback/init tables), so
+# direct-branch discovery and the RTTI vtable scanner don't find them.
+# Empty table = let the analyzer auto-determine the function extent.
+[functions]
+# Boot-path crash: global-constructor/init-list callback invoked during xstart.
+# Sits in the gap between discovered funcs 0x82A715D0 and 0x82A718A0.
+"0x82A71810" = {}
+# Further constructor/callback targets found via LD_PRELOAD enumeration
+# (libtrap.so): indirect-call targets the analyzer missed.
+"0x823F52B8" = {}
+"0x828332D0" = {}
+
+# Allocator-helper cluster + misc: direct-call targets found via
+# 'Unresolved call' fatal stubs once the game reached the main menu.
+"0x8269D52C" = {}
+"0x82782F90" = {}
+"0x82783258" = {}
+"0x82783400" = {}
+"0x82783740" = {}
+"0x82783918" = {}
+"0x82783B70" = {}
+"0x82783D18" = {}
+"0x82783F50" = {}
+"0x8296B118" = {}
+"0x82C42EB8" = {}
+"0x82C462F0" = {}
