@@ -250,12 +250,6 @@ def patch_instant_popin(enable):
          f"gpu_allow_invalid_fetch_constants = {'true' if enable else 'false'}"),
         (r"^gpu_shader_max_cf_iterations\s*=.*$",
          f"gpu_shader_max_cf_iterations = {'4096' if enable else '0'}"),
-        # The hang dump shows the wedge is a pixel wave that never retires --
-        # the FSI path's pixel-ordered interlock (POPS) is the one Deck GPU
-        # feature matching that signature. Use the host render path while the
-        # patch is on. Trade-off: in-engine cutscenes may show tile static.
-        (r"^render_target_path_vulkan\s*=.*$",
-         f"render_target_path_vulkan = {'\"\"' if enable else '\"fsi\"'}"),
     ]
     for pat, rep in subs:
         if not re.search(pat, text, re.M):
@@ -271,12 +265,10 @@ def patch_instant_popin(enable):
 def patches_list():
     return [
         {"id": "instant_popin", "name": "Instant character pop-in (community fix)",
-         "desc": "Characters/props appear immediately instead of loading in "
-                 "late (same fix Xenia players use, plus Steam Deck guardrails: "
-                 "readback limits + a simpler render path, so in-engine "
-                 "cutscenes may look rougher while enabled). If a level load "
-                 "ever freezes: power off fully, turn this off, relaunch. First "
-                 "launch after toggling rebuilds shaders (brief stutter).",
+         "desc": "EXPERIMENTAL - currently CRASHES on Steam Deck during level "
+                 "loads (a GPU driver interaction; the same fix works in Xenia "
+                 "on desktop GPUs). Leave OFF on Deck. Kept for future driver "
+                 "updates and the Windows build.",
          "state": patch_instant_popin_state(), "available": GAME_TOML.exists()},
         {"id": "skip_intro", "name": "Skip intro logo videos",
          "desc": "Boots straight past the EA / Fox / Gracie logo movies.",
@@ -697,13 +689,9 @@ def launch_game():
         # it for the game regardless of the user's global LS settings.
         env["DISABLE_LSFG"] = "1"
         if patch_instant_popin_state() == "on":
-            # experimental patch active: capture a driver hang dump for
-            # forensics, and disable the driver's NGG-culling fast path -- the
-            # remaining wedge executes the big skinned-character vertex
-            # shaders and stalls pixel waves waiting on their outputs (a
-            # parameter-cache deadlock signature); nonggc removes the culling
-            # variant of exactly those shaders.
-            env["RADV_DEBUG"] = "hang,nonggc"
+            # capture a driver dump if the GPU ever hangs (black-box recorder;
+            # remove once the priming-draw fix has a few clean sessions)
+            env["RADV_DEBUG"] = "hang"
         libs = [str(_resolve(d)) for d in CONFIG["lib_dirs"].get(PLAT, [])]
         if libs:
             env["LD_LIBRARY_PATH"] = ":".join(libs) + ":" + env.get("LD_LIBRARY_PATH", "")

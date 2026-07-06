@@ -433,6 +433,13 @@ class VulkanCommandProcessor : public CommandProcessor {
   void ClearTransientDescriptorPools();
   bool IssueCopy_ReadbackResolvePath();
   bool IssueDraw_MemexportReadbackFullPath(uint32_t total_size);
+  // HAND PATCH: accurate memexport readback, deferred to end-of-frame. The
+  // per-draw synchronous path drains the whole GPU queue mid-frame inside an
+  // open render pass - once per skinned-character draw - which wedges
+  // RADV/VanGogh (CP stuck at PS_PARTIAL_FLUSH). Ranges are accumulated per
+  // draw and read back once per frame in IssueSwap, where the submission is
+  // ending anyway; the guest consumes the data on the following frame.
+  void PerformDeferredMemexportReadback();
   bool IssueDraw_MemexportReadbackFastPath(uint32_t total_size);
 
   void SplitPendingBarrier();
@@ -755,6 +762,7 @@ class VulkanCommandProcessor : public CommandProcessor {
   uint64_t vertex_buffers_in_sync_[2] = {};
   std::unordered_map<uint64_t, ReadbackBuffer> readback_buffers_;
   std::unordered_map<uint64_t, ReadbackBuffer> memexport_readback_buffers_;
+  std::vector<draw_util::MemExportRange> deferred_memexport_readback_ranges_;
 
   // The current dynamic state of the graphics pipeline bind point. Note that
   // binding any pipeline to the bind point with static state (even if it's

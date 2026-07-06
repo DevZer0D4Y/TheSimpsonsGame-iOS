@@ -149,23 +149,11 @@ std::vector<XCONTENT_AGGREGATE_DATA> ContentManager::ListContent(uint32_t device
   // content_root/xuid/title_id/type_name/*
   auto package_root = ResolvePackageRoot(xuid, content_type, title_id);
   auto file_infos = rex::filesystem::ListFiles(package_root);
-  if (FILE* lcf = fopen("/tmp/listcontent.log", "a")) {
-    fprintf(lcf, "ListContent: xuid=%016llX root=%s entries=%zu\n",
-            (unsigned long long)xuid, rex::path_to_utf8(package_root).c_str(),
-            file_infos.size());
-    fclose(lcf);
-  }
   for (const auto& file_info : file_infos) {
     if (file_info.type != rex::filesystem::FileInfo::Type::kDirectory) {
       // Directories only.
       continue;
     }
-    if (FILE* lcf = fopen("/tmp/listcontent.log", "a")) {
-      fprintf(lcf, "ListContent: dir entry %s type_ok\n",
-              rex::path_to_utf8(file_info.name).c_str());
-      fclose(lcf);
-    }
-
     XCONTENT_AGGREGATE_DATA content_data;
     if (XSUCCEEDED(ReadContentHeaderFile(rex::path_to_utf8(file_info.name), xuid, title_id,
                                          content_type, content_data))) {

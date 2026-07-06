@@ -198,23 +198,6 @@ u32 NtReadFile_entry(u32 file_handle, u32 event_handle, mapped_void apc_routine_
       (uint32_t)file_handle, (uint32_t)event_handle, apc_routine_ptr.guest_address(),
       apc_context.guest_address(), io_status_block.guest_address(), buffer.guest_address(),
       (uint32_t)buffer_length, byte_offset_ptr ? (int64_t)byte_offset : -1);
-  // HAND PATCH DIAGNOSTIC: entity pop-in investigation -- log streaming
-  // throughput every 2000 reads (count, cumulative MB, elapsed since first).
-  {
-    static std::atomic<uint64_t> hp_reads{0}, hp_bytes{0};
-    static std::atomic<int64_t> hp_first_ms{0};
-    auto hp_now = std::chrono::duration_cast<std::chrono::milliseconds>(
-                      std::chrono::steady_clock::now().time_since_epoch())
-                      .count();
-    int64_t hp_expected = 0;
-    hp_first_ms.compare_exchange_strong(hp_expected, hp_now);
-    uint64_t hp_n = ++hp_reads;
-    hp_bytes += buffer_length;
-    if (hp_n % 2000 == 0) {
-      REXKRNL_WARN("[IO-DIAG] NtReadFile #{} cumulative={} MB elapsed={} s", hp_n,
-                   hp_bytes.load() >> 20, (hp_now - hp_first_ms.load()) / 1000);
-    }
-  }
   X_STATUS result = X_STATUS_SUCCESS;
   bool apc_queued = false;
 

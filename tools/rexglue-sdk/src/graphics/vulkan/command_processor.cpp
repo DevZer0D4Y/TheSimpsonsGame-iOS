@@ -2308,6 +2308,11 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
     return;
   }
 
+  // HAND PATCH: the accurate memexport readback happens once per frame here
+  // (see PerformDeferredMemexportReadback) instead of draining the queue
+  // mid-frame per draw.
+  PerformDeferredMemexportReadback();
+
   bool skip_present_due_async_placeholder = REXCVAR_GET(async_shader_compilation) &&
                                             REXCVAR_GET(vulkan_async_skip_incomplete_frames) &&
                                             frame_used_async_placeholder_pipeline_;
@@ -3997,6 +4002,15 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   }
 
   // Ensure vertex buffers are resident.
+  // HAND PATCH: "priming draw" = a draw admitted with invalid-type fetch
+  // constants (gpu_allow_invalid_fetch_constants). This game finalizes
+  // characters through such draws: the vertex shader memexports skinned
+  // vertices, the CPU reads them back, and only then valid fetch constants
+  // are written (RenderWare streaming). The draw MUST execute for entities to
+  // ever appear -- but its rasterized output is meaningless (and degenerate
+  // enough to wedge the VanGogh pixel pipeline), so it is drawn under a 1x1
+  // scissor: full vertex work + memexport, no pixel work.
+  bool priming_draw = false;
   const Shader::ConstantRegisterMap& constant_map_vertex = vertex_shader->constant_register_map();
   for (uint32_t i = 0; i < rex::countof(constant_map_vertex.vertex_fetch_bitmap); ++i) {
     uint32_t vfetch_bits_remaining = constant_map_vertex.vertex_fetch_bitmap[i];
@@ -4058,6 +4072,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
             }
           }
           if (REXCVAR_GET(gpu_allow_invalid_fetch_constants) && (plausible || null_stream)) {
+            priming_draw = true;
             // HAND PATCH DIAGNOSTIC: characterize every allowed-invalid draw so
             // the poison ones (GPU overdraw storms at level load) can be told
             // apart from the benign pop-in draws (null optional streams).
@@ -4196,6 +4211,14 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
       render_target_cache_->last_update_framebuffer());
 
   // Draw.
+  // HAND PATCH: mute rasterization for priming draws (see above) -- the
+  // vertex shader and its memexport still execute in full.
+  VkRect2D priming_saved_scissor;
+  if (priming_draw) {
+    priming_saved_scissor = dynamic_scissor_;
+    VkRect2D priming_scissor = {{0, 0}, {1, 1}};
+    SetScissor(priming_scissor);
+  }
   if (primitive_processing_result.index_buffer_type ==
           PrimitiveProcessor::ProcessedIndexBufferType::kNone ||
       shader_32bit_index_dma) {
@@ -4233,6 +4256,9 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     deferred_command_buffer_.CmdVkDrawIndexed(primitive_processing_result.host_draw_vertex_count, 1,
                                               0, 0, 0);
   }
+  if (priming_draw) {
+    SetScissor(priming_saved_scissor);
+  }
 
   // Invalidate textures in memexported memory and watch for changes.
   if (!memexport_ranges_.empty()) {
@@ -4259,22 +4285,6 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     //  - skip the readback for those draws (their export data is garbage for a
     //    frame or two anyway; the CPU consumer sees the previous contents);
     //  - regardless of the window, cap the total readback size per draw.
-    bool streaming_window = false;
-    if (REXCVAR_GET(gpu_allow_invalid_fetch_constants)) {
-      const Shader::ConstantRegisterMap& taint_map = vertex_shader->constant_register_map();
-      for (uint32_t i = 0; !streaming_window && i < rex::countof(taint_map.vertex_fetch_bitmap);
-           ++i) {
-        uint32_t taint_bits_remaining = taint_map.vertex_fetch_bitmap[i];
-        uint32_t j;
-        while (rex::bit_scan_forward(taint_bits_remaining, &j)) {
-          taint_bits_remaining &= ~(uint32_t(1) << j);
-          if (regs.GetVertexFetch(i * 32 + j).type == xenos::FetchConstantType::kInvalidVertex) {
-            streaming_window = true;
-            break;
-          }
-        }
-      }
-    }
     uint32_t memexport_total_size = 0;
     for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
       memexport_total_size += memexport_range.size_bytes;
@@ -4282,24 +4292,123 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     int32_t readback_max_mb = REXCVAR_GET(gpu_memexport_readback_max_mb);
     bool readback_oversized =
         readback_max_mb > 0 && memexport_total_size > (uint32_t(readback_max_mb) << 20);
-    if (streaming_window || readback_oversized) {
+    if (readback_oversized) {
       static std::atomic<uint32_t> readback_skip_logs{0};
       uint32_t n = readback_skip_logs.fetch_add(1, std::memory_order_relaxed);
       if (n < 8 || (n & 2047) == 0) {
-        REXGPU_WARN("Memexport readback skipped ({}; total size {} bytes, occurrence {})",
-                    streaming_window ? "fetch constants still streaming" : "oversized",
+        REXGPU_WARN("Memexport readback skipped (oversized; total size {} bytes, occurrence {})",
                     memexport_total_size, n + 1);
       }
     } else if (memexport_total_size) {
       if (REXCVAR_GET(readback_memexport_fast)) {
         IssueDraw_MemexportReadbackFastPath(memexport_total_size);
       } else {
-        IssueDraw_MemexportReadbackFullPath(memexport_total_size);
+        // Accurate path: accumulate; the actual readback happens once per
+        // frame in IssueSwap (see PerformDeferredMemexportReadback).
+        for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
+          bool merged = false;
+          for (draw_util::MemExportRange& deferred : deferred_memexport_readback_ranges_) {
+            if (deferred.base_address_dwords == memexport_range.base_address_dwords) {
+              deferred.size_bytes = std::max(deferred.size_bytes, memexport_range.size_bytes);
+              merged = true;
+              break;
+            }
+          }
+          if (!merged && deferred_memexport_readback_ranges_.size() < 512) {
+            deferred_memexport_readback_ranges_.push_back(memexport_range);
+          }
+        }
       }
     }
   }
 
   return true;
+}
+
+void VulkanCommandProcessor::PerformDeferredMemexportReadback() {
+  if (deferred_memexport_readback_ranges_.empty()) {
+    return;
+  }
+  uint32_t total_size = 0;
+  for (const draw_util::MemExportRange& range : deferred_memexport_readback_ranges_) {
+    total_size += range.size_bytes;
+  }
+  int32_t readback_max_mb = REXCVAR_GET(gpu_memexport_readback_max_mb);
+  if (!total_size ||
+      (readback_max_mb > 0 && total_size > (uint32_t(readback_max_mb) << 20))) {
+    deferred_memexport_readback_ranges_.clear();
+    return;
+  }
+
+  const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+
+  VkBuffer readback_buffer = VK_NULL_HANDLE;
+  VkDeviceMemory readback_memory = VK_NULL_HANDLE;
+  uint32_t readback_memory_type = UINT32_MAX;
+  VkDeviceSize readback_memory_size = 0;
+  if (!ui::vulkan::util::CreateDedicatedAllocationBuffer(
+          vulkan_device, total_size, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+          ui::vulkan::util::MemoryPurpose::kReadback, readback_buffer, readback_memory,
+          &readback_memory_type, &readback_memory_size)) {
+    REXGPU_ERROR("Failed to create the deferred Vulkan memexport readback buffer");
+    deferred_memexport_readback_ranges_.clear();
+    return;
+  }
+
+  shared_memory_->Use(VulkanSharedMemory::Usage::kRead);
+  SubmitBarriers(true);
+
+  uint32_t readback_offset = 0;
+  for (const draw_util::MemExportRange& range : deferred_memexport_readback_ranges_) {
+    VkBufferCopy readback_region = {};
+    readback_region.srcOffset = range.base_address_dwords << 2;
+    readback_region.dstOffset = readback_offset;
+    readback_region.size = range.size_bytes;
+    deferred_command_buffer_.CmdVkCopyBuffer(shared_memory_->buffer(), readback_buffer, 1,
+                                             &readback_region);
+    readback_offset += range.size_bytes;
+  }
+  PushBufferMemoryBarrier(readback_buffer, 0, total_size, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                          VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+                          VK_ACCESS_HOST_READ_BIT);
+
+  if (!AwaitAllQueueOperationsCompletion()) {
+    REXGPU_ERROR("Failed to await the deferred Vulkan memexport readback");
+    dfn.vkDestroyBuffer(device, readback_buffer, nullptr);
+    dfn.vkFreeMemory(device, readback_memory, nullptr);
+    deferred_memexport_readback_ranges_.clear();
+    return;
+  }
+
+  void* readback_mapping = nullptr;
+  if (dfn.vkMapMemory(device, readback_memory, 0, VK_WHOLE_SIZE, 0, &readback_mapping) ==
+      VK_SUCCESS) {
+    if (!(vulkan_device->memory_types().host_coherent &
+          (uint32_t(1) << readback_memory_type))) {
+      VkMappedMemoryRange readback_memory_range = {};
+      readback_memory_range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+      readback_memory_range.memory = readback_memory;
+      readback_memory_range.offset = 0;
+      readback_memory_range.size = std::min(
+          rex::round_up(VkDeviceSize(total_size), vulkan_device->properties().nonCoherentAtomSize),
+          readback_memory_size);
+      dfn.vkInvalidateMappedMemoryRanges(device, 1, &readback_memory_range);
+    }
+    const uint8_t* readback_bytes = reinterpret_cast<const uint8_t*>(readback_mapping);
+    for (const draw_util::MemExportRange& range : deferred_memexport_readback_ranges_) {
+      std::memcpy(memory_->TranslatePhysical(range.base_address_dwords << 2), readback_bytes,
+                  range.size_bytes);
+      readback_bytes += range.size_bytes;
+    }
+    dfn.vkUnmapMemory(device, readback_memory);
+  } else {
+    REXGPU_ERROR("Failed to map the deferred Vulkan memexport readback buffer");
+  }
+  dfn.vkDestroyBuffer(device, readback_buffer, nullptr);
+  dfn.vkFreeMemory(device, readback_memory, nullptr);
+  deferred_memexport_readback_ranges_.clear();
 }
 
 bool VulkanCommandProcessor::IssueDraw_MemexportReadbackFullPath(uint32_t total_size) {
