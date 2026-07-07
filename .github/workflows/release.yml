@@ -94,6 +94,10 @@ jobs:
           Copy-Item "dist/simpsons-launcher.exe"        release/
           Copy-Item "ffmpeg.exe"                         release/
           Copy-Item "README.md"                         release/
+          Set-Content release/simpsons.toml -Encoding utf8 -Value @(
+            '# The Simpsons Game - runtime configuration (edit these via the launcher)',
+            'gpu_allow_invalid_fetch_constants = false',
+            'gpu_shader_max_cf_iterations = 0')
           Compress-Archive -Path release/* -DestinationPath TheSimpsonsGame-Recompiled-Windows-x64.zip -Force
 
       - uses: actions/upload-artifact@v4
@@ -144,6 +148,7 @@ jobs:
           cp tools/extract-xiso/build/extract-xiso release/
           cp -r launcher release/launcher
           cp README.md release/
+          printf '# The Simpsons Game - runtime configuration (edit these via the launcher)\ngpu_allow_invalid_fetch_constants = false\ngpu_shader_max_cf_iterations = 0\n' > release/simpsons.toml
           tar -czf TheSimpsonsGame-Recompiled-Linux-x64.tar.gz -C release .
 
       - uses: actions/upload-artifact@v4
@@ -180,3 +185,12 @@ jobs:
 
             ⚠️ Do **not** enable the "Instant character pop-in" patch on Steam Deck / Van Gogh
             APU class GPUs — it crashes on level load (a kernel BSOD on Windows).
+
+      # The release now holds its own copy of the zips, so drop the transient
+      # workflow artifacts to keep storage clean.
+      - name: Delete build artifacts
+        uses: geekyeggo/delete-artifact@v5
+        with:
+          name: |
+            windows-x64
+            linux-x64
