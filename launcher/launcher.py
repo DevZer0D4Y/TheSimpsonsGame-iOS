@@ -32,9 +32,18 @@ from pathlib import Path
 
 VERSION = "0.3.0"
 
-LAUNCHER_DIR = Path(__file__).resolve().parent
-ROOT = LAUNCHER_DIR.parent
-UI_DIR = LAUNCHER_DIR / "ui"
+FROZEN = getattr(sys, "frozen", False)
+if FROZEN:
+    # Packaged .exe: the launcher lives in a flat release directory next to
+    # simpsons.exe / extract-xiso.exe / gamedata/. The web UI is bundled and
+    # unpacked to PyInstaller's temp dir (sys._MEIPASS).
+    LAUNCHER_DIR = Path(sys.executable).resolve().parent
+    ROOT = LAUNCHER_DIR
+    UI_DIR = Path(getattr(sys, "_MEIPASS", LAUNCHER_DIR)) / "ui"
+else:
+    LAUNCHER_DIR = Path(__file__).resolve().parent
+    ROOT = LAUNCHER_DIR.parent
+    UI_DIR = LAUNCHER_DIR / "ui"
 ART_DIR = LAUNCHER_DIR / "art"
 MODS_DIR = LAUNCHER_DIR / "mods"
 BACKUPS_DIR = LAUNCHER_DIR / "backups"
@@ -80,13 +89,18 @@ def _resolve(p):
     return p if p.is_absolute() else ROOT / p
 
 
-GAME_BIN = _resolve(CONFIG["engine"].get(PLAT, CONFIG["engine"]["Linux"]))
+if FROZEN:
+    # Flat release layout: game binary and tools sit beside the launcher.
+    GAME_BIN = ROOT / ("simpsons.exe" if PLAT == "Windows" else "simpsons")
+    EXTRACT_XISO = ROOT / ("extract-xiso.exe" if PLAT == "Windows" else "extract-xiso")
+else:
+    GAME_BIN = _resolve(CONFIG["engine"].get(PLAT, CONFIG["engine"]["Linux"]))
+    EXTRACT_XISO = ROOT / "tools/extract-xiso/build/extract-xiso"
+    if PLAT == "Windows":
+        EXTRACT_XISO = EXTRACT_XISO.with_suffix(".exe")
 BUILD_DIR = GAME_BIN.parent
 GAME_TOML = BUILD_DIR / "simpsons.toml"
 GAMEDATA = ROOT / "gamedata"
-EXTRACT_XISO = ROOT / "tools/extract-xiso/build/extract-xiso"
-if PLAT == "Windows":
-    EXTRACT_XISO = EXTRACT_XISO.with_suffix(".exe")
 USER_DATA = Path.home() / ".local/share/simpsons"
 
 TOKEN = secrets.token_hex(16)

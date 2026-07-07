@@ -14,7 +14,7 @@ Linux / Steam Deck today.
 | Platform | State |
 |---|---|
 | Linux / Steam Deck | ✅ Playable (menus, saves, videos, gameplay) |
-| Windows | 🚧 In development — built by CI (`.github/workflows/build.yml`) |
+| Windows | ✅ Builds & boots to gameplay (clang + D3D12) — first bring-up |
 | Android | 🗺 Planned |
 
 Input: controller required for now — experimental keyboard/mouse emulation can be enabled in
@@ -44,7 +44,7 @@ simpsons/            The recompiled game project (generated translation units + 
 tools/rexglue-sdk/   ReXGlue recompilation SDK (runtime, GPU/kernel emulation, codegen builders)
 tools/XenonRecomp/   PowerPC→C++ static recompiler (disassembler + emitter)
 tools/extract-xiso/  Xbox ISO extraction tool (installer backend)
-.github/workflows/   CI: Linux build + experimental Windows build
+.github/workflows/   Manual (workflow_dispatch) release workflow — Windows + Linux
 ```
 
 Not in the repo (see `.gitignore`): game data, prebuilt toolchains (`tools/clang20`,
@@ -65,6 +65,47 @@ ninja -C simpsons/out/build/linux
 # 3. Install your game + play
 launcher/simpsons-launcher.sh
 ```
+
+## Building (Windows)
+
+Windows uses the **D3D12** backend and builds with **clang** (not MSVC `cl`).
+
+Prerequisites: LLVM/Clang 20.x, Visual Studio Build Tools with "Desktop
+development with C++" (Windows SDK + linker), CMake ≥ 3.25, Ninja, and Python 3
+(`pip install PySide6` for the native launcher window). NASM is *not* required —
+the vendored FFmpeg is configured with `HAVE_X86ASM=0`.
+
+```powershell
+# Build the game + SDK together (points the game at the SDK source tree):
+cmake --preset win-amd64-relwithdebinfo `
+      -DREXSDK_DIR="$PWD/tools/rexglue-sdk" `
+      "-DCMAKE_C_FLAGS=-march=x86-64-v3" "-DCMAKE_CXX_FLAGS=-march=x86-64-v3"
+cmake --build --preset win-amd64-relwithdebinfo --target simpsons
+
+# ISO extraction tool (WIN32 must be defined for the vendored getopt):
+cmake -S tools/extract-xiso -B tools/extract-xiso/build -G Ninja `
+      -DCMAKE_C_COMPILER=clang "-DCMAKE_C_FLAGS=-DWIN32"
+cmake --build tools/extract-xiso/build
+
+# Install your game + play
+python launcher/launcher.py
+```
+
+The build stages `rexruntime*.dll` and `TracyClient*.dll` next to `simpsons.exe`
+automatically — Windows has no `LD_LIBRARY_PATH`, so DLLs live beside the exe.
+
+## Known issues
+
+- **"Instant character pop-in" (`gpu_allow_invalid_fetch_constants = true`) is
+  dangerous on the Steam Deck's GPU.** It crashes on *any* level load on both
+  Linux/Vulkan (RADV) *and* Windows/D3D12 — on Windows it triggers a kernel
+  **BSOD** (`PAGE_FAULT_IN_NONPAGED_AREA`, bugcheck `0x50`) in the AMD driver.
+  The completely-unmodified D3D12 path fails identically, so this is the Van
+  Gogh APU (or the content), **not** a Vulkan/RADV-driver-specific bug as
+  previously assumed. Leave it **off** on Deck-class GPUs; it is reported to
+  work on desktop GPUs in Xenia.
+- Boot logo videos (EA/Fox/Gracie) may flicker green — a bug in the game's own
+  guest-side VP6 decoder, independent of the graphics backend.
 
 ## ⚠️ Before making this repository public
 
