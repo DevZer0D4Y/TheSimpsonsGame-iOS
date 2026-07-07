@@ -40,9 +40,13 @@ REXCVAR_DEFINE_INT32(
 // and let the normal AudioSystem handling take it, to prevent duplicate
 // implementations. They can be found in xboxkrnl_audio_xma.cc
 
+#if defined(_WIN32)
+#include <windows.h>
+#else
 #include <pthread.h>
 #include <unistd.h>
 #include <cerrno>
+#endif
 
 namespace rex::audio {
 
@@ -102,6 +106,11 @@ void AudioSystem::WorkerThreadMain() {
   // stutter under load). SCHED_FIFO needs privileges we may not have, so
   // fall back to the highest nice level for this thread.
   {
+#if defined(_WIN32)
+    // Windows equivalent of the POSIX realtime-ish bump: time-critical priority
+    // keeps the audio worker ahead of GPU/streaming threads.
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+#else
     struct sched_param sp {};
     sp.sched_priority = 10;
     if (pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp) != 0) {
@@ -109,6 +118,7 @@ void AudioSystem::WorkerThreadMain() {
       errno = 0;
       (void)nice(-10);
     }
+#endif
   }
   // Initialize driver and ringbuffer.
   Initialize();

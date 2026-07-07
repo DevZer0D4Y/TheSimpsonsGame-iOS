@@ -44,7 +44,7 @@ DEFAULT_CONFIG = {
     "github_repo": "",   # e.g. "username/simpsons-recomp" once published
     "engine": {
         "Linux": "simpsons/out/build/linux-amd64-relwithdebinfo/simpsons",
-        "Windows": "simpsons/out/build/win-amd64-release/simpsons.exe",
+        "Windows": "simpsons/out/build/win-amd64-relwithdebinfo/simpsons.exe",
     },
     "lib_dirs": {
         "Linux": ["tools/rexglue-bin/linux-amd64/lib",
@@ -58,7 +58,7 @@ def load_config():
     cfg = json.loads(json.dumps(DEFAULT_CONFIG))
     if CONFIG_JSON.exists():
         try:
-            user = json.loads(CONFIG_JSON.read_text())
+            user = json.loads(CONFIG_JSON.read_text(encoding="utf-8"))
             for k, v in user.items():
                 if isinstance(v, dict) and k in cfg:
                     cfg[k].update(v)
@@ -67,7 +67,7 @@ def load_config():
         except Exception:
             pass
     else:
-        CONFIG_JSON.write_text(json.dumps(cfg, indent=2) + "\n")
+        CONFIG_JSON.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
     return cfg
 
 
@@ -85,6 +85,8 @@ BUILD_DIR = GAME_BIN.parent
 GAME_TOML = BUILD_DIR / "simpsons.toml"
 GAMEDATA = ROOT / "gamedata"
 EXTRACT_XISO = ROOT / "tools/extract-xiso/build/extract-xiso"
+if PLAT == "Windows":
+    EXTRACT_XISO = EXTRACT_XISO.with_suffix(".exe")
 USER_DATA = Path.home() / ".local/share/simpsons"
 
 TOKEN = secrets.token_hex(16)
@@ -152,7 +154,7 @@ def read_settings():
     values = {k: v[1] for k, v in SETTINGS_SCHEMA.items()}
     if not GAME_TOML.exists():
         return values
-    for line in GAME_TOML.read_text().splitlines():
+    for line in GAME_TOML.read_text(encoding="utf-8").splitlines():
         s = line.strip()
         if "=" in s and not s.startswith("#"):
             key, _, raw = s.partition("=")
@@ -176,7 +178,7 @@ def write_settings(new_values):
     lines = []
     if GAME_TOML.exists():
         in_block = False
-        for line in GAME_TOML.read_text().splitlines():
+        for line in GAME_TOML.read_text(encoding="utf-8").splitlines():
             s = line.strip()
             if s == SETTINGS_BEGIN:
                 in_block = True
@@ -195,7 +197,7 @@ def write_settings(new_values):
     for k, (typ, _d, _r) in SETTINGS_SCHEMA.items():
         block.append(f"{k} = {_fmt(values[k], typ)}")
     block.append(SETTINGS_END)
-    GAME_TOML.write_text("\n".join(lines + ["", *block]) + "\n")
+    GAME_TOML.write_text("\n".join(lines + ["", *block]) + "\n", encoding="utf-8")
     return values
 
 
@@ -227,7 +229,7 @@ def patch_skip_intro(enable):
 def _toml_flag(key, default="false"):
     if not GAME_TOML.exists():
         return default
-    m = re.search(rf"^{key}\s*=\s*(\S+)", GAME_TOML.read_text(), re.M)
+    m = re.search(rf"^{key}\s*=\s*(\S+)", GAME_TOML.read_text(encoding="utf-8"), re.M)
     return m.group(1) if m else default
 
 
@@ -244,7 +246,7 @@ def patch_instant_popin(enable):
     patch off."""
     if not GAME_TOML.exists():
         return False, "game config not found"
-    text = GAME_TOML.read_text()
+    text = GAME_TOML.read_text(encoding="utf-8")
     subs = [
         (r"^gpu_allow_invalid_fetch_constants\s*=.*$",
          f"gpu_allow_invalid_fetch_constants = {'true' if enable else 'false'}"),
@@ -255,7 +257,7 @@ def patch_instant_popin(enable):
         if not re.search(pat, text, re.M):
             return False, "config keys missing - reinstall/repair first"
         text = re.sub(pat, rep, text, flags=re.M)
-    GAME_TOML.write_text(text)
+    GAME_TOML.write_text(text, encoding="utf-8")
     # the runaway cap is baked into translated shaders - force a rebuild
     shutil.rmtree(USER_DATA / "cache", ignore_errors=True)
     return True, ("instant pop-in ON (shader cache rebuilds on next launch)"
@@ -492,7 +494,9 @@ def run_install(iso_path):
             shutil.rmtree(target)
         target.mkdir()
         log.append(f"Extracting {iso.name} ... (this can take a few minutes)")
-        p = subprocess.Popen([str(EXTRACT_XISO), "-x", str(iso), "-d", str(target)],
+        # Options must precede the positional ISO: the Windows getopt does not
+        # permute argv, so "-x <iso> -d <target>" would leave -d unparsed.
+        p = subprocess.Popen([str(EXTRACT_XISO), "-x", "-d", str(target), str(iso)],
                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         for line in p.stdout:
             if line.strip():
@@ -775,7 +779,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
         if path in ("/", "/index.html"):
-            html = (UI_DIR / "index.html").read_text().replace("__TOKEN__", TOKEN)
+            html = (UI_DIR / "index.html").read_text(encoding="utf-8").replace("__TOKEN__", TOKEN)
             return self._send(200, html.encode(), "text/html; charset=utf-8")
         if path == "/api/status":
             return self._send(200, status())
