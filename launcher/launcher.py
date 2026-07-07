@@ -383,8 +383,16 @@ def browse(path_str):
 
 # -------------------------------------------------------------------- art
 
+def ffmpeg_path():
+    """ffmpeg from PATH, or bundled beside the launcher (Windows release)."""
+    local = LAUNCHER_DIR / ("ffmpeg.exe" if PLAT == "Windows" else "ffmpeg")
+    if local.exists():
+        return str(local)
+    return shutil.which("ffmpeg")
+
+
 def generate_art(force=False):
-    if not gamedata_ok() or not shutil.which("ffmpeg"):
+    if not gamedata_ok() or not ffmpeg_path():
         return
     ART_DIR.mkdir(parents=True, exist_ok=True)
     if art_files() and not force:
@@ -406,7 +414,7 @@ def generate_art(force=False):
                 break
             out = ART_DIR / f"hero{made}.jpg"
             r = subprocess.run(
-                ["ffmpeg", "-loglevel", "error", "-y", "-ss", ts, "-i", str(mv),
+                [ffmpeg_path(), "-loglevel", "error", "-y", "-ss", ts, "-i", str(mv),
                  "-frames:v", "1", "-q:v", "3", str(out)],
                 capture_output=True, timeout=60)
             # size threshold filters black/flat frames
