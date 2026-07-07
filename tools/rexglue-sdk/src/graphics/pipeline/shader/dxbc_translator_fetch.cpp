@@ -263,6 +263,24 @@ void DxbcShaderTranslator::ProcessVertexFetchInstruction(
     PopSystemTemp((endian_temp != swap_temp) ? 2 : 1);
   }
 
+  // HAND PATCH (port of the SPIR-V vertex-fetch zero-clamp): Xenos hardware
+  // bounded vertex fetches by the fetch constant's size field. This game leaves
+  // OPTIONAL vertex streams as all-zero "invalid"-type fetch constants during
+  // entity streaming; without a bound the shader reads live guest memory at
+  // address 0 instead of zeros, feeding garbage attributes (wrong colors,
+  // degenerate geometry, GPU ring hangs). When the size field (bits 2:25 of
+  // fetch constant word 1) is zero, force the fetched words to zero.
+  {
+    uint32_t size_temp = PushSystemTemp();
+    dxbc::Dest size_dest(dxbc::Dest::R(size_temp, 0b0001));
+    dxbc::Src size_src(dxbc::Src::R(size_temp, dxbc::Src::kXXXX));
+    a_.OpUShR(size_dest, fetch_constant_src.SelectFromSwizzled(1), dxbc::Src::LU(2));
+    a_.OpAnd(size_dest, size_src, dxbc::Src::LU((uint32_t(1) << 24) - 1));
+    a_.OpMovC(dxbc::Dest::R(system_temp_result_, needed_words), size_src, result_src,
+              dxbc::Src::LU(0));
+    PopSystemTemp();
+  }
+
   // - Unpack the format.
 
   uint32_t used_format_components =
