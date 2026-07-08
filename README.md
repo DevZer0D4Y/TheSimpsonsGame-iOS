@@ -67,17 +67,36 @@ the launcher (Settings → Input).
   unmodified, stock Xenia logic) points at the Van Gogh APU itself, not a driver or engine bug.
   It's reported to work on most other/desktop GPUs. **Leave it off on Steam Deck** unless you're
   specifically testing it.
-  **Workaround if you hit pop-in with the patch off (the normal/default case):** walk up close
-  to a wall or object and rotate the camera until it snaps back to a safe position — this
-  fixes pop-in for the rest of the session, the same effect as a full level reload but instant.
+  **Workaround if you hit pop-in with the patch off (the normal/default case):** do this once,
+  in **Level 1**, at the start of your play session — it then stays fixed for every level you
+  play afterward, not just Level 1:
+  1. Start Level 1 and jump across the two jump pads near the beginning. They'll render
+     invisible (that's the pop-in), but they still work — jump across anyway.
+  2. Climb up onto the first ledge just past them.
+  3. Rotate the camera into the wall and hold it there until it snaps back to center on its
+     own — let it reset itself, don't rotate it back yourself.
+  4. Leave the level (if you've already completed it, just exit back out).
+  Pop-in is then fixed for the rest of that session, across every level — the same effect as a
+  full level reload but instant.
 - Boot logo videos (EA/Fox/Gracie Films) may show green flicker — a bug in the *game's own*
   guest-side video decoder, not something introduced by this port. (THIS SHOULD BE FIXED)
-- In-game audio can sound crunchy under load; main menu UI may flicker slightly.
-- The framerate setting (Settings → Framerate) works by telling the game it's running on a
-  higher-refresh-rate display, the same mechanism the community's own 60 FPS patch for this game
-  uses — 60 is well-tested and safe. 90/120 are exposed as experimental: the *game's own*
-  scripted/physics timing wasn't designed for those rates, so watch for odd behavior in specific
-  scenes (especially cutscenes) at the higher settings.
+- In-game audio can sound crunchy under load.
+- Main menu UI flicker was traced to the Vulkan presenter defaulting to tearing-permitted
+  ("immediate") presentation; it now prefers a tear-free present mode (mailbox) when the driver
+  supports it, same latency characteristics either way. Report back if you still see it.
+- The framerate setting (Settings → Framerate) applies the same guest instruction patch as the
+  community's own 60 FPS unlock for this game (verified against the `xenia-canary/game-patches`
+  entry for this title) on top of reporting a higher display refresh rate — both were required;
+  reporting the higher refresh rate alone did nothing; the game had its own hardcoded "wait 2
+  vblanks between frames" that needed patching out. 60 removes that hardcoded halving cleanly.
+  A companion patch the community version also applies (compensating timing used elsewhere in
+  the game, said to avoid clipping/collision/animation artifacts) targets guest code outside
+  anything this project's recompiler discovered as a function, so it isn't ported yet — watch
+  for occasional clipping or animation oddities at 60+, especially 90/120 (experimental: the
+  *game's own* scripted/physics timing wasn't designed for those rates). Actual achieved
+  framerate still depends on real performance in the current scene — expect it to track close to
+  your target in light scenes and fall short in heavier ones on Steam Deck's APU; this is an
+  active area of work, not a hard cap anymore.
 
 ## Reporting issues
 
