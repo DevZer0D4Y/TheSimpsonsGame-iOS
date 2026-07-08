@@ -97,6 +97,29 @@
     width:100%; font-family:inherit; font-weight:600; font-size:13.5px; padding:10px 12px; color:var(--text);
     border:1px solid var(--border); border-radius:var(--radius-sm); background:var(--surface-2);}
   .field select:focus,.field input:focus{outline:none; border-color:var(--sky)}
+  /* Custom dropdown: native <select> popups are separate OS-level popup
+     windows, and that class of popup is known to fail to render (or render
+     off-screen) inside an embedded QWebEngineView window on Linux/Wayland.
+     The real <select> stays in the DOM (display:none) as the source of
+     truth for existing load/save code -- this is purely a replacement for
+     its native popup, not its value storage. */
+  .customselect{position:relative}
+  .customselect > select{display:none}
+  .customselect-trigger{width:100%; display:flex; align-items:center; justify-content:space-between; gap:10px;
+    font-family:inherit; font-weight:600; font-size:13.5px; padding:10px 12px; color:var(--text); text-align:left;
+    border:1px solid var(--border); border-radius:var(--radius-sm); background:var(--surface-2); cursor:pointer;}
+  .customselect-trigger:focus{outline:none; border-color:var(--sky)}
+  .customselect-trigger .arrow{color:var(--text-faint); font-size:11px; transition:transform .15s}
+  .customselect.open .customselect-trigger{border-color:var(--sky)}
+  .customselect.open .customselect-trigger .arrow{transform:rotate(180deg)}
+  .customselect-panel{display:none; position:absolute; left:0; right:0; top:calc(100% + 4px); z-index:40;
+    background:var(--surface-2); border:1px solid var(--border); border-radius:var(--radius-sm);
+    box-shadow:var(--shadow); max-height:260px; overflow-y:auto; padding:4px;}
+  .customselect.open .customselect-panel{display:block}
+  .customselect-option{padding:9px 10px; border-radius:6px; font-size:13.5px; font-weight:600; color:var(--text);
+    cursor:pointer; white-space:normal; line-height:1.4;}
+  .customselect-option:hover,.customselect-option.hl{background:var(--surface-3, rgba(255,255,255,.06))}
+  .customselect-option.sel{color:var(--sky)}
   .field .hint{font-weight:500; color:var(--text-faint); font-size:11.5px; margin-top:6px; line-height:1.5}
   .field input[type=range]{width:100%; accent-color:var(--sky)}
   .switch{display:flex; align-items:center; gap:10px; cursor:pointer; user-select:none; color:var(--text)}
@@ -465,6 +488,76 @@ const api = {
                               body: JSON.stringify(body||{})}).then(r => r.json()),
 };
 
+/* custom dropdowns (replaces native <select> popups, which are separate
+   OS-level windows that don't reliably render inside the embedded browser
+   view). Wraps each <select>, hides it, and drives it from a same-DOM panel
+   -- the hidden <select>'s .value stays the single source of truth, so all
+   existing load/save code keeps working unchanged. */
+function enhanceSelects(){
+  document.querySelectorAll("section select").forEach(sel => {
+    if (sel.closest(".customselect")) return;
+    const wrap = document.createElement("div");
+    wrap.className = "customselect";
+    sel.parentNode.insertBefore(wrap, sel);
+    wrap.appendChild(sel);
+
+    const trigger = document.createElement("button");
+    trigger.type = "button";
+    trigger.className = "customselect-trigger";
+    trigger.innerHTML = '<span class="label"></span><span class="arrow">▼</span>';
+    wrap.appendChild(trigger);
+
+    const panel = document.createElement("div");
+    panel.className = "customselect-panel";
+    wrap.appendChild(panel);
+
+    const closeAll = () => document.querySelectorAll(".customselect.open")
+      .forEach(w => w.classList.remove("open"));
+
+    const rebuildPanel = () => {
+      panel.innerHTML = "";
+      [...sel.options].forEach(opt => {
+        const row = document.createElement("div");
+        row.className = "customselect-option" + (opt.value === sel.value ? " sel" : "");
+        row.textContent = opt.textContent;
+        row.onclick = () => {
+          sel.value = opt.value;
+          sel.dispatchEvent(new Event("change", {bubbles:true}));
+          syncSelectLabel(sel);
+          closeAll();
+        };
+        panel.appendChild(row);
+      });
+    };
+
+    trigger.onclick = () => {
+      const isOpen = wrap.classList.contains("open");
+      closeAll();
+      if (!isOpen) { rebuildPanel(); wrap.classList.add("open"); }
+    };
+
+    syncSelectLabel(sel);
+  });
+  document.addEventListener("click", e => {
+    if (!e.target.closest(".customselect")) document.querySelectorAll(".customselect.open")
+      .forEach(w => w.classList.remove("open"));
+  });
+  document.addEventListener("keydown", e => {
+    if (e.key === "Escape") document.querySelectorAll(".customselect.open")
+      .forEach(w => w.classList.remove("open"));
+  });
+}
+function syncSelectLabel(sel){
+  const wrap = sel.closest(".customselect");
+  if (!wrap) return;
+  const opt = sel.options[sel.selectedIndex];
+  wrap.querySelector(".customselect-trigger .label").textContent = opt ? opt.textContent : "";
+}
+function syncAllSelectLabels(){
+  document.querySelectorAll(".customselect > select").forEach(syncSelectLabel);
+}
+enhanceSelects();
+
 /* donut sprinkles */
 (() => {
   const d = $("#donut"), colors = ["#fff","#57B9E8","#FFD90F","#7CB342","#8E24AA"];
@@ -683,6 +776,7 @@ async function loadSettings(){
   $("#s-audio_mute").checked = v.audio_mute;
   $("#s-audio_maxqframes").value = String(v.audio_maxqframes);
   updateBanner(v.mnk_mode);
+  syncAllSelectLabels();
 }
 loadSettings();
 $("#s-mnk_sensitivity").oninput = e => $("#senslabel").textContent = Number(e.target.value).toFixed(1);
