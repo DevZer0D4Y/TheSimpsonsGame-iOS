@@ -19,6 +19,7 @@
 #include <rex/graphics/vulkan/command_processor.h>
 #include <rex/graphics/vulkan/deferred_command_buffer.h>
 #include <rex/math.h>
+#include <rex/perf/counter.h>
 
 namespace rex::graphics::vulkan {
 
@@ -176,12 +177,16 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
 
       case Command::kVkDraw: {
         auto& args = *reinterpret_cast<const ArgsVkDraw*>(stream);
+        PROFILE_DRAW_CALL();
+        PROFILE_VERTICES(int64_t(args.vertex_count) * args.instance_count);
         dfn.vkCmdDraw(command_buffer, args.vertex_count, args.instance_count, args.first_vertex,
                       args.first_instance);
       } break;
 
       case Command::kVkDrawIndexed: {
         auto& args = *reinterpret_cast<const ArgsVkDrawIndexed*>(stream);
+        PROFILE_DRAW_CALL();
+        PROFILE_VERTICES(int64_t(args.index_count) * args.instance_count);
         dfn.vkCmdDrawIndexed(command_buffer, args.index_count, args.instance_count,
                              args.first_index, args.vertex_offset, args.first_instance);
       } break;

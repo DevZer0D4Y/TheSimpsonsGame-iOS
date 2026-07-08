@@ -17,6 +17,7 @@
 #include <rex/filesystem.h>
 #include <rex/logging/sink.h>
 #include <rex/logging.h>
+#include <rex/perf/counter.h>
 #include <rex/ui/overlay/console_overlay.h>
 #include <rex/ui/overlay/debug_overlay.h>
 #include <rex/ui/overlay/settings_overlay.h>
@@ -60,6 +61,23 @@ bool ReXApp::OnInitialize() {
     return false;
   if (!SetupPresentation())
     return false;
+
+  // HAND PATCH: SetGuestFrameStats was declared and wired into the F3 debug
+  // overlay's constructor, but nothing ever called it -- the "Guest: FPS"
+  // line was dead, always skipped by the `stats.frame_count > 0` check in
+  // debug_overlay.cpp. Feed it from the same fps/frame_time_us counters the
+  // perf_log_csv logger already uses (set every swap, see XE_SWAP handling
+  // in command_processor.cpp), so the overlay actually shows live numbers.
+  SetGuestFrameStats([]() -> ui::FrameStats {
+    static uint64_t overlay_frame_counter = 0;
+    ++overlay_frame_counter;
+    ui::FrameStats stats;
+    stats.frame_time_ms =
+        double(rex::perf::GetSnapshotCounter(rex::perf::CounterId::kFrameTimeUs)) / 1000.0;
+    stats.fps = double(rex::perf::GetSnapshotCounter(rex::perf::CounterId::kFps));
+    stats.frame_count = overlay_frame_counter;
+    return stats;
+  });
 
   auto paths = OnFinalizePaths(resolved_defaults_, MakeResumeCallback());
   if (!paths) {

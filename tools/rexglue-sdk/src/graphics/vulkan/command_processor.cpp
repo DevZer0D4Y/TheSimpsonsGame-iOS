@@ -29,6 +29,7 @@
 #include <rex/dbg.h>
 #include <rex/logging.h>
 #include <rex/math.h>
+#include <rex/perf/counter.h>
 #include <rex/graphics/util/draw.h>
 #include <rex/graphics/flags.h>
 #include <rex/graphics/pipeline/shader/shader.h>
@@ -5253,6 +5254,9 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
   size_t fences_total = submissions_in_flight_fences_.size();
   size_t fences_awaited = 0;
   if (await_submission > submission_completed_) {
+    // The CPU has run ahead of the GPU and must block here -- every hit is
+    // lost CPU time that could've been doing other work this frame.
+    PROFILE_CMD_BUFFER_STALL();
     // Await in a blocking way if requested.
     // TODO(Triang3l): Await only one fence. "Fence signal operations that are
     // defined by vkQueueSubmit additionally include in the first
