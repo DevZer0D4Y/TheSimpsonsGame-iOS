@@ -9,6 +9,9 @@ extracted/
 *.xiso
 *.img
 *.xex
+# extracted guest shader microcode (dump_shaders debug cvar output) -- this
+# is the game's own copyrighted shader bytecode, not project source
+shader_dumps/
 
 # Prebuilt toolchains / SDK binaries (downloaded separately, multi-GB)
 tools/clang20/
