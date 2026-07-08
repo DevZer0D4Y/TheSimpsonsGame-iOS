@@ -579,7 +579,10 @@ $("#playbtn").onclick = () => api.post("/api/launch").then(r => {
   $("#playstatus").textContent = r.ok ? "" : ("Launch failed: " + (r.msg || r.error || "unknown error"));
   refresh();
 }).catch(e => { $("#playstatus").textContent = "Launch request failed: " + e; });
-$("#stopbtn").onclick = () => api.post("/api/stop").then(refresh);
+$("#stopbtn").onclick = () => api.post("/api/stop").then(r => {
+  if (!r.ok) $("#playstatus").textContent = "Stop failed: " + (r.msg || r.error || "unknown error");
+  refresh();
+}).catch(e => { $("#playstatus").textContent = "Stop request failed: " + e; });
 $("#steambtn").onclick = async () => {
   const r = await api.post("/api/add-to-steam");
   $("#steammsg").textContent = r.msg;
@@ -641,7 +644,12 @@ async function togglePatch(id, enable){
                  "Steam Deck hardware (SteamOS and Windows alike). Make sure everything else " +
                  "is saved/closed first.\n\nEnable anyway?")) return;
   }
-  await api.post("/api/patch", {id, enable});
+  try {
+    const r = await api.post("/api/patch", {id, enable});
+    if (!r.ok) alert("Patch failed: " + (r.msg || r.error || "unknown error"));
+  } catch (e) {
+    alert("Patch request failed: " + e);
+  }
   refresh();
 }
 
