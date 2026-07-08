@@ -868,16 +868,24 @@ def launch_game():
         if debug_gdb.exists() and shutil.which("gdb"):
             # temporary diagnostics mode: capture a backtrace if the game crashes
             cmd = ["gdb", "-batch", "-x", str(debug_gdb), "--args"] + cmd
-        if shutil.which("systemd-run"):
-            # dedicated scope marked exempt from systemd-oomd pressure kills --
-            # level-load memory spikes were getting the game SIGKILLed.
-            cmd = ["systemd-run", "--user", "--scope", "--collect",
-                   "--unit", "simpsons-game",
-                   "-p", "ManagedOOMPreference=omit"] + cmd
         out = open(crash_log, "w") if debug_gdb.exists() else subprocess.DEVNULL
         game_proc = subprocess.Popen(cmd, cwd=str(BUILD_DIR), env=env,
                                      stdout=out, stderr=subprocess.STDOUT
                                      if debug_gdb.exists() else subprocess.DEVNULL)
+        # HAND PATCH: level-load memory spikes were getting the game SIGKILLed
+        # by systemd-oomd. This used to be handled by wrapping the launch in
+        # `systemd-run --user --scope`, which hands the process off into a
+        # separate transient systemd unit -- that reparents it away from
+        # this process, which broke Steam/gamescope's tracking of the game
+        # window in Gaming Mode (window would open but never get focused/
+        # composited -- "black screen" when switching to it). Writing
+        # oom_score_adj directly protects against the kernel OOM killer AND
+        # systemd-oomd equally well, with no extra process/cgroup hop and no
+        # reparenting -- the game stays a normal direct child.
+        try:
+            (Path(f"/proc/{game_proc.pid}/oom_score_adj")).write_text("-1000")
+        except OSError:
+            pass
         threading.Thread(target=_watch_game_exit, args=(game_proc,), daemon=True).start()
         return True, "launched"
 
@@ -885,9 +893,6 @@ def launch_game():
 def stop_game():
     global game_proc
     with game_proc_lock:
-        if shutil.which("systemctl"):
-            subprocess.run(["systemctl", "--user", "stop", "simpsons-game.scope"],
-                           capture_output=True)
         if game_proc and game_proc.poll() is None:
             game_proc.kill()
             game_proc = None
