@@ -42,6 +42,16 @@ bool SDLAudioDriver::Initialize() {
   // Set audio category for proper OS audio handling
   SDL_SetHint(SDL_HINT_AUDIO_CATEGORY, "playback");
 
+  // HAND PATCH: SDL's default audio driver auto-probe can land on "jack"
+  // before ever trying pipewire/pulseaudio, and if no real JACK server is
+  // reachable (common -- SteamOS runs PipeWire, whose JACK-compatibility
+  // shim isn't always present/started, especially inside sandboxed compat
+  // tool environments like Steam Linux Runtime), SDL_InitSubSystem(AUDIO)
+  // fails outright with "Can't open JACK client" instead of continuing on
+  // to a driver that actually works. Steer it straight at the drivers that
+  // are real, present, and reliable on this platform.
+  SDL_SetHint(SDL_HINT_AUDIO_DRIVER, "pipewire,pulseaudio,alsa");
+
   // Set app name for audio device identification
   SDL_SetAppMetadataProperty(SDL_PROP_APP_METADATA_NAME_STRING, "rexglue");
 
