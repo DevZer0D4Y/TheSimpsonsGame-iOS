@@ -70,6 +70,16 @@ X_STATUS Runtime::Setup(RuntimeConfig config) {
 
   // Start profiler (Tracy network threads, counter init)
   rex::perf::Profiler::Startup();
+#ifdef REXGLUE_ENABLE_PERF_COUNTERS
+  // HAND PATCH: perf_log_csv was declared/defined as a cvar but never
+  // actually wired to SetCsvLogPath(), so per-frame CSV logging (fps,
+  // frame_time_us, draw calls, etc.) was silent dead code -- the file was
+  // never opened. Needed to get real ground-truth frame-rate numbers rather
+  // than guessing from guest-visible behavior.
+  if (!REXCVAR_GET(perf_log_csv).empty()) {
+    rex::perf::SetCsvLogPath(REXCVAR_GET(perf_log_csv));
+  }
+#endif
 
   // Initialize SEH exception support for hardware exception handling
   rex::initialize_seh();

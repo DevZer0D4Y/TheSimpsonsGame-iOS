@@ -19650,8 +19650,25 @@ DEFINE_REX_FUNC(sub_82867A48) {
 	ctx.cr6.compare<uint32_t>(ctx.r3.u32, 0, ctx.xer);
 	// beq cr6,0x82867a78
 	if (ctx.cr6.eq) goto loc_82867A78;
+	// HAND PATCH: guest instruction patch at 0x82867a70, "li r4,2" -> "li r4,1".
+	// This is the swap-interval divisor passed to sub_82718D48 -- 2 means
+	// "wait 2 vblanks between swaps", 1 means "wait 1". Unconditional on
+	// purpose: the actual vblank rate the game sees already comes from the
+	// video_mode_refresh_rate cvar (graphics_system.cpp's vsync worker),
+	// which the launcher's Settings -> Framerate (30/60/90/120) already
+	// writes -- so this just removes the game's own hardcoded "always halve
+	// it" behavior and lets whatever Hz is configured pass straight through.
+	// Matches the verified community 60 FPS patch for this exact title
+	// (xenia-canary/game-patches, title_id 45410809, hash AC429E9FFB91904C,
+	// author tronuo), applied here as an equivalent source-level edit since
+	// this is a static recompilation, not a runtime-patchable emulator. That
+	// patch also touches 0x82159238, but that address falls outside every
+	// function XenonRecomp discovered for this title (nothing recompiled
+	// there to edit) -- so this port is missing whatever secondary
+	// compensation that second patch provides; watch for clipping/collision/
+	// animation artifacts at 60+ that the upstream patch notes don't show.
 	// li r4,2
-	ctx.r4.s64 = 2;
+	ctx.r4.s64 = 1;
 	// bl 0x82718d48
 	ctx.lr = 0x82867A78;
 	sub_82718D48(ctx, base);

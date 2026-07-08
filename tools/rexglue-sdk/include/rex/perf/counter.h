@@ -13,9 +13,13 @@
 #include <cstdint>
 #include <string>
 
+#include <rex/cvar.h>
+
 #ifdef REXGLUE_ENABLE_PROFILING
 #include <tracy/Tracy.hpp>
 #endif
+
+REXCVAR_DECLARE(std::string, perf_log_csv);
 
 namespace rex::perf {
 
