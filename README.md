@@ -109,26 +109,6 @@ Running from source: `launcher/simpsons-launcher.sh` (Linux) or `python launcher
 (Windows, needs Python 3 + `pip install PySide6` for the native window — falls back to opening
 in your browser otherwise). A `.desktop` entry is installed automatically on Linux.
 
-### Adding the Linux launcher as a Steam shortcut
-
-If Steam has trouble launching `simpsons-launcher.sh` directly as a non-Steam game, selecting a
-compatibility tool (e.g. **Steam Linux Runtime**) under the shortcut's Properties → Compatibility
-usually fixes that. But that runs the launcher inside a sandboxed container that can't see your
-normal user Python packages, so it silently falls back to opening in a browser tab instead of
-its own window (functionally identical, just not a dedicated window frame).
-
-To let the container see the host's PySide6 install and get the real window back, add this to
-the shortcut's **Properties → Launch Options**:
-
-```
-PRESSURE_VESSEL_FILESYSTEMS_RO="$HOME/.local" %command%
-```
-
-This tells the sandbox to expose `~/.local` (where `pip install --user` puts PySide6) read-only
-inside the container. If you don't need a compatibility tool for the shortcut to launch at all,
-you don't need this — it's only relevant when something has wrapped the launch in a sandboxed
-runtime.
-
 ## Repository layout
 
 ```
