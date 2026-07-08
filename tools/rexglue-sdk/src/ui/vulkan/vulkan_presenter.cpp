@@ -1342,23 +1342,29 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
     swapchain_create_info.compositeAlpha =
         VkCompositeAlphaFlagBitsKHR(uint32_t(1) << composite_alpha_shift);
   }
-  // As presentation is usually controlled by the GPU command processor, it's
-  // better to use modes that allow as quick acquisition as possible to avoid
-  // interfering with GPU command processing, and also to allow tearing so
-  // variable refresh rate may be used where it's available.
+  // HAND PATCH: upstream Xenia prioritized IMMEDIATE first here for the
+  // lowest possible latency / VRR passthrough. On this fork that meant every
+  // swapchain defaulted to tearing-permitted presentation, which read as
+  // visible flicker in UI-heavy scenes (the main menu) where sharp-contrast
+  // elements make torn/partial frames obvious. MAILBOX gives up essentially
+  // nothing on latency (it never blocks the GPU command processor -- it just
+  // drops all but the newest complete frame at present time) while removing
+  // the tearing, so it's now tried first; IMMEDIATE stays available as a
+  // fallback (and still user-disable-able via its own cvar) for drivers that
+  // don't expose MAILBOX.
   // Note: If the priorities here are changes, update the cvar descriptions.
-  if (REXCVAR_GET(vulkan_allow_present_mode_immediate) &&
-      std::find(present_modes.cbegin(), present_modes.cend(), VK_PRESENT_MODE_IMMEDIATE_KHR) !=
+  if (REXCVAR_GET(vulkan_allow_present_mode_mailbox) &&
+      std::find(present_modes.cbegin(), present_modes.cend(), VK_PRESENT_MODE_MAILBOX_KHR) !=
           present_modes.cend()) {
+    // Allowing dropping frames to reduce latency, but no tearing.
+    swapchain_create_info.presentMode = VK_PRESENT_MODE_MAILBOX_KHR;
+  } else if (REXCVAR_GET(vulkan_allow_present_mode_immediate) &&
+             std::find(present_modes.cbegin(), present_modes.cend(),
+                       VK_PRESENT_MODE_IMMEDIATE_KHR) != present_modes.cend()) {
     // Allowing tearing to reduce latency, and possibly variable refresh rate
     // (though on Windows with borderless fullscreen, GDI copying is used
     // instead of independent flip, so it's not supported there).
     swapchain_create_info.presentMode = VK_PRESENT_MODE_IMMEDIATE_KHR;
-  } else if (REXCVAR_GET(vulkan_allow_present_mode_mailbox) &&
-             std::find(present_modes.cbegin(), present_modes.cend(), VK_PRESENT_MODE_MAILBOX_KHR) !=
-                 present_modes.cend()) {
-    // Allowing dropping frames to reduce latency, but no tearing.
-    swapchain_create_info.presentMode = VK_PRESENT_MODE_MAILBOX_KHR;
   } else if (REXCVAR_GET(vulkan_allow_present_mode_fifo_relaxed) &&
              std::find(present_modes.cbegin(), present_modes.cend(),
                        VK_PRESENT_MODE_FIFO_RELAXED_KHR) != present_modes.cend()) {
