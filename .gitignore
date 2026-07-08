@@ -18,6 +18,13 @@ tools/clang20/
 tools/rexglue-bin/
 tools/runtime-staging/
 
+# Vendored PySide6+QtWebEngine for the launcher's native window (~500MB
+# trimmed). Local-machine fix for Steam Linux Runtime sandboxing hiding the
+# host's ~/.local packages -- not meant for git history. Rebuild with:
+#   pip install --target=launcher/vendor PySide6
+# then trim per the removal lists in this session's commit message.
+launcher/vendor/
+
 # Build outputs
 simpsons/out/
 tools/rexglue-sdk/build/

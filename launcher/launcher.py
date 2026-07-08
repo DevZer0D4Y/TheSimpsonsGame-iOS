@@ -1026,6 +1026,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
 def run_native(url):
     """Native desktop window via PySide6 QWebEngineView."""
+    # HAND PATCH: a Steam shortcut that needs a compatibility tool (e.g.
+    # Steam Linux Runtime) to launch runs this inside a sandboxed container
+    # that can't see the host's ~/.local Python packages, so a normal
+    # `pip install --user PySide6` isn't visible and this silently fell back
+    # to a browser tab. Vendoring a trimmed PySide6+QtWebEngine directly
+    # under launcher/vendor/ (not gitignored intentionally -- see .gitignore
+    # comment) means it travels with the code regardless of sandbox.
+    vendor_dir = LAUNCHER_DIR / "vendor"
+    if vendor_dir.is_dir() and str(vendor_dir) not in sys.path:
+        sys.path.insert(0, str(vendor_dir))
+
     from PySide6.QtCore import QUrl
     from PySide6.QtGui import QIcon
     from PySide6.QtWebEngineWidgets import QWebEngineView
