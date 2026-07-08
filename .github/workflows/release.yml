@@ -86,10 +86,18 @@ jobs:
       - name: Package
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
           $bd = "simpsons/out/build/win-amd64-relwithdebinfo"
           New-Item -ItemType Directory -Force release | Out-Null
           Copy-Item "$bd/simpsons.exe"                 release/
-          Copy-Item "$bd/*.dll"                         release/
+          Copy-Item "$bd/*.dll"                         release/ -ErrorAction SilentlyContinue
+          # REXSDK_DIR's add_subdirectory build does NOT colocate the SDK's
+          # DLLs with the game exe -- they land in the SDK's own out dir
+          # (relative to tools/rexglue-sdk, not $bd) regardless of being
+          # built as a subdirectory of the game project. Confirmed via a
+          # real CI run: rexruntimerd.dll was silently missing from the
+          # package (Copy-Item on a non-matching wildcard doesn't error).
+          Copy-Item "tools/rexglue-sdk/out/win-amd64/*.dll" release/ -ErrorAction SilentlyContinue
           Copy-Item "tools/extract-xiso/build/extract-xiso.exe" release/
           Copy-Item "dist/simpsons-launcher.exe"        release/
           Copy-Item "ffmpeg.exe"                         release/
@@ -98,6 +106,20 @@ jobs:
             '# The Simpsons Game - runtime configuration (edit these via the launcher)',
             'gpu_allow_invalid_fetch_constants = false',
             'gpu_shader_max_cf_iterations = 0')
+
+          # Fail here, not for a player after download, if a required file
+          # never made it into the package (Copy-Item on a non-matching
+          # wildcard is silent, so this is the only real check we get).
+          $required = @("simpsons.exe", "extract-xiso.exe", "simpsons-launcher.exe", "ffmpeg.exe", "rexruntimerd.dll")
+          $required += (Get-ChildItem "$bd" -Filter "*.dll" -Name -ErrorAction SilentlyContinue)
+          $required += (Get-ChildItem "tools/rexglue-sdk/out/win-amd64" -Filter "*.dll" -Name -ErrorAction SilentlyContinue)
+          $required = $required | Select-Object -Unique
+          $missing = $required | Where-Object { -not (Test-Path "release/$_") }
+          if ($missing) {
+            Write-Error "Packaged release is missing required files: $($missing -join ', ')"
+            exit 1
+          }
+
           Compress-Archive -Path release/* -DestinationPath TheSimpsonsGame-Recompiled-Windows-x64.zip -Force
 
       - uses: actions/upload-artifact@v4
@@ -148,7 +170,14 @@ jobs:
           bd="simpsons/out/build/linux-amd64-relwithdebinfo"
           mkdir -p release
           cp "$bd/simpsons" release/
+          # REXSDK_DIR's add_subdirectory build does NOT colocate the SDK's
+          # shared libs with the game executable -- they land in the SDK's
+          # own out dir (relative to tools/rexglue-sdk, not $bd) regardless
+          # of being built as a subdirectory of the game project. Confirmed
+          # via a real CI run: librexruntimerd.so and libTracyClientrd.so
+          # were both missing from the package until this was added.
           cp "$bd"/*.so* release/ 2>/dev/null || true
+          cp tools/rexglue-sdk/out/linux-amd64/*.so* release/ 2>/dev/null || true
           cp tools/extract-xiso/build/extract-xiso release/
           cp -r launcher release/launcher
           cp README.md release/
