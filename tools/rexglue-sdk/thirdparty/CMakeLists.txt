@@ -558,7 +558,7 @@ if(IS_ARM64)
     )
 endif()
 
-target_include_directories(libavutil BEFORE PUBLIC "${FFMPEG_CONFIG_DIR}")
+target_include_directories(libavutil BEFORE PUBLIC "$<BUILD_INTERFACE:${FFMPEG_CONFIG_DIR}>")
 target_include_directories(libavutil
     PUBLIC
         $<BUILD_INTERFACE:${FFMPEG_DIR}>
