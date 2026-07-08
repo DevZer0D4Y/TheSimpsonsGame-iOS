@@ -72,7 +72,7 @@ the launcher (Settings → Input).
   play afterward, not just Level 1:
   1. Start Level 1 and jump across the two jump pads near the beginning. They'll render
      invisible (that's the pop-in), but they still work — jump across anyway.
-  2. Climb up onto the first ledge just past them.
+  2. Don't climb up onto the first ledge just past them.
   3. Rotate the camera into the wall and hold it there until it snaps back to center on its
      own — let it reset itself, don't rotate it back yourself.
   4. Leave the level (if you've already completed it, just exit back out).
