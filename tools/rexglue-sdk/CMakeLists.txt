@@ -18,6 +18,16 @@ option(REXGLUE_ENABLE_SANITIZERS "Enable UndefinedBehaviorSanitizer" OFF)
 option(REXGLUE_ENABLE_FIDELITYFX "Enable optional AMD FidelityFX integration (experimental)" OFF)
 option(REXGLUE_ENABLE_TRACY                "Enable Tracy profiler integration" ON)
 option(REXGLUE_ENABLE_PERF_COUNTERS        "Enable lightweight perf counter registry and overlay" ON)
+# Opt-in: the ~82k mechanically-translated guest functions call each other
+# constantly across ~90 separate translation units, so ordinary per-TU
+# compilation can never inline any of it. ThinLTO lets the compiler see and
+# optimize across that whole call graph at once -- the single biggest lever
+# available for this code shape. Off by default: needs lld (clang's bundled
+# toolchain has it; a bare apt/distro clang install may not), and meaningfully
+# lengthens build+link time. Verified the weak/noinline hand-patch-override
+# alias mechanism (used by simpsons/generated/default's DEFINE_REX_FUNC)
+# survives ThinLTO correctly in an isolated repro before adding this.
+option(REXGLUE_ENABLE_LTO "Enable ThinLTO (needs lld)" OFF)
 # Propagate profiling defines globally (compiled out in Release)
 if(REXGLUE_ENABLE_TRACY)
     add_compile_definitions($<$<NOT:$<CONFIG:Release>>:REXGLUE_ENABLE_PROFILING>)
@@ -118,6 +128,15 @@ add_compile_options(
     $<$<CONFIG:RELWITHDEBINFO>:-O3>
     -fno-char8_t
 )
+
+if(REXGLUE_ENABLE_LTO)
+    if(WIN32)
+        message(WARNING "REXGLUE_ENABLE_LTO: not wired up for Windows/MSVC yet, ignoring")
+    else()
+        add_compile_options(-flto=thin)
+        add_link_options(-flto=thin -fuse-ld=lld)
+    endif()
+endif()
 
 # Platform detection (supports AMD64 and ARM64)
 if(WIN32)

@@ -33,6 +33,18 @@ function(rexglue_apply_target_settings target_name)
             target_compile_options(${target_name} PRIVATE -msse4.1)
         endif()
     endif()
+
+    # Opt-in ThinLTO for the guest-code-heavy targets (see the
+    # REXGLUE_ENABLE_LTO option in the SDK's own CMakeLists.txt for the
+    # rationale and the correctness note on the weak/noinline override alias
+    # mechanism). This mirrors that same gate for consumers using the
+    # packaged SDK (find_package(rexglue)) rather than REXSDK_DIR/
+    # add_subdirectory, where the SDK's own top-level compile/link options
+    # never reach the game target directly.
+    if(REXGLUE_ENABLE_LTO AND NOT WIN32)
+        target_compile_options(${target_name} PRIVATE -flto=thin)
+        target_link_options(${target_name} PRIVATE -flto=thin -fuse-ld=lld)
+    endif()
 endfunction()
 
 #==========================================================
