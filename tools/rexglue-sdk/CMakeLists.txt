@@ -112,6 +112,10 @@ add_compile_options(
     $<$<CONFIG:DEBUG>:-O0>
     $<$<CONFIG:RELEASE>:-O3>
     $<$<CONFIG:RELEASE>:-DNDEBUG>
+    # RelWithDebInfo is what's actually shipped/played (see build.yml/release.yml
+    # presets) -- CMake's own default for it is only -O2. Bump it to -O3 like
+    # Release; -g stays on for crash diagnostics, the two aren't in conflict.
+    $<$<CONFIG:RELWITHDEBINFO>:-O3>
     -fno-char8_t
 )
 
