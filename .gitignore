@@ -69,3 +69,7 @@ gamedata_clean_extract/
 # launcher runtime state
 launcher/last_exit.txt
 launcher/last_run_debug.txt
+launcher/launcher_native_error.log
+
+# codegraph: rebuildable index (tools/codegraph/recomp_index.py build), not source
+tools/codegraph/*.sqlite

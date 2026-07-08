@@ -6,154 +6,167 @@
 <title>The Simpsons Game — Recompiled</title>
 <style>
   :root{
-    --yellow:#FFD90F; --yellow-dark:#F0B90B; --sky:#57B9E8; --sky-deep:#2E86C1;
-    --ink:#232629; --paper:#FFF9E3; --pink:#F06292; --green:#7CB342;
-    --card:#ffffff; --shadow:0 6px 0 rgba(0,0,0,.25);
+    --bg:#0a0c10; --bg-soft:#0f1319;
+    --surface:#161b22; --surface-2:#1c222b; --surface-glass:rgba(22,27,34,.72);
+    --border:rgba(255,255,255,.08); --border-strong:rgba(255,255,255,.16);
+    --text:#eef1f5; --text-dim:#9aa4b2; --text-faint:#6b7480;
+    --yellow:#FFD90F; --yellow-dim:#caa90c;
+    --sky:#57B9E8; --green:#5BC888; --red:#F0654D; --pink:#F06292;
+    --warn-bg:rgba(255,217,15,.10); --warn-border:rgba(255,217,15,.35);
+    --danger-bg:rgba(240,101,77,.12); --danger-border:rgba(240,101,77,.4);
+    --radius:16px; --radius-sm:10px;
+    --shadow:0 8px 24px rgba(0,0,0,.35);
   }
   *{box-sizing:border-box; margin:0; padding:0}
-  body{font-family:"Arial Black", Arial, sans-serif;
-    background:linear-gradient(180deg, var(--sky) 0%, #9AD9F5 55%, #CDEBFA 100%);
-    color:var(--ink); min-height:100vh; overflow-x:hidden;}
-  .cloud{position:fixed; background:#fff; border-radius:50px; opacity:.9; z-index:0;
-         animation:drift linear infinite;}
-  .cloud::before,.cloud::after{content:""; position:absolute; background:#fff; border-radius:50%}
-  .c1{width:140px;height:44px;top:70px;animation-duration:70s}
-  .c1::before{width:60px;height:60px;top:-28px;left:22px}
-  .c1::after{width:44px;height:44px;top:-18px;left:70px}
-  .c2{width:100px;height:34px;top:190px;animation-duration:95s;animation-delay:-30s}
-  .c2::before{width:44px;height:44px;top:-20px;left:16px}
-  .c2::after{width:34px;height:34px;top:-14px;left:52px}
-  .c3{width:170px;height:50px;top:330px;animation-duration:120s;animation-delay:-70s;opacity:.65}
-  .c3::before{width:70px;height:70px;top:-32px;left:28px}
-  .c3::after{width:50px;height:50px;top:-20px;left:88px}
-  @keyframes drift{from{left:-220px}to{left:110vw}}
+  html{color-scheme:dark}
+  body{font-family:"Segoe UI", system-ui, -apple-system, "Inter", Arial, sans-serif;
+    background:
+      radial-gradient(1100px 600px at 15% -10%, rgba(87,185,232,.14), transparent 60%),
+      radial-gradient(900px 500px at 100% 0%, rgba(255,217,15,.08), transparent 55%),
+      var(--bg);
+    color:var(--text); min-height:100vh; line-height:1.4;}
 
-  .wrap{position:relative; z-index:1; max-width:1080px; margin:0 auto; padding:22px}
-  header{display:flex; align-items:center; gap:18px; margin-bottom:18px}
-  .donut{width:64px;height:64px;border-radius:50%;
-    background:radial-gradient(circle at 50% 50%, transparent 0 12px, #E8A33D 12px 15px, var(--pink) 15px 30px, #D5822B 30px 32px);
-    position:relative; flex:none; animation:spinSlow 14s linear infinite}
-  .donut i{position:absolute;width:7px;height:3px;border-radius:2px}
+  .wrap{position:relative; z-index:1; max-width:1120px; margin:0 auto; padding:28px 24px 60px}
+  header{display:flex; align-items:center; gap:16px; margin-bottom:22px}
+  .donut{width:46px;height:46px;border-radius:50%;
+    background:radial-gradient(circle at 50% 50%, transparent 0 8px, #E8A33D 8px 10px, var(--pink) 10px 20px, #D5822B 20px 21.5px);
+    position:relative; flex:none; filter:drop-shadow(0 2px 6px rgba(0,0,0,.4)); animation:spinSlow 16s linear infinite}
+  .donut i{position:absolute;width:5px;height:2px;border-radius:2px}
   @keyframes spinSlow{to{transform:rotate(360deg)}}
-  h1{font-size:34px; letter-spacing:1px; color:var(--yellow);
-     text-shadow:3px 3px 0 var(--ink), -1px -1px 0 var(--ink), 1px -1px 0 var(--ink), -1px 1px 0 var(--ink);
-     transform:skew(-4deg); line-height:.95}
-  h1 small{display:block; font-size:14px; color:#fff; letter-spacing:6px}
+  h1{font-size:22px; font-weight:800; letter-spacing:.3px; color:var(--text)}
+  h1 small{display:block; font-size:11px; font-weight:700; color:var(--yellow); letter-spacing:3px; margin-top:2px}
+  .headerspacer{flex:1}
+  .verchip{font-size:12px; color:var(--text-faint); font-weight:600; border:1px solid var(--border);
+    padding:5px 11px; border-radius:999px; background:var(--surface)}
 
-  nav{display:flex; gap:8px; margin-bottom:16px; flex-wrap:wrap}
-  nav button{font-family:inherit; font-size:15px; border:3px solid var(--ink); border-radius:12px;
-    background:var(--paper); padding:10px 20px; cursor:pointer; box-shadow:var(--shadow);
-    transition:transform .06s;}
-  nav button:hover{transform:translateY(-2px)}
-  nav button.active{background:var(--yellow)}
+  nav{display:flex; gap:6px; margin-bottom:20px; flex-wrap:wrap; border-bottom:1px solid var(--border); padding-bottom:0}
+  nav button{font-family:inherit; font-size:13.5px; font-weight:700; letter-spacing:.2px; border:none;
+    background:transparent; color:var(--text-dim); padding:11px 16px; cursor:pointer;
+    border-bottom:2px solid transparent; transition:color .15s, border-color .15s;}
+  nav button:hover{color:var(--text)}
+  nav button.active{color:var(--yellow); border-bottom-color:var(--yellow)}
 
-  .card{background:var(--card); border:3px solid var(--ink); border-radius:16px;
-        box-shadow:var(--shadow); padding:20px; margin-bottom:16px}
-  h2{font-size:20px; margin-bottom:14px; transform:skew(-3deg)}
-  h3{font-size:15px; margin:16px 0 10px; color:var(--sky-deep)}
+  .card{background:var(--surface); border:1px solid var(--border); border-radius:var(--radius);
+        box-shadow:var(--shadow); padding:22px; margin-bottom:16px}
+  h2{font-size:15px; font-weight:800; letter-spacing:.4px; margin-bottom:14px; color:var(--text)}
+  h3{font-size:12.5px; font-weight:800; letter-spacing:.6px; text-transform:uppercase; margin:20px 0 12px; color:var(--sky)}
 
-  .hero{position:relative; border:3px solid var(--ink); border-radius:16px; overflow:hidden;
-        height:330px; box-shadow:var(--shadow); background:#111}
+  .hero{position:relative; border:1px solid var(--border); border-radius:var(--radius); overflow:hidden;
+        height:340px; box-shadow:var(--shadow); background:#0d0f12}
   .hero img{width:100%; height:100%; object-fit:cover; display:block; transition:opacity .8s}
   .hero .scrim{position:absolute; inset:0;
-       background:linear-gradient(180deg, transparent 40%, rgba(0,0,0,.75))}
-  .hero .inner{position:absolute; left:24px; right:24px; bottom:20px; display:flex;
+       background:linear-gradient(180deg, rgba(10,12,16,.15) 30%, rgba(10,12,16,.92) 100%)}
+  .hero .inner{position:absolute; left:26px; right:26px; bottom:22px; display:flex;
        align-items:flex-end; justify-content:space-between; gap:14px}
-  .playbtn{font-family:inherit; font-size:26px; padding:16px 44px; border-radius:16px;
-    border:4px solid var(--ink); background:var(--yellow); cursor:pointer;
-    box-shadow:0 8px 0 rgba(0,0,0,.35); letter-spacing:2px;}
-  .playbtn:hover{background:var(--yellow-dark)}
-  .playbtn:disabled{background:#bbb; cursor:not-allowed}
-  .stopbtn{font-family:inherit; font-size:14px; padding:10px 18px; border-radius:12px;
-    border:3px solid var(--ink); background:#ff7043; cursor:pointer; box-shadow:var(--shadow)}
-  .statusline{color:#fff; font-family:Arial; font-weight:bold; font-size:14px;
-    text-shadow:1px 1px 2px #000}
-  .banner{display:flex; gap:10px; align-items:center; background:var(--yellow);
-    border:3px solid var(--ink); border-radius:12px; padding:10px 14px; margin-top:14px;
-    font-family:Arial; font-weight:bold; font-size:14px; box-shadow:var(--shadow)}
-  .banner.kbm{background:#C5E1A5}
-  .banner .em{font-size:22px}
-  .badges{display:flex; gap:10px; margin-top:14px; flex-wrap:wrap}
-  .badge{font-family:Arial; font-weight:bold; font-size:13px; border:3px solid var(--ink);
-    padding:7px 14px; border-radius:999px; background:#eee; box-shadow:var(--shadow)}
-  .badge.ready{background:var(--green); color:#fff}
-  .badge .dot{display:inline-block;width:9px;height:9px;border-radius:50%;
-    background:rgba(255,255,255,.9); margin-right:7px}
+  .playbtn{font-family:inherit; font-size:16px; font-weight:800; letter-spacing:.5px; padding:15px 40px;
+    border-radius:var(--radius-sm); border:none; background:var(--yellow); color:#1a1300; cursor:pointer;
+    box-shadow:0 4px 18px rgba(255,217,15,.35); transition:transform .1s, box-shadow .1s;}
+  .playbtn:hover:not(:disabled){transform:translateY(-1px); box-shadow:0 6px 22px rgba(255,217,15,.45)}
+  .playbtn:disabled{background:#3a3f47; color:var(--text-faint); cursor:not-allowed; box-shadow:none}
+  .stopbtn{font-family:inherit; font-size:13px; font-weight:700; padding:11px 18px; border-radius:var(--radius-sm);
+    border:1px solid var(--danger-border); background:var(--danger-bg); color:#ffb4a4; cursor:pointer;}
+  .statusline{color:var(--text); font-weight:600; font-size:13.5px; opacity:.9}
+  .banner{display:flex; gap:12px; align-items:center; background:var(--surface-2);
+    border:1px solid var(--border); border-radius:var(--radius-sm); padding:12px 16px; margin-top:14px;
+    font-size:13px; color:var(--text-dim);}
+  .banner.kbm{border-color:rgba(91,200,136,.35); background:rgba(91,200,136,.08); color:#bfe9cf}
+  .banner .em{font-size:19px}
+  .badges{display:flex; gap:8px; margin-top:14px; flex-wrap:wrap}
+  .badge{font-weight:700; font-size:11.5px; letter-spacing:.3px; border:1px solid var(--border);
+    padding:6px 12px; border-radius:999px; background:var(--surface-2); color:var(--text-dim)}
+  .badge.ready{background:rgba(91,200,136,.14); border-color:rgba(91,200,136,.35); color:#a6e9c1}
+  .badge.experimental{background:rgba(255,217,15,.12); border-color:rgba(255,217,15,.35); color:var(--yellow)}
+  .badge .dot{display:inline-block;width:7px;height:7px;border-radius:50%;
+    background:currentColor; margin-right:6px; opacity:.9}
+
+  /* disclaimer / warning callouts */
+  .callout{border-radius:var(--radius-sm); padding:14px 16px; font-size:13px; line-height:1.55;
+    display:flex; gap:12px; align-items:flex-start; margin-bottom:14px}
+  .callout .em{font-size:19px; flex:none; line-height:1}
+  .callout b{color:var(--text)}
+  .callout.warn{background:var(--warn-bg); border:1px solid var(--warn-border); color:#f2e7b8}
+  .callout.danger{background:var(--danger-bg); border:1px solid var(--danger-border); color:#f5c6bb}
+  .callout.info{background:rgba(87,185,232,.08); border:1px solid rgba(87,185,232,.3); color:#c9e6f5}
+  .footer-legal{margin-top:26px; padding-top:18px; border-top:1px solid var(--border);
+    font-size:11.5px; color:var(--text-faint); line-height:1.6; text-align:center}
 
   .grid{display:grid; grid-template-columns:1fr 1fr; gap:14px}
-  .field{font-family:Arial; font-weight:bold; font-size:14px}
-  .field label{display:block; margin-bottom:6px}
+  .field{font-size:13px; font-weight:600; color:var(--text-dim)}
+  .field label{display:block; margin-bottom:7px; color:var(--text)}
   .field select,.field input[type=text],.field input[type=number]{
-    width:100%; font-family:Arial; font-weight:bold; font-size:14px; padding:9px 10px;
-    border:3px solid var(--ink); border-radius:10px; background:var(--paper)}
-  .field .hint{font-weight:normal; color:#666; font-size:12px; margin-top:4px}
-  .field input[type=range]{width:100%}
-  .switch{display:flex; align-items:center; gap:10px; cursor:pointer; user-select:none}
-  .switch input{width:22px;height:22px; accent-color:var(--sky-deep)}
-  .savebtn{margin-top:16px; font-family:inherit; font-size:16px; padding:12px 30px;
-    border-radius:12px; border:3px solid var(--ink); background:var(--green); color:#fff;
-    cursor:pointer; box-shadow:var(--shadow)}
-  .saved{color:var(--green); font-family:Arial; font-weight:bold; margin-left:12px}
-  .warn{background:#FFF3CD; border:3px solid var(--ink); border-radius:10px; padding:10px 12px;
-    font-family:Arial; font-size:13px; margin-top:10px}
+    width:100%; font-family:inherit; font-weight:600; font-size:13.5px; padding:10px 12px; color:var(--text);
+    border:1px solid var(--border); border-radius:var(--radius-sm); background:var(--surface-2);}
+  .field select:focus,.field input:focus{outline:none; border-color:var(--sky)}
+  .field .hint{font-weight:500; color:var(--text-faint); font-size:11.5px; margin-top:6px; line-height:1.5}
+  .field input[type=range]{width:100%; accent-color:var(--sky)}
+  .switch{display:flex; align-items:center; gap:10px; cursor:pointer; user-select:none; color:var(--text)}
+  .switch input{width:18px;height:18px; accent-color:var(--sky)}
+  .savebtn{margin-top:18px; font-family:inherit; font-size:14px; font-weight:800; padding:12px 28px;
+    border-radius:var(--radius-sm); border:none; background:var(--green); color:#08210f;
+    cursor:pointer; box-shadow:0 4px 14px rgba(91,200,136,.3)}
+  .saved{color:#a6e9c1; font-weight:700; margin-left:12px; font-size:13px}
 
-  .console{background:#181c20; color:#c6e2ff; font:12px/1.5 monospace; border-radius:10px;
-    border:3px solid var(--ink); padding:12px; height:200px; overflow-y:auto;
+  .console{background:#06070a; color:#9fd0ef; font:12px/1.55 "SF Mono", Consolas, monospace; border-radius:var(--radius-sm);
+    border:1px solid var(--border); padding:14px; height:200px; overflow-y:auto;
     white-space:pre-wrap; word-break:break-all}
-  .row{display:flex; gap:10px; align-items:center}
-  .row input[type=text]{flex:1}
-  .bigbtn{font-family:inherit; font-size:15px; padding:11px 22px; border-radius:12px;
-    border:3px solid var(--ink); background:var(--sky-deep); color:#fff; cursor:pointer;
-    box-shadow:var(--shadow); white-space:nowrap}
-  .bigbtn.alt{background:var(--pink)}
-  .bigbtn:disabled{background:#999; cursor:not-allowed}
-  .smallbtn{font-family:Arial; font-weight:bold; font-size:12px; padding:6px 12px;
-    border-radius:9px; border:2px solid var(--ink); background:var(--paper); cursor:pointer}
-  .ok{color:var(--green)} .err{color:#e53935}
-  .muted{font-family:Arial; color:#555; font-size:14px; line-height:1.6}
-  .lockart{font-size:64px; text-align:center; padding:26px 0 8px}
-  a{color:var(--sky-deep)}
+  .row{display:flex; gap:10px; align-items:center; flex-wrap:wrap}
+  .row input[type=text]{flex:1; min-width:200px}
+  .bigbtn{font-family:inherit; font-size:13.5px; font-weight:700; padding:11px 20px; border-radius:var(--radius-sm);
+    border:1px solid var(--border-strong); background:var(--surface-2); color:var(--text); cursor:pointer;
+    white-space:nowrap; transition:background .15s, border-color .15s;}
+  .bigbtn:hover:not(:disabled){background:#242b35; border-color:var(--sky)}
+  .bigbtn.alt{background:var(--sky); color:#05202e; border-color:var(--sky)}
+  .bigbtn.gold{background:var(--yellow); color:#1a1300; border-color:var(--yellow)}
+  .bigbtn:disabled{background:#20242b; color:var(--text-faint); cursor:not-allowed; border-color:var(--border)}
+  .smallbtn{font-family:inherit; font-weight:700; font-size:11.5px; padding:7px 13px;
+    border-radius:8px; border:1px solid var(--border-strong); background:var(--surface-2); color:var(--text); cursor:pointer}
+  .ok{color:#a6e9c1} .err{color:#f5988a}
+  .muted{color:var(--text-dim); font-size:13.5px; line-height:1.6}
+  .lockart{font-size:50px; text-align:center; padding:20px 0 6px; opacity:.7}
+  a{color:var(--sky); text-decoration:none} a:hover{text-decoration:underline}
   .hidden{display:none}
 
-  table{width:100%; border-collapse:collapse; font-family:Arial; font-size:13px}
-  td,th{border-bottom:2px solid #eee; padding:8px 6px; text-align:left}
+  table{width:100%; border-collapse:collapse; font-size:12.5px}
+  td,th{border-bottom:1px solid var(--border); padding:9px 6px; text-align:left; color:var(--text-dim)}
 
   /* file browser modal */
-  .modal{position:fixed; inset:0; background:rgba(0,0,0,.55); z-index:50;
-    display:flex; align-items:center; justify-content:center}
+  .modal{position:fixed; inset:0; background:rgba(0,0,0,.65); z-index:50;
+    display:flex; align-items:center; justify-content:center; backdrop-filter:blur(3px)}
   .modal.hidden{display:none}
-  .modal .box{background:var(--card); border:4px solid var(--ink); border-radius:16px;
+  .modal .box{background:var(--surface); border:1px solid var(--border-strong); border-radius:var(--radius);
     width:640px; max-width:92vw; max-height:80vh; display:flex; flex-direction:column;
-    box-shadow:0 12px 0 rgba(0,0,0,.3)}
-  .modal .head{padding:14px 18px; border-bottom:3px solid var(--ink);
-    display:flex; justify-content:space-between; align-items:center}
-  .modal .path{font-family:monospace; font-size:12px; color:#555; padding:6px 18px;
-    border-bottom:2px solid #eee; word-break:break-all}
+    box-shadow:0 20px 60px rgba(0,0,0,.5)}
+  .modal .head{padding:16px 20px; border-bottom:1px solid var(--border);
+    display:flex; justify-content:space-between; align-items:center; font-weight:700}
+  .modal .path{font-family:monospace; font-size:11.5px; color:var(--text-faint); padding:8px 20px;
+    border-bottom:1px solid var(--border); word-break:break-all}
   .modal .list{overflow-y:auto; flex:1; padding:6px 0}
-  .modal .entry{padding:9px 18px; font-family:Arial; font-weight:bold; font-size:14px;
-    cursor:pointer; display:flex; justify-content:space-between}
-  .modal .entry:hover{background:var(--paper)}
+  .modal .entry{padding:10px 20px; font-weight:600; font-size:13.5px;
+    cursor:pointer; display:flex; justify-content:space-between; color:var(--text-dim)}
+  .modal .entry:hover{background:var(--surface-2); color:var(--text)}
   .patchrow{display:flex; justify-content:space-between; align-items:center; gap:14px;
-    padding:12px 0; border-bottom:2px solid #eee; font-family:Arial}
-  .patchrow b{font-size:15px}
-  .patchrow .desc{font-size:13px; color:#555; font-weight:normal; margin-top:3px}
+    padding:14px 0; border-bottom:1px solid var(--border)}
+  .patchrow:last-child{border-bottom:none}
+  .patchrow b{font-size:14px; color:var(--text)}
+  .patchrow .desc{font-size:12.5px; color:var(--text-dim); font-weight:500; margin-top:4px; line-height:1.5}
 </style>
 </head>
 <body>
-<div class="cloud c1"></div><div class="cloud c2"></div><div class="cloud c3"></div>
 <div class="wrap">
   <header>
     <div class="donut" id="donut"></div>
-    <h1>THE SIMPSONS GAME<small>R E C O M P I L E D</small></h1>
+    <h1>THE SIMPSONS GAME<small>RECOMPILED</small></h1>
+    <div class="headerspacer"></div>
+    <div class="verchip" id="verchip">v…</div>
   </header>
 
   <nav>
-    <button data-tab="play" class="active">▶ PLAY</button>
-    <button data-tab="install">💿 INSTALL</button>
-    <button data-tab="settings">⚙ SETTINGS</button>
-    <button data-tab="patches">🩹 PATCHES</button>
-    <button data-tab="mods">🧩 MODS</button>
-    <button data-tab="about">ℹ ABOUT</button>
+    <button data-tab="play" class="active">▶ Play</button>
+    <button data-tab="install">💿 Install</button>
+    <button data-tab="settings">⚙ Settings</button>
+    <button data-tab="patches">🩹 Patches</button>
+    <button data-tab="mods">🧩 Mods</button>
+    <button data-tab="about">ℹ About</button>
   </nav>
 
   <!-- ============================= PLAY ============================= -->
@@ -175,7 +188,7 @@
     </div>
     <div class="badges" id="platformbadges"></div>
     <div class="row" style="margin-top:14px">
-      <button class="bigbtn" id="steambtn">🎮 ADD TO STEAM (Gaming Mode)</button>
+      <button class="bigbtn" id="steambtn">🎮 Add to Steam (Gaming Mode)</button>
       <span class="muted" id="steammsg"></span>
     </div>
     <div class="card" style="margin-top:16px">
@@ -186,17 +199,19 @@
 
   <!-- ============================ INSTALL =========================== -->
   <section id="tab-install" class="hidden">
+    <div class="callout info">
+      <span class="em">💿</span>
+      <div>This project ships <b>no copyrighted game files</b>. Provide an ISO of
+      <b>The Simpsons Game (Xbox 360)</b> that <b>you personally own</b> — the launcher reads
+      your disc image locally and installs it next to the recompiled engine. Nothing is
+      uploaded anywhere.</div>
+    </div>
     <div class="card">
       <h2>INSTALL FROM YOUR GAME DISC</h2>
-      <p class="muted" style="margin-bottom:12px">
-        This project ships <b>no copyrighted game files</b>. Provide an ISO of
-        <b>The Simpsons Game (Xbox&nbsp;360)</b> that you own — the launcher extracts your disc's
-        data and installs it next to the recompiled engine.
-      </p>
       <div class="row">
         <input type="text" id="isopath" placeholder="/path/to/Simpsons_Game.iso">
-        <button class="bigbtn alt" id="browsebtn">📂 BROWSE…</button>
-        <button class="bigbtn" id="installbtn">EXTRACT &amp; INSTALL</button>
+        <button class="bigbtn alt" id="browsebtn">📂 Browse…</button>
+        <button class="bigbtn gold" id="installbtn">Extract &amp; Install</button>
       </div>
       <p class="muted" id="installstate" style="margin-top:10px"></p>
       <div class="console" id="installlog" style="margin-top:10px">–</div>
@@ -204,7 +219,7 @@
     <div class="card">
       <h2>SAVE DATA</h2>
       <div class="row">
-        <button class="bigbtn" id="backupbtn">💾 BACK UP SAVES</button>
+        <button class="bigbtn" id="backupbtn">💾 Back up saves</button>
         <span class="muted" id="backupmsg"></span>
       </div>
       <table id="backuptable" style="margin-top:12px"></table>
@@ -212,7 +227,7 @@
     <div class="card">
       <h2>LAUNCHER ARTWORK</h2>
       <p class="muted">Backgrounds are frame-grabs from the cutscenes in your installed copy.
-        <button class="smallbtn" id="regenart" style="margin-left:10px">REGENERATE</button>
+        <button class="smallbtn" id="regenart" style="margin-left:10px">Regenerate</button>
       </p>
     </div>
   </section>
@@ -247,7 +262,7 @@
           <label class="switch"><input type="checkbox" id="s-present_letterbox"> Letterbox non-native aspect ratios</label>
         </div>
       </div>
-      <h3>QUALITY</h3>
+      <h3>Quality</h3>
       <div class="grid">
         <div class="field">
           <label>Render resolution scale</label>
@@ -276,7 +291,7 @@
           </select>
         </div>
       </div>
-      <h3>FRAMERATE</h3>
+      <h3>Framerate</h3>
       <div class="grid">
         <div class="field">
           <label>Refresh rate / FPS target</label>
@@ -339,11 +354,21 @@
         </div>
       </div>
     </div>
-    <button class="savebtn" id="savebtn">SAVE SETTINGS</button><span class="saved hidden" id="savedmark">✔ saved — restart the game for some changes</span>
+    <button class="savebtn" id="savebtn">Save Settings</button><span class="saved hidden" id="savedmark">✔ saved — restart the game for some changes</span>
   </section>
 
   <!-- ============================ PATCHES =========================== -->
   <section id="tab-patches" class="hidden">
+    <div class="callout warn" id="popin-warning">
+      <span class="em">⚠</span>
+      <div><b>Steam Deck players:</b> the "Instant character pop-in" patch below is known to
+      <b>hang the GPU and crash the whole desktop session</b> on Steam Deck's AMD hardware —
+      this reproduces identically whether you're on SteamOS or Steam Deck's own Windows
+      dual-boot, so it isn't a one-off fluke. Leave it <b>OFF</b> unless you're specifically
+      testing it and are prepared for a hard crash (save your game and close other work
+      first). It's expected to work fine on most other GPUs/PCs — this is a known, actively
+      investigated compatibility issue, not something you're doing wrong.</div>
+    </div>
     <div class="card">
       <h2>GAME PATCHES</h2>
       <p class="muted">One-click tweaks applied to your installed copy. Everything is reversible.</p>
@@ -366,24 +391,57 @@
 
   <!-- ============================= ABOUT ============================ -->
   <section id="tab-about" class="hidden">
-    <div class="card">
+    <div class="card" id="updatecard">
       <h2>UPDATES</h2>
       <div class="row">
-        <button class="bigbtn" id="updatebtn">🔄 CHECK FOR UPDATES</button>
+        <button class="bigbtn" id="updatebtn">🔄 Check for updates</button>
+        <button class="bigbtn gold hidden" id="applyupdatebtn">⬇ Update now</button>
         <span class="muted" id="updatemsg"></span>
       </div>
     </div>
+
+    <div class="callout danger">
+      <span class="em">⚖</span>
+      <div><b>Ownership &amp; legal notice.</b> <i>The Simpsons Game</i> © 2007 Electronic Arts /
+      Fox. This is an unaffiliated, non-commercial preservation/compatibility project — it is
+      not endorsed by, sponsored by, or affiliated with EA, Fox, or any rightsholder. It
+      contains <b>zero</b> original game assets, code, or copyrighted content of any kind; it
+      only reads and translates data from a copy of the game <b>you legally own</b>. You are
+      responsible for complying with your local laws regarding backups/format-shifting of
+      media you own. No warranty of any kind is provided — use at your own risk.</div>
+    </div>
+
     <div class="card">
       <h2>ABOUT</h2>
       <p class="muted">
-        <b>The Simpsons Game — Recompiled</b> <span id="verlabel"></span> — a fan-made static
-        recompilation of the Xbox&nbsp;360 game to a native executable.<br><br>
-        • You must own the original game; this project contains no game assets.<br>
-        • Platform status: <b>Linux / Steam Deck</b> playable today · <b>Windows</b> in development
-          (builds via CI once open-sourced) · <b>Android</b> planned.<br>
-        • Powered by the ReXGlue recompilation SDK (Xenia-derived GPU/kernel emulation).<br><br>
-        <span id="aboutgithub">Source code: GitHub link coming soon.</span>
+        <b>The Simpsons Game — Recompiled</b> <span id="verlabel"></span> is a fan-made
+        <b>static recompilation</b>: the original Xbox 360 game code is translated ahead-of-time
+        into a native executable for your machine, rather than emulated instruction-by-instruction
+        at runtime — running against a Xenia-derived GPU/kernel emulation layer (the ReXGlue SDK).
       </p>
+      <h3>Platform status</h3>
+      <p class="muted">
+        • <b>Linux / Steam Deck</b> — playable: menus, saves, video, full gameplay.<br>
+        • <b>Windows</b> — experimental, builds and boots via CI; shares the same GPU
+          compatibility caveat noted in the Patches tab on Steam Deck's own hardware.<br>
+        • <b>Android</b> — planned, not started.
+      </p>
+      <h3>Credits</h3>
+      <p class="muted">
+        • Static recompilation approach in the style of
+        <a href="https://github.com/hedge-dev/XenonRecomp" target="_blank" rel="noopener">XenonRecomp</a>.<br>
+        • GPU/kernel emulation via the ReXGlue SDK, derived from
+        <a href="https://xenia.jp" target="_blank" rel="noopener">Xenia</a>, the Xbox 360 emulator.<br>
+        • Uses SDL3, Dear ImGui, glslang/SPIRV-Tools, FFmpeg, spdlog, fmt, and the Tracy
+        profiler, each under their own open-source licenses.<br>
+        <span id="aboutgithub"></span>
+      </p>
+    </div>
+
+    <div class="footer-legal">
+      Not affiliated with Electronic Arts, Fox, or Microsoft. Xbox 360 and related marks are
+      trademarks of their respective owners. This project distributes no game data — you must
+      supply your own legally-owned copy.
     </div>
   </section>
 </div>
@@ -392,7 +450,7 @@
 <div class="modal hidden" id="browsemodal">
   <div class="box">
     <div class="head"><b>Choose your game ISO</b>
-      <button class="smallbtn" id="browseclose">✕ CLOSE</button></div>
+      <button class="smallbtn" id="browseclose">✕ Close</button></div>
     <div class="path" id="browsepath"></div>
     <div class="list" id="browselist"></div>
   </div>
@@ -411,8 +469,8 @@ const api = {
 (() => {
   const d = $("#donut"), colors = ["#fff","#57B9E8","#FFD90F","#7CB342","#8E24AA"];
   for (let i=0;i<10;i++){
-    const s=document.createElement("i"), a=i/10*2*Math.PI, r=22;
-    s.style.left=(32+Math.cos(a)*r-4)+"px"; s.style.top=(32+Math.sin(a)*r-2)+"px";
+    const s=document.createElement("i"), a=i/10*2*Math.PI, r=15;
+    s.style.left=(23+Math.cos(a)*r-3)+"px"; s.style.top=(23+Math.sin(a)*r-1)+"px";
     s.style.background=colors[i%colors.length];
     s.style.transform=`rotate(${(a*57+90)|0}deg)`; d.appendChild(s);
   }
@@ -452,11 +510,20 @@ async function refresh(){
     $("#playstatus").textContent = st.running ? "Game is running — have fun in Springfield!" :
       ready ? `Ready to play · engine build ${st.engine_date} · launcher v${st.version}` :
       !st.engine_ready ? "Engine binary missing — build the project first" :
-      "Game data not installed — open the INSTALL tab and use your ISO";
+      "Game data not installed — open the Install tab and use your ISO";
     $("#platformbadges").innerHTML = st.platforms.map(p =>
-      `<span class="badge ${p.state==="ready"?"ready":""}"><span class="dot"></span>${p.name} — ${p.state.toUpperCase()}</span>`).join("");
+      `<span class="badge ${p.state}"><span class="dot"></span>${p.name} — ${p.state.toUpperCase()}</span>`).join("");
     $("#verlabel").textContent = "v" + st.version;
-    if (st.update && st.update.checked) $("#updatemsg").textContent = st.update.msg;
+    $("#verchip").textContent = "v" + st.version;
+    if (st.update && st.update.checked) {
+      $("#updatemsg").textContent = st.update.applying ? (st.update.apply_msg || "Updating…") : st.update.msg;
+      $("#applyupdatebtn").classList.toggle("hidden", !st.update.update_available);
+      $("#applyupdatebtn").disabled = !!st.update.applying;
+      $("#updatebtn").disabled = !!st.update.applying;
+    }
+    if (st.github_repo) {
+      $("#aboutgithub").innerHTML = `Source code: <a href="https://github.com/${st.github_repo}" target="_blank" rel="noopener">github.com/${st.github_repo}</a>`;
+    }
     /* install progress */
     const inst = st.install;
     $("#installlog").textContent = (inst.log && inst.log.length) ? inst.log.join("\n") : "–";
@@ -470,7 +537,7 @@ async function refresh(){
     /* backups */
     $("#backuptable").innerHTML = (st.backups||[]).map(b =>
       `<tr><td>${b.name}</td><td>${b.date}</td><td>${b.size_kb} KB</td>
-       <td><button class="smallbtn" onclick="restoreSave('${b.name}')">RESTORE</button></td></tr>`).join("") ||
+       <td><button class="smallbtn" onclick="restoreSave('${b.name}')">Restore</button></td></tr>`).join("") ||
       "<tr><td class='muted'>No backups yet.</td></tr>";
     /* mods */
     $("#modtable").innerHTML = (st.mods||[]).map(m => `<tr><td>🧩 ${m}</td><td class="muted">waiting for mod loader</td></tr>`).join("") ||
@@ -481,7 +548,7 @@ async function refresh(){
         <div><b>${p.name}</b><div class="desc">${p.desc}</div></div>
         ${p.available && (p.state === "on" || p.state === "off")
           ? `<button class="bigbtn ${p.state==="on"?"alt":""}" onclick="togglePatch('${p.id}', ${p.state!=="on"})">
-               ${p.state==="on" ? "ENABLED — CLICK TO DISABLE" : "ENABLE"}</button>`
+               ${p.state==="on" ? "ENABLED — click to disable" : "Enable"}</button>`
           : `<span class="muted">${p.state}</span>`}
       </div>`).join("");
   }catch(e){ $("#playstatus").textContent = "launcher backend unreachable"; }
@@ -508,7 +575,10 @@ setInterval(async () => {
 }, 3000);
 
 /* play / stop / steam */
-$("#playbtn").onclick = () => api.post("/api/launch").then(refresh);
+$("#playbtn").onclick = () => api.post("/api/launch").then(r => {
+  $("#playstatus").textContent = r.ok ? "" : ("Launch failed: " + (r.msg || r.error || "unknown error"));
+  refresh();
+}).catch(e => { $("#playstatus").textContent = "Launch request failed: " + e; });
 $("#stopbtn").onclick = () => api.post("/api/stop").then(refresh);
 $("#steambtn").onclick = async () => {
   const r = await api.post("/api/add-to-steam");
@@ -518,7 +588,7 @@ $("#steambtn").onclick = async () => {
 /* install + browse modal */
 $("#installbtn").onclick = () => {
   const iso = $("#isopath").value.trim();
-  if (!iso) { alert("Choose your ISO file first (BROWSE…)."); return; }
+  if (!iso) { alert("Choose your ISO file first (Browse…)."); return; }
   api.post("/api/install", {iso_path: iso}).then(refresh);
 };
 $("#regenart").onclick = () => api.post("/api/regen-art");
@@ -566,6 +636,11 @@ async function restoreSave(name){
 
 /* patches */
 async function togglePatch(id, enable){
+  if (id === "instant_popin" && enable) {
+    if (!confirm("This is known to HANG THE GPU and crash your whole desktop session on " +
+                 "Steam Deck hardware (SteamOS and Windows alike). Make sure everything else " +
+                 "is saved/closed first.\n\nEnable anyway?")) return;
+  }
   await api.post("/api/patch", {id, enable});
   refresh();
 }
@@ -575,6 +650,11 @@ $("#updatebtn").onclick = async () => {
   $("#updatemsg").textContent = "checking…";
   await api.post("/api/check-updates");
   setTimeout(refresh, 1500);
+};
+$("#applyupdatebtn").onclick = async () => {
+  if (!confirm("Download and install the latest release now? Close the game first if it's running.")) return;
+  $("#updatemsg").textContent = "starting update…";
+  await api.post("/api/apply-update");
 };
 
 /* settings */

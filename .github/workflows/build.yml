@@ -1,0 +1,157 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  linux:
+    name: Linux (x86_64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build clang lld cmake patchelf \
+            libgtk-3-dev libx11-xcb-dev libx11-dev libxcb1-dev libvulkan-dev \
+            libpipewire-0.3-dev libdbus-1-dev libibus-1.0-dev
+      - name: Build (SDK + game, unified via REXSDK_DIR)
+        run: |
+          cmake -S simpsons -B simpsons/out/ci -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
+            -DREXSDK_DIR="$(pwd)/tools/rexglue-sdk"
+          ninja -C simpsons/out/ci
+      - name: Package
+        run: |
+          set -e
+          # Directory layout matches what launcher/launcher.py's DEFAULT_CONFIG
+          # expects relative to its own location (ROOT = launcher dir's parent),
+          # so the bundled launcher can find the engine without any edits:
+          #   dist/launcher/...
+          #   dist/simpsons/out/build/linux-amd64-relwithdebinfo/simpsons
+          #   dist/tools/rexglue-bin/linux-amd64/lib/*.so
+          ENGINE_DIR=dist/simpsons/out/build/linux-amd64-relwithdebinfo
+          LIB_DIR=dist/tools/rexglue-bin/linux-amd64/lib
+          mkdir -p "$ENGINE_DIR" "$LIB_DIR"
+
+          EXE=$(find simpsons/out/ci -maxdepth 1 -type f -name simpsons)
+          test -n "$EXE"
+          cp "$EXE" "$ENGINE_DIR/"
+
+          # Bundle every shared library the build produced anywhere under
+          # simpsons/out/ci or tools/rexglue-sdk/out (search broadly rather
+          # than assuming one fixed path, since REXSDK_DIR's add_subdirectory
+          # build layout hasn't been exhaustively verified against the
+          # separately-built-and-installed dev flow).
+          find simpsons/out/ci tools/rexglue-sdk/out -maxdepth 3 -type f -name "*.so*" 2>/dev/null \
+            | xargs -I{} cp -n {} "$LIB_DIR/" 2>/dev/null || true
+
+          # The runtime lib pulls in libTracyClient.so as a NEEDED entry it
+          # doesn't actually use symbols from; loading two copies of Tracy
+          # (once via this transitive dependency, once via the executable's
+          # own direct link) segfaults in Tracy's global constructor at
+          # dl_init. De-duplicate by repointing that entry at libm.so.6,
+          # which every ELF already needs anyway.
+          for f in "$LIB_DIR"/librexruntime*.so; do
+            [ -f "$f" ] && patchelf --replace-needed libTracyClient.so libm.so.6 "$f"
+          done
+
+          cp -r launcher dist/
+          cp README.md LICENSE* dist/ 2>/dev/null || true
+
+          # One obvious double-clickable/runnable entry point at the top of
+          # the download, so a player never has to know the internal layout.
+          printf '#!/bin/sh\ncd "$(dirname "$0")/launcher" && exec ./simpsons-launcher.sh\n' > dist/Play.sh
+          chmod +x dist/Play.sh
+
+          test -f "$ENGINE_DIR/simpsons"
+          test -n "$(ls "$LIB_DIR"/librexruntime*.so 2>/dev/null)"
+          test -n "$(ls "$LIB_DIR"/libTracyClient*.so 2>/dev/null)"
+      - name: Smoke test (verify all shared library dependencies resolve)
+        run: |
+          set -e
+          export LD_LIBRARY_PATH="$(pwd)/dist/tools/rexglue-bin/linux-amd64/lib"
+          MISSING=$(ldd dist/simpsons/out/build/linux-amd64-relwithdebinfo/simpsons | grep "not found" || true)
+          if [ -n "$MISSING" ]; then
+            echo "Packaged binary has unresolved shared library dependencies:"
+            echo "$MISSING"
+            exit 1
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: simpsons-recompiled-linux
+          path: dist/
+
+  windows:
+    name: Windows (x86_64) — experimental
+    runs-on: windows-latest
+    continue-on-error: true   # first-pass port; not release-blocking yet
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Ninja
+        run: choco install ninja -y
+      - name: Build (SDK + game, unified via REXSDK_DIR)
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+          cmake -S simpsons -B simpsons/out/ci -G Ninja ^
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo ^
+            -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ ^
+            -DREXSDK_DIR="%CD%/tools/rexglue-sdk"
+          ninja -C simpsons/out/ci
+      - name: Package
+        shell: bash
+        run: |
+          set -e
+          ENGINE_DIR=dist/simpsons/out/build/win-amd64-release
+          mkdir -p "$ENGINE_DIR"
+          EXE=$(find simpsons/out/ci -maxdepth 1 -type f -name "simpsons.exe")
+          test -n "$EXE"
+          cp "$EXE" "$ENGINE_DIR/"
+          # Windows has no LD_LIBRARY_PATH equivalent: DLLs must sit next to
+          # the exe (matches launcher.py's empty Windows lib_dirs, which
+          # assumes exactly this).
+          find simpsons/out/ci tools/rexglue-sdk/out -maxdepth 3 -type f -name "*.dll" 2>/dev/null \
+            | xargs -I{} cp -n {} "$ENGINE_DIR/" 2>/dev/null || true
+          cp -r launcher dist/
+          cp README.md LICENSE* dist/ 2>/dev/null || true
+          printf '@echo off\r\ncd /d "%%~dp0launcher"\r\npython launcher.py\r\n' > dist/Play.bat
+          test -f "$ENGINE_DIR/simpsons.exe"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: simpsons-recompiled-windows
+          path: dist/
+
+  release:
+    name: Publish Release
+    needs: [linux, windows]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: simpsons-recompiled-linux
+          path: linux-dist
+      - uses: actions/download-artifact@v4
+        with:
+          name: simpsons-recompiled-windows
+          path: windows-dist
+        continue-on-error: true   # Windows build is still experimental; release must not block on it
+      - name: Zip release assets
+        run: |
+          set -e
+          cd linux-dist && zip -rq ../simpsons-recompiled-linux.zip . && cd ..
+          if [ -d windows-dist ] && [ -n "$(ls -A windows-dist 2>/dev/null)" ]; then
+            cd windows-dist && zip -rq ../simpsons-recompiled-windows.zip . && cd ..
+          fi
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: "*.zip"
+          generate_release_notes: true
+          name: "${{ github.ref_name }}"

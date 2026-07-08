@@ -92,7 +92,8 @@ class VulkanPipelineCache {
       const PrimitiveProcessor::ProcessingResult& primitive_processing_result,
       reg::RB_DEPTHCONTROL normalized_depth_control, uint32_t normalized_color_mask,
       VulkanRenderTargetCache::RenderPassKey render_pass_key, VkPipeline& pipeline_out,
-      const PipelineLayoutProvider*& pipeline_layout_out, void** pipeline_handle_out = nullptr);
+      const PipelineLayoutProvider*& pipeline_layout_out, void** pipeline_handle_out = nullptr,
+      bool force_rasterizer_discard = false);
   bool IsCreatingPipelines() const;
   void GetPipelineAndLayoutByHandle(void* handle, VkPipeline& pipeline_out,
                                     const PipelineLayoutProvider*& pipeline_layout_out,
@@ -339,8 +340,8 @@ class VulkanPipelineCache {
       const VulkanShader::VulkanTranslation* pixel_shader,
       const PrimitiveProcessor::ProcessingResult& primitive_processing_result,
       reg::RB_DEPTHCONTROL normalized_depth_control, uint32_t normalized_color_mask,
-      VulkanRenderTargetCache::RenderPassKey render_pass_key,
-      PipelineDescription& description_out) const;
+      VulkanRenderTargetCache::RenderPassKey render_pass_key, PipelineDescription& description_out,
+      bool force_rasterizer_discard = false) const;
 
   // Whether the pipeline for the given description is supported by the device.
   bool ArePipelineRequirementsMet(const PipelineDescription& description) const;

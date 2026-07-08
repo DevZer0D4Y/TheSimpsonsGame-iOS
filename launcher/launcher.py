@@ -41,7 +41,7 @@ BACKUPS_DIR = LAUNCHER_DIR / "backups"
 CONFIG_JSON = LAUNCHER_DIR / "launcher.json"
 
 DEFAULT_CONFIG = {
-    "github_repo": "",   # e.g. "username/simpsons-recomp" once published
+    "github_repo": "YesterMester/TheSimpsonsGameRecomp",
     "engine": {
         "Linux": "simpsons/out/build/linux-amd64-relwithdebinfo/simpsons",
         "Windows": "simpsons/out/build/win-amd64-release/simpsons.exe",
@@ -84,7 +84,8 @@ GAME_BIN = _resolve(CONFIG["engine"].get(PLAT, CONFIG["engine"]["Linux"]))
 BUILD_DIR = GAME_BIN.parent
 GAME_TOML = BUILD_DIR / "simpsons.toml"
 GAMEDATA = ROOT / "gamedata"
-EXTRACT_XISO = ROOT / "tools/extract-xiso/build/extract-xiso"
+EXTRACT_XISO = ROOT / ("tools/extract-xiso/build/extract-xiso.exe" if PLAT == "Windows"
+                       else "tools/extract-xiso/build/extract-xiso")
 USER_DATA = Path.home() / ".local/share/simpsons"
 
 TOKEN = secrets.token_hex(16)
@@ -124,7 +125,8 @@ LOGO_MOVIES = ("ealogo", "ealogo_sd", "foxlogo", "foxlogo_sd",
 game_proc_lock = threading.Lock()
 game_proc = None
 install_state = {"running": False, "log": [], "ok": None}
-update_state = {"checked": False, "msg": "", "update_available": False}
+update_state = {"checked": False, "msg": "", "update_available": False, "download_url": None,
+                "latest_tag": "", "applying": False, "apply_msg": ""}
 
 
 # ----------------------------------------------------------------- settings
@@ -329,7 +331,7 @@ def status():
                     "log": install_state["log"][-40:]},
         "platforms": [
             {"name": "Linux / Steam Deck", "state": "ready"},
-            {"name": "Windows", "state": "in development"},
+            {"name": "Windows", "state": "experimental"},
             {"name": "Android", "state": "planned"},
         ],
     }
@@ -553,11 +555,35 @@ def restore_saves(name):
 
 # ---------------------------------------------------------------- updates
 
+# Paths inside a release download that are safe to overwrite wholesale on
+# update (engine binaries + launcher code). Anything NOT listed here is
+# preserved untouched even if the release zip also contains a copy of it --
+# in particular user data: launcher.json (settings), backups/ (save
+# backups), mods/, art/ (regenerated locally from the player's own files),
+# and launcher_native_error.log.
+UPDATE_MANAGED_PATHS = [
+    "simpsons/out/build",
+    "tools/rexglue-bin",
+    "tools/extract-xiso/build",
+    "launcher/launcher.py",
+    "launcher/simpsons-launcher.sh",
+    "launcher/ui",
+    "README.md",
+    "LICENSE",
+    "LICENSE.md",
+    "LICENSE.txt",
+]
+
+
+def _platform_asset_name():
+    return "simpsons-recompiled-linux.zip" if PLAT != "Windows" else "simpsons-recompiled-windows.zip"
+
+
 def check_updates():
     repo = CONFIG.get("github_repo", "")
     if not repo:
-        update_state.update(checked=True, update_available=False,
-                            msg="No GitHub repository configured yet — coming with the open-source release.")
+        update_state.update(checked=True, update_available=False, download_url=None,
+                            msg="No GitHub repository configured.")
         return
     try:
         req = urllib.request.Request(
@@ -566,15 +592,68 @@ def check_updates():
         with urllib.request.urlopen(req, timeout=8) as r:
             data = json.loads(r.read())
         tag = data.get("tag_name", "")
-        if tag and tag.lstrip("v") != VERSION:
+        asset_name = _platform_asset_name()
+        asset = next((a for a in data.get("assets", []) if a.get("name") == asset_name), None)
+        if tag and tag.lstrip("v") != VERSION and asset:
             update_state.update(checked=True, update_available=True,
-                                msg=f"Update available: {tag} — {data.get('html_url','')}")
+                                download_url=asset["browser_download_url"], latest_tag=tag,
+                                msg=f"Update available: {tag} (you're on {VERSION})")
+        elif tag and tag.lstrip("v") != VERSION:
+            update_state.update(checked=True, update_available=False, download_url=None,
+                                msg=f"A newer release ({tag}) exists but has no {asset_name} asset for "
+                                    f"this platform yet — see {data.get('html_url', '')}")
         else:
-            update_state.update(checked=True, update_available=False,
+            update_state.update(checked=True, update_available=False, download_url=None,
                                 msg=f"You're up to date (latest release: {tag or 'none'}).")
     except Exception as e:  # noqa: BLE001
-        update_state.update(checked=True, update_available=False,
+        update_state.update(checked=True, update_available=False, download_url=None,
                             msg=f"Update check failed: {e}")
+
+
+def apply_update():
+    if game_running_pids():
+        return False, "Close the game before updating — its files may be in use."
+    url = update_state.get("download_url")
+    if not url:
+        return False, "No update ready to apply — check for updates first."
+    import tempfile
+    try:
+        update_state.update(applying=True, apply_msg="Downloading...")
+        with tempfile.TemporaryDirectory(prefix="simpsons-update-") as tmp:
+            tmp = Path(tmp)
+            zip_path = tmp / "update.zip"
+            req = urllib.request.Request(url, headers={"User-Agent": f"simpsons-launcher/{VERSION}"})
+            with urllib.request.urlopen(req, timeout=120) as r, open(zip_path, "wb") as f:
+                shutil.copyfileobj(r, f)
+
+            update_state.update(apply_msg="Extracting...")
+            extract_dir = tmp / "extracted"
+            with zipfile.ZipFile(zip_path) as z:
+                z.extractall(extract_dir)
+
+            update_state.update(apply_msg="Installing...")
+            installed = []
+            for rel in UPDATE_MANAGED_PATHS:
+                src = extract_dir / rel
+                if not src.exists():
+                    continue
+                dst = ROOT / rel
+                if src.is_dir():
+                    if dst.exists():
+                        shutil.rmtree(dst)
+                    shutil.copytree(src, dst)
+                else:
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(src, dst)
+                installed.append(rel)
+
+        update_state.update(applying=False, apply_msg="Updated — restart the launcher to finish.",
+                            update_available=False, checked=True,
+                            msg=f"Updated to {update_state.get('latest_tag', 'latest')}. Restart the launcher.")
+        return True, f"Installed: {', '.join(installed)}. Restart the launcher to finish."
+    except Exception as e:  # noqa: BLE001
+        update_state.update(applying=False, apply_msg=f"Update failed: {e}")
+        return False, f"Update failed: {e}"
 
 
 # ----------------------------------------------------------------- launch
@@ -689,9 +768,27 @@ def launch_game():
         # it for the game regardless of the user's global LS settings.
         env["DISABLE_LSFG"] = "1"
         if patch_instant_popin_state() == "on":
-            # capture a driver dump if the GPU ever hangs (black-box recorder;
-            # remove once the priming-draw fix has a few clean sessions)
+            # capture a driver dump if the GPU ever hangs (black-box recorder)
             env["RADV_DEBUG"] = "hang"
+            # DRIVER EXPERIMENT: the level-load wedge reproduces on the SteamOS
+            # system driver (Mesa 24.3, built 2025-05) under every engine
+            # configuration; run on the year-newer Mesa from the flatpak GL
+            # runtime instead. Their libs resolve after ours (appended last).
+            icd = LAUNCHER_DIR / "mesa-new-icd.json"
+            gl_lib = Path("/var/lib/flatpak/runtime/org.freedesktop.Platform.GL.default"
+                          "/x86_64/24.08/active/files/lib")
+            if icd.exists() and (gl_lib / "libvulkan_radeon.so").exists():
+                env["VK_DRIVER_FILES"] = str(icd)
+                env["LD_LIBRARY_PATH"] = env.get("LD_LIBRARY_PATH", "") + ":" + str(gl_lib)
+        # Experiments survive stale launcher backends: extra env is read from
+        # launcher-env.json at every PLAY press, not baked into this process.
+        env_file = LAUNCHER_DIR / "launcher-env.json"
+        if env_file.exists():
+            try:
+                for k, v in json.loads(env_file.read_text()).items():
+                    env[str(k)] = str(v)
+            except Exception:
+                pass
         libs = [str(_resolve(d)) for d in CONFIG["lib_dirs"].get(PLAT, [])]
         if libs:
             env["LD_LIBRARY_PATH"] = ":".join(libs) + ":" + env.get("LD_LIBRARY_PATH", "")
@@ -842,6 +939,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if path == "/api/check-updates":
             threading.Thread(target=check_updates, daemon=True).start()
             return self._send(200, {"ok": True})
+        if path == "/api/apply-update":
+            if update_state.get("applying"):
+                return self._send(409, {"ok": False, "msg": "Update already in progress."})
+            threading.Thread(target=apply_update, daemon=True).start()
+            return self._send(200, {"ok": True, "msg": "Update started."})
         return self._send(404, {"error": "not found"})
 
 
@@ -905,8 +1007,14 @@ def main():
             return
     try:
         run_native(url)          # real app window
-    except Exception as e:       # noqa: BLE001
-        print(f"(native window unavailable: {e}; falling back to browser)")
+    except Exception:       # noqa: BLE001
+        import traceback
+        tb = traceback.format_exc()
+        print(f"(native window unavailable; falling back to browser)\n{tb}")
+        try:
+            (LAUNCHER_DIR / "launcher_native_error.log").write_text(tb)
+        except Exception:
+            pass
         open_browser(url)
         try:
             while True:

@@ -87,6 +87,7 @@ REXCVAR_DECLARE(std::string, swap_post_effect);
 // this is enforced. 0 disables the guard.
 REXCVAR_DECLARE(int32_t, gpu_shader_max_cf_iterations);
 REXCVAR_DECLARE(bool, gpu_sanitize_vertex_position);
+REXCVAR_DECLARE(double, gpu_vertex_position_magnitude_limit);
 
 // Vulkan
 REXCVAR_DECLARE(bool, vulkan_sparse_shared_memory);

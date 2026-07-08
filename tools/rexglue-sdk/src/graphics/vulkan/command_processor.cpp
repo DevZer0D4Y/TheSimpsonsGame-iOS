@@ -3611,6 +3611,41 @@ Shader* VulkanCommandProcessor::LoadShader(xenos::ShaderType shader_type, uint32
   return pipeline_cache_->LoadShader(shader_type, host_address, dword_count);
 }
 
+namespace {
+// HAND PATCH: read-only pre-check mirroring the admit/veto classification
+// further down in IssueDraw (the kInvalidVertex case), used ONLY to pick the
+// pipeline's rasterizer_discard state before ConfigurePipeline runs -- the
+// real, authoritative classification (which also does buffer-sync side
+// effects and can still veto the whole draw) still happens later and is
+// unaffected by this. Safe to duplicate: purely reads already-computed shader
+// metadata and current register state, no side effects.
+bool VulkanIsLikelyPrimingDraw(const RegisterFile& regs, const VulkanShader* vertex_shader) {
+  if (!REXCVAR_GET(gpu_allow_invalid_fetch_constants)) {
+    return false;
+  }
+  const Shader::ConstantRegisterMap& constant_map_vertex = vertex_shader->constant_register_map();
+  for (uint32_t i = 0; i < rex::countof(constant_map_vertex.vertex_fetch_bitmap); ++i) {
+    uint32_t vfetch_bits_remaining = constant_map_vertex.vertex_fetch_bitmap[i];
+    uint32_t j;
+    while (rex::bit_scan_forward(vfetch_bits_remaining, &j)) {
+      vfetch_bits_remaining &= ~(uint32_t(1) << j);
+      uint32_t vfetch_index = i * 32 + j;
+      xenos::xe_gpu_vertex_fetch_t vfetch_constant = regs.GetVertexFetch(vfetch_index);
+      if (vfetch_constant.type != xenos::FetchConstantType::kInvalidVertex) {
+        continue;
+      }
+      bool plausible = vfetch_constant.address != 0 && vfetch_constant.size != 0 &&
+                       (uint64_t(vfetch_constant.size) << 2) <= (64u << 20);
+      bool null_stream = vfetch_constant.address == 0 && vfetch_constant.size == 0;
+      if (plausible || null_stream) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+}  // namespace
+
 bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
                                        IndexBufferInfo* index_buffer_info,
                                        bool major_mode_explicit) {
@@ -3873,11 +3908,17 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   // textures.
   VkPipeline pipeline;
   void* pipeline_handle = nullptr;
-  if (!pipeline_cache_->ConfigurePipeline(vertex_shader_translation, pixel_shader_translation,
-                                          primitive_processing_result, normalized_depth_control,
-                                          normalized_color_mask,
-                                          render_target_cache_->last_update_render_pass_key(),
-                                          pipeline, pipeline_layout_provider, &pipeline_handle)) {
+  // HAND PATCH: force rasterizer_discard for priming draws (see the
+  // kInvalidVertex case above) instead of relying only on the 1x1 scissor
+  // mute below -- this skips the fixed-function clip/rasterize/scan-convert
+  // stages for these draws at the pipeline level, rather than merely
+  // shrinking the area they can affect while still running the full
+  // rasterizer path that was observed to wedge on this hardware.
+  if (!pipeline_cache_->ConfigurePipeline(
+          vertex_shader_translation, pixel_shader_translation, primitive_processing_result,
+          normalized_depth_control, normalized_color_mask,
+          render_target_cache_->last_update_render_pass_key(), pipeline, pipeline_layout_provider,
+          &pipeline_handle, VulkanIsLikelyPrimingDraw(regs, vertex_shader))) {
     return draw_fail("configure_pipeline");
   }
   bool pipeline_is_placeholder = false;

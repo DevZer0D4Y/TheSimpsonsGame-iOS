@@ -56,6 +56,24 @@ REXCVAR_DEFINE_INT32(gpu_shader_max_cf_iterations, 100000, "GPU",
 REXCVAR_DEFINE_BOOL(gpu_sanitize_vertex_position, true, "GPU",
                     "Neutralize NaN/Inf vertex shader position outputs (degenerate instead).");
 
+// HAND PATCH: the NaN/Inf/w==0 checks above only catch positions that are
+// already IEEE-poison. They do NOT catch a position that is merely huge but
+// finite -- which is exactly what a skinning shader produces if it indexes an
+// UNINITIALIZED or STALE float-constant register as a bone matrix (this
+// game's shaders select bone rows via a dynamically-computed address register
+// `a0`, e.g. `c[52+a0]`; see spirv_translator.cpp SanitizeVertexPosition for
+// the full writeup). A garbage bit pattern read as a float is far more often
+// a huge finite number than exactly NaN/Inf, so it sails through the existing
+// sanitizer, reaches the fixed-function clip/NDC transform, and can still
+// wedge the RADV/VanGogh scan converter on a degenerate huge-magnitude
+// triangle. No legitimate camera-space vertex in this game's content ever
+// needs a clip-space component anywhere near this bound. 0 disables the
+// check.
+REXCVAR_DEFINE_DOUBLE(gpu_vertex_position_magnitude_limit, 1.0e6, "GPU",
+                    "Clip-space vertex position component magnitude past which the position is "
+                    "treated as poison and replaced (0 disables).")
+    .range(0.0, 1.0e30);
+
 bool IsGpuDebugMarkersEnabled() {
   static bool cached = false;
   static bool result = false;

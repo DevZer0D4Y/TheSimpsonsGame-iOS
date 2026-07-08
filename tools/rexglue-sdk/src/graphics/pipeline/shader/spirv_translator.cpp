@@ -1074,9 +1074,17 @@ std::vector<uint8_t> SpirvShaderTranslator::CompleteTranslation() {
             spv::OpFAdd, type_float4_,
             builder_->createNoContractionBinOp(spv::OpFSub, type_float4_, position_1, position_0),
             position_2);
+        // HAND PATCH: position_original is a select among per-vertex positions
+        // that already passed through SanitizeVertexPosition (they were
+        // copied from output_per_vertex_ after CompleteVertexOrTessEvalShaderInMain
+        // ran it). position_synthetic is a fresh arithmetic extrapolation
+        // (v1-v0+v2) for the host-synthesized 4th quad vertex and was never
+        // checked -- close that gap here rather than assuming a linear
+        // combination of clean inputs is itself always clean.
         builder_->createStore(
-            builder_->createTriOp(spv::OpSelect, type_float4_, rectangle_host_vertex_is_synthetic,
-                                  position_synthetic, position_original),
+            SanitizeVertexPosition(builder_->createTriOp(
+                spv::OpSelect, type_float4_, rectangle_host_vertex_is_synthetic,
+                position_synthetic, position_original)),
             rectangle_position_ptr);
 
         auto write_rectangle_distance_member =
@@ -2835,6 +2843,34 @@ spv::Id SpirvShaderTranslator::SanitizeVertexPosition(spv::Id position) {
                                             builder_->makeFloatConstant(0.0f));
   spv::Id poison =
       builder_->createBinOp(spv::OpLogicalOr, type_bool_, any_non_finite, w_is_zero);
+  // HAND PATCH: the checks above only catch positions that are already
+  // IEEE-poison (NaN/Inf/w==0). They do NOT catch a position that is merely
+  // huge but finite -- which is what this game's skinning shaders produce if
+  // the dynamically-indexed bone matrix constant (c[52+a0]/c[53+a0]/c[54+a0],
+  // where a0 comes from a per-vertex bone-index byte in the main vertex
+  // stream) lands on an uninitialized or out-of-range float-constant
+  // register while an entity's skeleton is still streaming in: a garbage bit
+  // pattern read as a float is far more often a huge finite number than
+  // exactly NaN/Inf, so it sails through the check above, reaches the
+  // fixed-function clip/NDC transform untouched, and can still wedge the
+  // RADV/VanGogh scan converter on a degenerate huge-magnitude triangle. No
+  // legitimate camera-space vertex in this game's content ever needs a
+  // clip-space component anywhere near the configured bound. UNVERIFIED
+  // against a live repro (needs a GPU constant-register dump this sandbox
+  // cannot take) -- but this check is a pure superset of the existing one:
+  // it can only affect positions that were already implausible, never a
+  // legitimately-rendered vertex.
+  double magnitude_limit = REXCVAR_GET(gpu_vertex_position_magnitude_limit);
+  if (magnitude_limit > 0.0) {
+    spv::Id abs_position = builder_->createUnaryBuiltinCall(
+        type_float4_, ext_inst_glsl_std_450_, GLSLstd450FAbs, position);
+    spv::Id limit_const = SpirvSmearScalarResultOrConstant(
+        builder_->makeFloatConstant(float(magnitude_limit)), type_float4_);
+    spv::Id too_large_per_component = builder_->createBinOp(
+        spv::OpFOrdGreaterThan, type_bool4, abs_position, limit_const);
+    spv::Id too_large = builder_->createUnaryOp(spv::OpAny, type_bool_, too_large_per_component);
+    poison = builder_->createBinOp(spv::OpLogicalOr, type_bool_, poison, too_large);
+  }
   // Replacement: a point past the far plane (z > w), guaranteed to be clipped
   // away entirely rather than rasterized as a degenerate.
   id_vector_temp_.clear();

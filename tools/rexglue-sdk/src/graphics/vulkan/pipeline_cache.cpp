@@ -1050,7 +1050,8 @@ bool VulkanPipelineCache::ConfigurePipeline(
     const PrimitiveProcessor::ProcessingResult& primitive_processing_result,
     reg::RB_DEPTHCONTROL normalized_depth_control, uint32_t normalized_color_mask,
     VulkanRenderTargetCache::RenderPassKey render_pass_key, VkPipeline& pipeline_out,
-    const PipelineLayoutProvider*& pipeline_layout_out, void** pipeline_handle_out) {
+    const PipelineLayoutProvider*& pipeline_layout_out, void** pipeline_handle_out,
+    bool force_rasterizer_discard) {
 #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
@@ -1085,7 +1086,7 @@ bool VulkanPipelineCache::ConfigurePipeline(
   PipelineDescription description;
   if (!GetCurrentStateDescription(vertex_shader, pixel_shader, primitive_processing_result,
                                   normalized_depth_control, normalized_color_mask, render_pass_key,
-                                  description)) {
+                                  description, force_rasterizer_discard)) {
     REXGPU_ERROR(
         "VulkanPipelineCache: GetCurrentStateDescription failed "
         "(guest_prim={}, host_prim={}, host_vs_type={}, tess_mode={}, host_reset={}, "
@@ -1364,8 +1365,8 @@ bool VulkanPipelineCache::GetCurrentStateDescription(
     const VulkanShader::VulkanTranslation* pixel_shader,
     const PrimitiveProcessor::ProcessingResult& primitive_processing_result,
     reg::RB_DEPTHCONTROL normalized_depth_control, uint32_t normalized_color_mask,
-    VulkanRenderTargetCache::RenderPassKey render_pass_key,
-    PipelineDescription& description_out) const {
+    VulkanRenderTargetCache::RenderPassKey render_pass_key, PipelineDescription& description_out,
+    bool force_rasterizer_discard) const {
   description_out.Reset();
 
   const ui::vulkan::VulkanDevice::Properties& device_properties =
@@ -1466,11 +1467,21 @@ bool VulkanPipelineCache::GetCurrentStateDescription(
   // Tessellated draws are patch-domain polygonal primitives regardless of guest
   // register ambiguity in non-explicit major mode configurations.
   bool primitive_polygonal = tessellated ? true : draw_util::IsPrimitivePolygonal(regs);
-  bool rasterization_enabled = draw_util::IsRasterizationPotentiallyDone(regs, primitive_polygonal);
+  bool rasterization_enabled =
+      !force_rasterizer_discard && draw_util::IsRasterizationPotentiallyDone(regs, primitive_polygonal);
   if (!rasterization_enabled) {
     // Keep parity with D3D12 by fully disabling rasterization for draws where
     // only non-raster stages (for instance, vertex memexport) can have side
     // effects.
+    // HAND PATCH: also forced for this game's "priming draws" (invalid-type
+    // fetch constants admitted so a streaming entity's memexport can run) --
+    // see command_processor.cpp IssueDraw. Their rasterized output is
+    // meaningless and can be numerically degenerate (see
+    // SanitizeVertexPosition), so skip the fixed-function
+    // clip/rasterize/scan-convert stages entirely at the pipeline level
+    // instead of only shrinking their visible footprint with a 1x1 scissor --
+    // the latter still runs the primitive through the same scan converter
+    // that was observed to wedge on this hardware.
     description_out.rasterizer_discard = 1;
     return true;
   }
