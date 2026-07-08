@@ -71,7 +71,7 @@ the launcher (Settings → Input).
   to a wall or object and rotate the camera until it snaps back to a safe position — this
   fixes pop-in for the rest of the session, the same effect as a full level reload but instant.
 - Boot logo videos (EA/Fox/Gracie Films) may show green flicker — a bug in the *game's own*
-  guest-side video decoder, not something introduced by this port.
+  guest-side video decoder, not something introduced by this port. (THIS SHOULD BE FIXED)
 - In-game audio can sound crunchy under load; main menu UI may flicker slightly.
 - The framerate setting (Settings → Framerate) works by telling the game it's running on a
   higher-refresh-rate display, the same mechanism the community's own 60 FPS patch for this game
