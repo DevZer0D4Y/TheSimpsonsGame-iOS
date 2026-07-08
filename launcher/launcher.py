@@ -32,9 +32,18 @@ from pathlib import Path
 
 VERSION = "0.3.0"
 
-LAUNCHER_DIR = Path(__file__).resolve().parent
-ROOT = LAUNCHER_DIR.parent
-UI_DIR = LAUNCHER_DIR / "ui"
+FROZEN = getattr(sys, "frozen", False)
+if FROZEN:
+    # Packaged .exe: the launcher lives in a flat release directory next to
+    # simpsons.exe / extract-xiso.exe / gamedata/. The web UI is bundled and
+    # unpacked to PyInstaller's temp dir (sys._MEIPASS).
+    LAUNCHER_DIR = Path(sys.executable).resolve().parent
+    ROOT = LAUNCHER_DIR
+    UI_DIR = Path(getattr(sys, "_MEIPASS", LAUNCHER_DIR)) / "ui"
+else:
+    LAUNCHER_DIR = Path(__file__).resolve().parent
+    ROOT = LAUNCHER_DIR.parent
+    UI_DIR = LAUNCHER_DIR / "ui"
 ART_DIR = LAUNCHER_DIR / "art"
 MODS_DIR = LAUNCHER_DIR / "mods"
 BACKUPS_DIR = LAUNCHER_DIR / "backups"
@@ -44,7 +53,7 @@ DEFAULT_CONFIG = {
     "github_repo": "YesterMester/TheSimpsonsGameRecomp",
     "engine": {
         "Linux": "simpsons/out/build/linux-amd64-relwithdebinfo/simpsons",
-        "Windows": "simpsons/out/build/win-amd64-release/simpsons.exe",
+        "Windows": "simpsons/out/build/win-amd64-relwithdebinfo/simpsons.exe",
     },
     "lib_dirs": {
         "Linux": ["tools/rexglue-bin/linux-amd64/lib",
@@ -58,7 +67,7 @@ def load_config():
     cfg = json.loads(json.dumps(DEFAULT_CONFIG))
     if CONFIG_JSON.exists():
         try:
-            user = json.loads(CONFIG_JSON.read_text())
+            user = json.loads(CONFIG_JSON.read_text(encoding="utf-8"))
             for k, v in user.items():
                 if isinstance(v, dict) and k in cfg:
                     cfg[k].update(v)
@@ -67,7 +76,7 @@ def load_config():
         except Exception:
             pass
     else:
-        CONFIG_JSON.write_text(json.dumps(cfg, indent=2) + "\n")
+        CONFIG_JSON.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
     return cfg
 
 
@@ -80,12 +89,18 @@ def _resolve(p):
     return p if p.is_absolute() else ROOT / p
 
 
-GAME_BIN = _resolve(CONFIG["engine"].get(PLAT, CONFIG["engine"]["Linux"]))
+if FROZEN:
+    # Flat release layout: game binary and tools sit beside the launcher.
+    GAME_BIN = ROOT / ("simpsons.exe" if PLAT == "Windows" else "simpsons")
+    EXTRACT_XISO = ROOT / ("extract-xiso.exe" if PLAT == "Windows" else "extract-xiso")
+else:
+    GAME_BIN = _resolve(CONFIG["engine"].get(PLAT, CONFIG["engine"]["Linux"]))
+    EXTRACT_XISO = ROOT / "tools/extract-xiso/build/extract-xiso"
+    if PLAT == "Windows":
+        EXTRACT_XISO = EXTRACT_XISO.with_suffix(".exe")
 BUILD_DIR = GAME_BIN.parent
 GAME_TOML = BUILD_DIR / "simpsons.toml"
 GAMEDATA = ROOT / "gamedata"
-EXTRACT_XISO = ROOT / ("tools/extract-xiso/build/extract-xiso.exe" if PLAT == "Windows"
-                       else "tools/extract-xiso/build/extract-xiso")
 USER_DATA = Path.home() / ".local/share/simpsons"
 
 TOKEN = secrets.token_hex(16)
@@ -154,7 +169,7 @@ def read_settings():
     values = {k: v[1] for k, v in SETTINGS_SCHEMA.items()}
     if not GAME_TOML.exists():
         return values
-    for line in GAME_TOML.read_text().splitlines():
+    for line in GAME_TOML.read_text(encoding="utf-8").splitlines():
         s = line.strip()
         if "=" in s and not s.startswith("#"):
             key, _, raw = s.partition("=")
@@ -178,7 +193,7 @@ def write_settings(new_values):
     lines = []
     if GAME_TOML.exists():
         in_block = False
-        for line in GAME_TOML.read_text().splitlines():
+        for line in GAME_TOML.read_text(encoding="utf-8").splitlines():
             s = line.strip()
             if s == SETTINGS_BEGIN:
                 in_block = True
@@ -197,7 +212,7 @@ def write_settings(new_values):
     for k, (typ, _d, _r) in SETTINGS_SCHEMA.items():
         block.append(f"{k} = {_fmt(values[k], typ)}")
     block.append(SETTINGS_END)
-    GAME_TOML.write_text("\n".join(lines + ["", *block]) + "\n")
+    GAME_TOML.write_text("\n".join(lines + ["", *block]) + "\n", encoding="utf-8")
     return values
 
 
@@ -229,7 +244,7 @@ def patch_skip_intro(enable):
 def _toml_flag(key, default="false"):
     if not GAME_TOML.exists():
         return default
-    m = re.search(rf"^{key}\s*=\s*(\S+)", GAME_TOML.read_text(), re.M)
+    m = re.search(rf"^{key}\s*=\s*(\S+)", GAME_TOML.read_text(encoding="utf-8"), re.M)
     return m.group(1) if m else default
 
 
@@ -246,7 +261,7 @@ def patch_instant_popin(enable):
     patch off."""
     if not GAME_TOML.exists():
         return False, "game config not found"
-    text = GAME_TOML.read_text()
+    text = GAME_TOML.read_text(encoding="utf-8")
     subs = [
         (r"^gpu_allow_invalid_fetch_constants\s*=.*$",
          f"gpu_allow_invalid_fetch_constants = {'true' if enable else 'false'}"),
@@ -257,7 +272,7 @@ def patch_instant_popin(enable):
         if not re.search(pat, text, re.M):
             return False, "config keys missing - reinstall/repair first"
         text = re.sub(pat, rep, text, flags=re.M)
-    GAME_TOML.write_text(text)
+    GAME_TOML.write_text(text, encoding="utf-8")
     # the runaway cap is baked into translated shaders - force a rebuild
     shutil.rmtree(USER_DATA / "cache", ignore_errors=True)
     return True, ("instant pop-in ON (shader cache rebuilds on next launch)"
@@ -369,8 +384,16 @@ def browse(path_str):
 
 # -------------------------------------------------------------------- art
 
+def ffmpeg_path():
+    """ffmpeg from PATH, or bundled beside the launcher (Windows release)."""
+    local = LAUNCHER_DIR / ("ffmpeg.exe" if PLAT == "Windows" else "ffmpeg")
+    if local.exists():
+        return str(local)
+    return shutil.which("ffmpeg")
+
+
 def generate_art(force=False):
-    if not gamedata_ok() or not shutil.which("ffmpeg"):
+    if not gamedata_ok() or not ffmpeg_path():
         return
     ART_DIR.mkdir(parents=True, exist_ok=True)
     if art_files() and not force:
@@ -392,7 +415,7 @@ def generate_art(force=False):
                 break
             out = ART_DIR / f"hero{made}.jpg"
             r = subprocess.run(
-                ["ffmpeg", "-loglevel", "error", "-y", "-ss", ts, "-i", str(mv),
+                [ffmpeg_path(), "-loglevel", "error", "-y", "-ss", ts, "-i", str(mv),
                  "-frames:v", "1", "-q:v", "3", str(out)],
                 capture_output=True, timeout=60)
             # size threshold filters black/flat frames
@@ -494,7 +517,9 @@ def run_install(iso_path):
             shutil.rmtree(target)
         target.mkdir()
         log.append(f"Extracting {iso.name} ... (this can take a few minutes)")
-        p = subprocess.Popen([str(EXTRACT_XISO), "-x", str(iso), "-d", str(target)],
+        # Options must precede the positional ISO: the Windows getopt does not
+        # permute argv, so "-x <iso> -d <target>" would leave -d unparsed.
+        p = subprocess.Popen([str(EXTRACT_XISO), "-x", "-d", str(target), str(iso)],
                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         for line in p.stdout:
             if line.strip():
@@ -556,27 +581,30 @@ def restore_saves(name):
 # ---------------------------------------------------------------- updates
 
 # Paths inside a release download that are safe to overwrite wholesale on
-# update (engine binaries + launcher code). Anything NOT listed here is
-# preserved untouched even if the release zip also contains a copy of it --
-# in particular user data: launcher.json (settings), backups/ (save
-# backups), mods/, art/ (regenerated locally from the player's own files),
-# and launcher_native_error.log.
-UPDATE_MANAGED_PATHS = [
-    "simpsons/out/build",
-    "tools/rexglue-bin",
-    "tools/extract-xiso/build",
-    "launcher/launcher.py",
-    "launcher/simpsons-launcher.sh",
-    "launcher/ui",
-    "README.md",
-    "LICENSE",
-    "LICENSE.md",
-    "LICENSE.txt",
-]
+# update (engine binaries + launcher code), relative to the extracted
+# archive's own root -- release.yml ships a FLAT layout (simpsons[.exe] and
+# friends sit right next to launcher/, not nested under simpsons/out/build/
+# like a dev tree). Anything NOT listed here is preserved untouched even if
+# the release also contains a copy of it -- in particular user data:
+# launcher.json (settings), backups/ (save backups), mods/, art/
+# (regenerated locally from the player's own files), gamedata/, and
+# simpsons.toml (the player's own runtime settings).
+if PLAT == "Windows":
+    UPDATE_MANAGED_PATHS = ["simpsons.exe", "extract-xiso.exe", "ffmpeg.exe", "README.md"]
+    UPDATE_GLOB_PATHS = ["*.dll"]
+else:
+    UPDATE_MANAGED_PATHS = ["simpsons", "extract-xiso", "launcher/ui",
+                            "launcher/launcher.py", "launcher/simpsons-launcher.sh", "README.md"]
+    UPDATE_GLOB_PATHS = ["*.so*"]
+# The launcher's own executable (Windows only, PyInstaller-frozen release)
+# needs special handling: it can't overwrite its own running file's content,
+# but Windows does allow renaming a running exe out of the way first.
+UPDATE_SELF_EXE = "simpsons-launcher.exe"
 
 
 def _platform_asset_name():
-    return "simpsons-recompiled-linux.zip" if PLAT != "Windows" else "simpsons-recompiled-windows.zip"
+    return ("TheSimpsonsGame-Recompiled-Windows-x64.zip" if PLAT == "Windows"
+            else "TheSimpsonsGame-Recompiled-Linux-x64.tar.gz")
 
 
 def check_updates():
@@ -586,11 +614,20 @@ def check_updates():
                             msg="No GitHub repository configured.")
         return
     try:
+        # NOT /releases/latest: that endpoint explicitly excludes drafts AND
+        # prereleases, and this project's releases are published as
+        # prereleases (accurate for early builds) via release.yml. List all
+        # releases newest-first and take the first non-draft instead.
         req = urllib.request.Request(
-            f"https://api.github.com/repos/{repo}/releases/latest",
+            f"https://api.github.com/repos/{repo}/releases",
             headers={"User-Agent": f"simpsons-launcher/{VERSION}"})
         with urllib.request.urlopen(req, timeout=8) as r:
-            data = json.loads(r.read())
+            releases = json.loads(r.read())
+        data = next((rel for rel in releases if not rel.get("draft")), None)
+        if not data:
+            update_state.update(checked=True, update_available=False, download_url=None,
+                                msg="No published releases yet.")
+            return
         tag = data.get("tag_name", "")
         asset_name = _platform_asset_name()
         asset = next((a for a in data.get("assets", []) if a.get("name") == asset_name), None)
@@ -616,28 +653,41 @@ def apply_update():
     url = update_state.get("download_url")
     if not url:
         return False, "No update ready to apply — check for updates first."
+    import tarfile
     import tempfile
     try:
         update_state.update(applying=True, apply_msg="Downloading...")
         with tempfile.TemporaryDirectory(prefix="simpsons-update-") as tmp:
             tmp = Path(tmp)
-            zip_path = tmp / "update.zip"
+            archive_path = tmp / url.split("/")[-1]
             req = urllib.request.Request(url, headers={"User-Agent": f"simpsons-launcher/{VERSION}"})
-            with urllib.request.urlopen(req, timeout=120) as r, open(zip_path, "wb") as f:
+            with urllib.request.urlopen(req, timeout=120) as r, open(archive_path, "wb") as f:
                 shutil.copyfileobj(r, f)
 
             update_state.update(apply_msg="Extracting...")
             extract_dir = tmp / "extracted"
-            with zipfile.ZipFile(zip_path) as z:
-                z.extractall(extract_dir)
+            if archive_path.name.endswith(".zip"):
+                with zipfile.ZipFile(archive_path) as z:
+                    z.extractall(extract_dir)
+            else:
+                with tarfile.open(archive_path) as t:
+                    t.extractall(extract_dir)
+
+            # The archive's own top-level layout is flat (matches ROOT
+            # directly) -- but a .zip made from a single top-level folder
+            # sometimes nests everything one level deeper; detect that.
+            entries = list(extract_dir.iterdir())
+            if len(entries) == 1 and entries[0].is_dir():
+                extract_dir = entries[0]
 
             update_state.update(apply_msg="Installing...")
             installed = []
-            for rel in UPDATE_MANAGED_PATHS:
-                src = extract_dir / rel
+
+            def install_one(rel_src, rel_dst=None):
+                src = extract_dir / rel_src
                 if not src.exists():
-                    continue
-                dst = ROOT / rel
+                    return
+                dst = ROOT / (rel_dst or rel_src)
                 if src.is_dir():
                     if dst.exists():
                         shutil.rmtree(dst)
@@ -645,7 +695,27 @@ def apply_update():
                 else:
                     dst.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(src, dst)
-                installed.append(rel)
+                installed.append(rel_dst or rel_src)
+
+            for rel in UPDATE_MANAGED_PATHS:
+                install_one(rel)
+            for pattern in UPDATE_GLOB_PATHS:
+                for src in extract_dir.glob(pattern):
+                    install_one(src.relative_to(extract_dir))
+
+            # The running launcher exe can't have its own file content
+            # overwritten, but Windows does allow renaming an open exe out
+            # of the way first -- the currently-running process keeps
+            # executing fine from the renamed file.
+            if FROZEN and PLAT == "Windows":
+                new_exe = extract_dir / UPDATE_SELF_EXE
+                if new_exe.exists():
+                    current_exe = Path(sys.executable)
+                    old_exe = current_exe.with_suffix(".exe.old")
+                    old_exe.unlink(missing_ok=True)
+                    current_exe.rename(old_exe)
+                    shutil.copy2(new_exe, current_exe)
+                    installed.append(UPDATE_SELF_EXE)
 
         update_state.update(applying=False, apply_msg="Updated — restart the launcher to finish.",
                             update_available=False, checked=True,
@@ -872,7 +942,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
         if path in ("/", "/index.html"):
-            html = (UI_DIR / "index.html").read_text().replace("__TOKEN__", TOKEN)
+            html = (UI_DIR / "index.html").read_text(encoding="utf-8").replace("__TOKEN__", TOKEN)
             return self._send(200, html.encode(), "text/html; charset=utf-8")
         if path == "/api/status":
             return self._send(200, status())

@@ -52,9 +52,13 @@ REXCVAR_DEFINE_BOOL(ffmpeg_verbose, false, "Audio", "Verbose FFmpeg output (debu
 // do this, it's likely they are either passing the context to XAudio or
 // using the XMA* functions.
 
+#if defined(_WIN32)
+#include <windows.h>
+#else
 #include <pthread.h>
 #include <unistd.h>
 #include <cerrno>
+#endif
 
 namespace rex::audio {
 
@@ -147,12 +151,16 @@ void XmaDecoder::WorkerThreadMain() {
   // menu/cutscene audio (fewer voices) was fine. Same approach as the
   // AudioSystem worker.
   {
+#if defined(_WIN32)
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+#else
     struct sched_param sp {};
     sp.sched_priority = 10;
     if (pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp) != 0) {
       errno = 0;
       (void)nice(-10);
     }
+#endif
   }
   while (worker_running_) {
     // Okay, let's loop through XMA contexts to find ones we need to decode!

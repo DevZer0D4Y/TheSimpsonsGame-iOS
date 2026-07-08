@@ -2500,6 +2500,11 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   // Must not call anything that can change the descriptor heap from now on!
 
   // Ensure vertex buffers are resident.
+  // HAND PATCH (Windows/D3D12 port of the Vulkan priming-draw fix): draws
+  // admitted with invalid-type vertex fetch constants finalize streamed
+  // characters via the vertex shader's memexport; they must run, but their
+  // rasterized output is degenerate, so a priming draw is muted below.
+  bool priming_draw = false;
   const Shader::ConstantRegisterMap& constant_map_vertex = vertex_shader->constant_register_map();
   for (uint32_t i = 0; i < rex::countof(constant_map_vertex.vertex_fetch_bitmap); ++i) {
     uint32_t vfetch_bits_remaining = constant_map_vertex.vertex_fetch_bitmap[i];
@@ -2515,8 +2520,36 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
       switch (vfetch_constant.type) {
         case xenos::FetchConstantType::kVertex:
           break;
-        case xenos::FetchConstantType::kInvalidVertex:
-          if (REXCVAR_GET(gpu_allow_invalid_fetch_constants)) {
+        case xenos::FetchConstantType::kInvalidVertex: {
+          // HAND PATCH: port of the Vulkan null-stream stride gate. The game
+          // marks streamed meshes' vertex fetch constants "invalid" while they
+          // stream in. Admit two safe shapes when gpu_allow_invalid_fetch_constants
+          // is set: (a) plausible address/size (streamed meshes; real Xenos drew
+          // them), and (b) ALL-ZERO constants on OPTIONAL (secondary, stride 0)
+          // streams -- the game's absent blend-shape streams, which the shader
+          // dynamically branches around. A null MAIN stream (stride > 0) means the
+          // entity is still streaming: all-zero data collapses skinned positions
+          // to (0,0,0,0), whose perspective divide yields NaN screen coords that
+          // wedge the Van Gogh pixel pipeline -- keep vetoing those.
+          bool plausible = vfetch_constant.address != 0 &&
+                           vfetch_constant.size != 0 &&
+                           (uint64_t(vfetch_constant.size) << 2) <= (64u << 20);
+          bool null_stream =
+              vfetch_constant.address == 0 && vfetch_constant.size == 0;
+          if (null_stream) {
+            for (const Shader::VertexBinding& vfetch_binding :
+                 vertex_shader->vertex_bindings()) {
+              if (vfetch_binding.fetch_constant == vfetch_index) {
+                if (vfetch_binding.stride_words != 0) {
+                  null_stream = false;  // null MAIN stream -> veto this draw
+                }
+                break;
+              }
+            }
+          }
+          if (REXCVAR_GET(gpu_allow_invalid_fetch_constants) &&
+              (plausible || null_stream)) {
+            priming_draw = true;
             break;
           }
           REXGPU_WARN(
@@ -2525,6 +2558,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
               "launching Xenia with --gpu_allow_invalid_fetch_constants=true.",
               vfetch_index, vfetch_constant.dword_0, vfetch_constant.dword_1);
           return false;
+        }
         default:
           REXGPU_WARN("Vertex fetch constant {} ({:08X} {:08X}) is completely invalid!",
                       vfetch_index, vfetch_constant.dword_0, vfetch_constant.dword_1);
@@ -2641,6 +2675,18 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   SetPrimitiveTopology(primitive_topology);
   // Must not call anything that may change the primitive topology from now on!
 
+  // HAND PATCH: mute rasterization for priming draws. Their vertex shader +
+  // memexport MUST run (that is what finalizes streamed characters), but the
+  // rasterized output is degenerate. Use an EMPTY (0-area) scissor so ZERO
+  // pixel waves spawn: a 1x1 scissor still spawns one pixel wave that blocks on
+  // the vertex shader's parameter-cache output, which is the Van Gogh wedge
+  // signature (PS_PARTIAL_FLUSH, pixel waves never retire). The next draw's
+  // UpdateFixedFunctionState restores the real scissor via SetScissorRect.
+  if (priming_draw) {
+    D3D12_RECT priming_scissor = {0, 0, 0, 0};
+    SetScissorRect(priming_scissor);
+  }
+
   // Draw.
   if (primitive_processing_result.index_buffer_type ==
       PrimitiveProcessor::ProcessedIndexBufferType::kNone) {
@@ -2741,7 +2787,14 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
       for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
         memexport_total_size += memexport_range.size_bytes;
       }
-      if (memexport_total_size != 0) {
+      // HAND PATCH (port of the Vulkan readback size cap): a stale-but-plausible
+      // stream descriptor can demand an enormous synchronous readback (full queue
+      // drain + huge allocation + memcpy back to a stale guest address), which
+      // stalls for seconds and can lose the device / corrupt guest memory. Skip
+      // oversized readbacks rather than risk the wedge.
+      const uint32_t kMemexportReadbackMaxBytes = 16u << 20;  // 16 MB
+      if (memexport_total_size != 0 &&
+          memexport_total_size <= kMemexportReadbackMaxBytes) {
         if (REXCVAR_GET(readback_memexport_fast)) {
           IssueDraw_MemexportReadbackFastPath(memexport_total_size);
         } else {

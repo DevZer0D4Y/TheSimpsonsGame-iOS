@@ -22,3 +22,9 @@ else()
 endif()
 
 rexglue_setup_target(simpsons)
+
+# Windows POSIX shims for the few generated TUs that reference <sys/mman.h>
+# (mprotect, neutered/no-op) and <unistd.h> (usleep). Scoped to this target.
+if(WIN32)
+    target_include_directories(simpsons PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/compat_win)
+endif()

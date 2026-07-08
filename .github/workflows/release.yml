@@ -1,0 +1,232 @@
+name: Release (manual)
+
+# Manual, button-triggered release build for Windows + Linux.
+#
+# Builds the recompiled game (simpsons[.exe]), the extract-xiso installer tool,
+# and the launcher (a standalone .exe on Windows), then uploads them to a DRAFT
+# GitHub release for you to review before publishing.
+#
+# You must own The Simpsons Game (Xbox 360). No game assets are built or shipped;
+# players install content from their own legally-owned ISO via the launcher.
+#
+# Trigger: Actions tab -> "Release (manual)" -> Run workflow.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v0.3.0)"
+        required: true
+        default: "v0.0.0-test"
+      draft:
+        description: "Create the GitHub release as a draft"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write   # needed to create the release
+
+env:
+  LLVM_VERSION: "20.1.8"
+
+jobs:
+  # ---------------------------------------------------------------- Windows
+  windows:
+    name: Windows x64 (clang / D3D12)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install LLVM/Clang ${{ env.LLVM_VERSION }}
+        shell: pwsh
+        run: |
+          $url = "https://github.com/llvm/llvm-project/releases/download/llvmorg-$env:LLVM_VERSION/LLVM-$env:LLVM_VERSION-win64.exe"
+          Invoke-WebRequest $url -OutFile "$env:RUNNER_TEMP\llvm.exe"
+          Start-Process -FilePath "$env:RUNNER_TEMP\llvm.exe" -ArgumentList '/S' -Wait
+          "C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+
+      - name: Install Ninja
+        run: choco install ninja -y --no-progress
+
+      - name: Configure (game + SDK, D3D12)
+        shell: pwsh
+        working-directory: simpsons
+        run: |
+          cmake --preset win-amd64-relwithdebinfo `
+            -DREXSDK_DIR="$env:GITHUB_WORKSPACE/tools/rexglue-sdk" `
+            "-DCMAKE_C_FLAGS=-march=x86-64-v3" "-DCMAKE_CXX_FLAGS=-march=x86-64-v3"
+
+      - name: Build simpsons.exe
+        working-directory: simpsons
+        run: cmake --build --preset win-amd64-relwithdebinfo --target simpsons
+
+      - name: Build extract-xiso
+        shell: pwsh
+        run: |
+          cmake -S tools/extract-xiso -B tools/extract-xiso/build -G Ninja `
+            -DCMAKE_C_COMPILER=clang "-DCMAKE_C_FLAGS=-DWIN32 -Wno-deprecated-declarations"
+          cmake --build tools/extract-xiso/build
+
+      - name: Build launcher .exe (native window)
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip pyinstaller PySide6
+          pyinstaller --noconfirm --onefile --windowed --name simpsons-launcher `
+            --add-data "launcher/ui;ui" launcher/launcher.py
+
+      - name: Fetch ffmpeg (launcher artwork)
+        shell: pwsh
+        run: |
+          $url = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip"
+          Invoke-WebRequest $url -OutFile "$env:RUNNER_TEMP\ff.zip"
+          Expand-Archive "$env:RUNNER_TEMP\ff.zip" "$env:RUNNER_TEMP\ff" -Force
+          $ff = Get-ChildItem "$env:RUNNER_TEMP\ff" -Recurse -Filter ffmpeg.exe | Select-Object -First 1
+          Copy-Item $ff.FullName "ffmpeg.exe" -Force
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $bd = "simpsons/out/build/win-amd64-relwithdebinfo"
+          New-Item -ItemType Directory -Force release | Out-Null
+          Copy-Item "$bd/simpsons.exe"                 release/
+          Copy-Item "$bd/*.dll"                         release/
+          Copy-Item "tools/extract-xiso/build/extract-xiso.exe" release/
+          Copy-Item "dist/simpsons-launcher.exe"        release/
+          Copy-Item "ffmpeg.exe"                         release/
+          Copy-Item "README.md"                         release/
+          Set-Content release/simpsons.toml -Encoding utf8 -Value @(
+            '# The Simpsons Game - runtime configuration (edit these via the launcher)',
+            'gpu_allow_invalid_fetch_constants = false',
+            'gpu_shader_max_cf_iterations = 0')
+          Compress-Archive -Path release/* -DestinationPath TheSimpsonsGame-Recompiled-Windows-x64.zip -Force
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-x64
+          path: TheSimpsonsGame-Recompiled-Windows-x64.zip
+
+  # ---------------------------------------------------------------- Linux
+  # Best-effort; mirrors the documented Linux build. Uses the Vulkan backend.
+  linux:
+    name: Linux x64 (clang / Vulkan)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install clang-20 + build deps
+        run: |
+          wget -q https://apt.llvm.org/llvm.sh
+          chmod +x llvm.sh
+          sudo ./llvm.sh 20
+          sudo apt-get update
+          sudo apt-get install -y ninja-build pkg-config patchelf \
+            libgtk-3-dev libvulkan-dev \
+            libx11-xcb-dev libxcb1-dev libx11-dev libxext-dev libxrandr-dev \
+            libxcursor-dev libxi-dev libxfixes-dev libxss-dev \
+            libxkbcommon-dev libxkbcommon-x11-dev \
+            libwayland-dev wayland-protocols libudev-dev \
+            libasound2-dev libpulse-dev libpipewire-0.3-dev
+
+      - name: Configure (game + SDK, Vulkan)
+        working-directory: simpsons
+        run: |
+          cmake --preset linux-amd64-relwithdebinfo \
+            -DREXSDK_DIR="$GITHUB_WORKSPACE/tools/rexglue-sdk" \
+            "-DCMAKE_C_FLAGS=-march=x86-64-v3" "-DCMAKE_CXX_FLAGS=-march=x86-64-v3"
+
+      - name: Build simpsons
+        working-directory: simpsons
+        run: cmake --build --preset linux-amd64-relwithdebinfo --target simpsons
+
+      - name: Build extract-xiso
+        run: |
+          cmake -S tools/extract-xiso -B tools/extract-xiso/build -G Ninja -DCMAKE_C_COMPILER=clang-20
+          cmake --build tools/extract-xiso/build
+
+      - name: Package
+        run: |
+          bd="simpsons/out/build/linux-amd64-relwithdebinfo"
+          mkdir -p release
+          cp "$bd/simpsons" release/
+          cp "$bd"/*.so* release/ 2>/dev/null || true
+          cp tools/extract-xiso/build/extract-xiso release/
+          cp -r launcher release/launcher
+          cp README.md release/
+          printf '# The Simpsons Game - runtime configuration (edit these via the launcher)\ngpu_allow_invalid_fetch_constants = false\ngpu_shader_max_cf_iterations = 0\n' > release/simpsons.toml
+
+          # launcher.py's DEFAULT_CONFIG assumes the nested dev-tree layout
+          # (simpsons/out/build/.../simpsons). This package is flat instead
+          # (simpsons sits right next to launcher/), so ship a launcher.json
+          # override describing the real layout -- otherwise the bundled
+          # launcher can't find the engine it's sitting right next to.
+          printf '{"engine": {"Linux": "simpsons"}, "lib_dirs": {"Linux": ["."]}}\n' > release/launcher/launcher.json
+
+          # One obvious double-clickable/runnable entry point at the top of
+          # the download, so a player never has to know the internal layout.
+          printf '#!/bin/sh\ncd "$(dirname "$0")/launcher" && exec ./simpsons-launcher.sh\n' > release/Play.sh
+          chmod +x release/Play.sh
+
+          # The runtime lib pulls in libTracyClient.so as a NEEDED entry it
+          # doesn't actually use symbols from; loading two copies of Tracy
+          # (once via this transitive dependency, once via simpsons' own
+          # direct link) segfaults in Tracy's global constructor at dl_init.
+          # De-duplicate by repointing that entry at libm.so.6, which every
+          # ELF already needs anyway.
+          for f in release/librexruntime*.so; do
+            [ -f "$f" ] && patchelf --replace-needed libTracyClient.so libm.so.6 "$f"
+          done
+
+          # Fail the build here, not for a player after download, if the
+          # packaged binary has any unresolved shared library dependency.
+          MISSING=$(LD_LIBRARY_PATH="$(pwd)/release" ldd release/simpsons | grep "not found" || true)
+          if [ -n "$MISSING" ]; then
+            echo "Packaged binary has unresolved shared library dependencies:"
+            echo "$MISSING"
+            exit 1
+          fi
+
+          tar -czf TheSimpsonsGame-Recompiled-Linux-x64.tar.gz -C release .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-x64
+          path: TheSimpsonsGame-Recompiled-Linux-x64.tar.gz
+
+  # ---------------------------------------------------------------- Release
+  release:
+    name: Draft GitHub release
+    needs: [windows, linux]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create draft release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag }}
+          name: The Simpsons Game — Recompiled ${{ inputs.tag }}
+          draft: ${{ inputs.draft }}
+          prerelease: true
+          fail_on_unmatched_files: true
+          files: artifacts/**/*
+          body: |
+            First-bring-up build of the recompiled game for Windows (D3D12) and Linux (Vulkan).
+
+            **You must own The Simpsons Game (Xbox 360).** No game content is included —
+            install it from your own legally-owned ISO.
+
+            **Windows:** unzip, run `simpsons-launcher.exe`, click *Install from ISO*, then *Play*.
+
+            ⚠️ Do **not** enable the "Instant character pop-in" patch on Steam Deck / Van Gogh
+            APU class GPUs — it crashes on level load (a kernel BSOD on Windows).
+
+      # The release now holds its own copy of the zips, so drop the transient
+      # workflow artifacts to keep storage clean.
+      - name: Delete build artifacts
+        uses: geekyeggo/delete-artifact@v5
+        with:
+          name: |
+            windows-x64
+            linux-x64

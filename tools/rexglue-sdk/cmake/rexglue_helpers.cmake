@@ -59,6 +59,14 @@ function(rexglue_configure_target target_name)
     target_sources(${target_name} PRIVATE
         ${REXGLUE_SHARE_DIR}/rex_app.cpp)
 
+    # rex_app.cpp includes <imgui.h> (console overlay). imgui is a thirdparty
+    # OBJECT library whose interface include dir isn't propagated to the host
+    # through rex::runtime, so add it explicitly here.
+    if(TARGET imgui)
+        target_include_directories(${target_name} PRIVATE
+            $<TARGET_PROPERTY:imgui,INTERFACE_INCLUDE_DIRECTORIES>)
+    endif()
+
     target_compile_definitions(${target_name} PRIVATE
         REXGLUE_BUILD_CONFIG="$<CONFIG>")
 
