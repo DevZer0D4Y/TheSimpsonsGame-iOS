@@ -1193,7 +1193,12 @@ RenderTargetCache::RenderTarget* RenderTargetCache::GetOrCreateRenderTarget(Rend
     uint32_t width = key.GetWidth();
     uint32_t height = GetRenderTargetHeight(key.pitch_tiles_at_32bpp, key.msaa_samples);
     if (render_target) {
-      REXGPU_DEBUG(
+      // HAND PATCH: promoted from DEBUG to INFO. Render targets are created
+      // once and cached, so this fires only a handful of times per session,
+      // and the MSAA sample count here is the single most important hidden
+      // GPU-cost datum for perf work on this title -- default logs carried
+      // no way to see whether the game requests 2x/4x MSAA.
+      REXGPU_INFO(
           "Created a {}x{} {}xMSAA {} render target with guest format {} at "
           "EDRAM base {}",
           width, height, uint32_t(1) << uint32_t(key.msaa_samples),
