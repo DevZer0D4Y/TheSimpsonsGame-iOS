@@ -276,18 +276,35 @@ class PosixConditionBase {
       return std::make_pair(result, 0);
     }
 
-    auto start_time = std::chrono::steady_clock::now();
-    auto end_time = (timeout == std::chrono::milliseconds::max())
-                        ? std::chrono::steady_clock::time_point::max()
-                        : start_time + timeout;
+    // HAND PATCH: this poll loop measured at 42% of ALL process CPU cycles
+    // during real gameplay (Springfield hub), nearly all of it from the
+    // "Audio Worker" thread multi-waiting on client semaphores -- and it
+    // also serves every guest KeWaitForMultipleObjects. Three fixes, none
+    // changing semantics:
+    //   1. The locks vector used to be constructed (heap-allocated) and
+    //      destroyed EVERY loop iteration -- hoisted out; clear() keeps
+    //      capacity, so the allocation happens once per call.
+    //   2. On trylock contention it used to yield() and immediately retry
+    //      the whole loop -- an unbounded busy-spin exactly when the
+    //      signaling side is active (the SDL audio callback signals these
+    //      same handles constantly, so contention here is the COMMON case
+    //      under load). Now backs off for a bounded 100us instead.
+    //   3. steady_clock::now() was read every iteration even for
+    //      infinite-timeout waits that can never time out (5.9% of the
+    //      audio thread's cycles were clock reads) -- now skipped.
+    const bool infinite_timeout = timeout == std::chrono::milliseconds::max();
+    auto end_time = std::chrono::steady_clock::time_point::max();
+    if (!infinite_timeout) {
+      end_time = std::chrono::steady_clock::now() + timeout;
+    }
+
+    std::vector<std::unique_lock<std::mutex>> locks;
+    locks.reserve(handles.size());
 
     while (true) {
       size_t first_signaled = std::numeric_limits<size_t>::max();
       bool condition_met = false;
       bool all_locked = true;
-
-      std::vector<std::unique_lock<std::mutex>> locks;
-      locks.reserve(handles.size());
 
       for (size_t i = 0; i < handles.size(); ++i) {
 #if REX_PLATFORM_LINUX
@@ -313,7 +330,7 @@ class PosixConditionBase {
 
       if (!all_locked) {
         locks.clear();
-        std::this_thread::yield();
+        std::this_thread::sleep_for(std::chrono::microseconds(100));
         continue;
       }
 
@@ -352,14 +369,13 @@ class PosixConditionBase {
 
       locks.clear();
 
-      auto now = std::chrono::steady_clock::now();
-      if (now >= end_time) {
-        return std::make_pair<WaitResult, size_t>(WaitResult::kTimeout, 0);
-      }
-
-      if (timeout == std::chrono::milliseconds::max()) {
+      if (infinite_timeout) {
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
       } else {
+        auto now = std::chrono::steady_clock::now();
+        if (now >= end_time) {
+          return std::make_pair<WaitResult, size_t>(WaitResult::kTimeout, 0);
+        }
         auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - now);
         auto sleep_time = std::min(remaining, std::chrono::milliseconds(1));
         std::this_thread::sleep_for(sleep_time);
