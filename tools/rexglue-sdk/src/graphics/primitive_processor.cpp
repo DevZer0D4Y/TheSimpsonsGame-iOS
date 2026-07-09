@@ -37,9 +37,20 @@ REXCVAR_DEFINE_BOOL(force_convert_quad_lists_to_triangle_lists, false, "GPU",
 REXCVAR_DEFINE_BOOL(force_convert_triangle_fans_to_lists, false, "GPU",
                     "Force convert triangle fans to lists");
 
-REXCVAR_DEFINE_INT32(primitive_processor_cache_min_indices, 0, "GPU",
-                     "Minimum indices for primitive processor cache")
-    .range(0, 1000000);
+// HAND PATCH: was 0, which (count being unsigned) made the CacheTransaction
+// gate engage the cache for EVERY converted-index draw no matter how tiny.
+// The upstream TODO below documents this exact cache measured as a net LOSS
+// at a threshold of 1024 ("cache lookups and insertions require global
+// critical region locking, and insertions also require protecting pages")
+// with a suggested default of 4096 -- shipping 0 was strictly more aggressive
+// than the value already known to regress. The cache is also cleared every
+// frame, so unique-per-frame tiny draws (the measured ~3.7k draws/frame in
+// the main menu) paid mutex + page-protection overhead per draw with zero
+// possible reuse. -1 disables caching; re-enable at a high threshold only if
+// a specific scene is shown to benefit.
+REXCVAR_DEFINE_INT32(primitive_processor_cache_min_indices, -1, "GPU",
+                     "Minimum indices for primitive processor cache (-1 disables)")
+    .range(-1, 1000000);
 
 // All these overrides are always safe to use as all backends are expected to
 // support triangle lists and line strips.
