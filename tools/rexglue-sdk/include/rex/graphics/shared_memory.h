@@ -258,6 +258,13 @@ class SharedMemory {
   // Triggers the watches (global and per-range), removing triggered range
   // watches.
   void FireWatches(uint32_t page_first, uint32_t page_last, bool invalidated_by_gpu);
+  // Same, for callers already holding the global critical region (pass the
+  // held lock as proof) -- avoids a redundant recursive re-acquire on the
+  // CPU-write-fault invalidation path, which fires tens of thousands of
+  // times during level streaming (see mmio_handler.cpp's exception-handler
+  // comment).
+  void FireWatchesLocked(const std::unique_lock<std::recursive_mutex>& global_lock,
+                         uint32_t page_first, uint32_t page_last, bool invalidated_by_gpu);
   // Unlinks and frees the range and its nodes. Call this in the global critical
   // region.
   void UnlinkWatchRange(WatchRange* range);

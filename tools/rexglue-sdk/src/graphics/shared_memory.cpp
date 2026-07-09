@@ -280,12 +280,17 @@ void SharedMemory::UnwatchMemoryRange(WatchHandle handle) {
 }
 
 void SharedMemory::FireWatches(uint32_t page_first, uint32_t page_last, bool invalidated_by_gpu) {
+  auto global_lock = global_critical_region_.Acquire();
+  FireWatchesLocked(global_lock, page_first, page_last, invalidated_by_gpu);
+}
+
+void SharedMemory::FireWatchesLocked(const std::unique_lock<std::recursive_mutex>& global_lock,
+                                     uint32_t page_first, uint32_t page_last,
+                                     bool invalidated_by_gpu) {
   uint32_t address_first = page_first << page_size_log2_;
   uint32_t address_last = (page_last << page_size_log2_) + ((1 << page_size_log2_) - 1);
   uint32_t bucket_first = address_first >> kWatchBucketSizeLog2;
   uint32_t bucket_last = address_last >> kWatchBucketSizeLog2;
-
-  auto global_lock = global_critical_region_.Acquire();
 
   // Fire global watches.
   for (const auto global_watch : global_watches_) {
@@ -640,7 +645,14 @@ std::pair<uint32_t, uint32_t> SharedMemory::MemoryInvalidationCallback(
   gpu_written_data_dirty_.store(true, std::memory_order_relaxed);
   dirty_blocks_.fetch_or(dirty_blocks_mask, std::memory_order_relaxed);
 
-  FireWatches(page_first, page_last, false);
+  // HAND PATCH: was the public FireWatches, which re-acquires the global
+  // critical region this function already holds (and whose sole caller,
+  // PhysicalHeap::TriggerCallbacks, holds it a level above that -- its
+  // signature takes the lock by value). This runs on every CPU write fault
+  // against GPU-watched memory -- tens of thousands of times during level
+  // streaming per mmio_handler.cpp's own comment -- so drop the innermost of
+  // the three recursive acquires by passing the already-held lock through.
+  FireWatchesLocked(global_lock, page_first, page_last, false);
 
   return std::make_pair(page_first << page_size_log2_, (page_last - page_first + 1)
                                                            << page_size_log2_);
