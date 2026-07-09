@@ -10,14 +10,20 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 include(generated/rexglue.cmake)
 
+# Opt-in: pass-through instrumentation of the guest draw-submission
+# functions (call counts, primitive mix, batchability run-lengths -- see
+# src/draw_telemetry.cpp). Off by default so the normal play build carries
+# zero extra code in the draw path; flip on deliberately for a measurement
+# session, then rebuild off again.
+option(SIMPSONS_DRAW_TELEMETRY "Instrument guest draw submission" OFF)
+
 # Sources
 set(SIMPSONS_SOURCES
     src/main.cpp
-    # Zero-behavior-change instrumentation of the two guest D3D draw entry
-    # points (the only PM4 DRAW_INDX writers in the image) -- measures how
-    # batchable the draw stream is before any draw-merging work is attempted.
-    src/draw_telemetry.cpp
 )
+if(SIMPSONS_DRAW_TELEMETRY)
+    list(APPEND SIMPSONS_SOURCES src/draw_telemetry.cpp)
+endif()
 
 if(WIN32)
     add_executable(simpsons WIN32 ${SIMPSONS_SOURCES})
