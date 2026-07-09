@@ -45,9 +45,14 @@ class ObjectTable {
   // not use.
   X_STATUS RestoreHandle(X_HANDLE handle, XObject* object);
 
+  // `already_locked` skips re-acquiring the global critical region for
+  // callers that provably hold it for the whole call (the raw two-arg
+  // LookupObject always had this escape hatch; nothing threaded it through
+  // to the template, so lock-holding callers paid a redundant recursive
+  // lock/unlock of the process-wide mutex on every lookup).
   template <typename T>
-  object_ref<T> LookupObject(X_HANDLE handle) {
-    auto object = LookupObject(handle, false);
+  object_ref<T> LookupObject(X_HANDLE handle, bool already_locked = false) {
+    auto object = LookupObject(handle, already_locked);
     if (object) {
       if (object->type() != T::kObjectType) {
         object->Release();
@@ -105,6 +110,6 @@ class ObjectTable {
 
 // Generic lookup
 template <>
-object_ref<XObject> ObjectTable::LookupObject<XObject>(X_HANDLE handle);
+object_ref<XObject> ObjectTable::LookupObject<XObject>(X_HANDLE handle, bool already_locked);
 
 }  // namespace rex::system::util

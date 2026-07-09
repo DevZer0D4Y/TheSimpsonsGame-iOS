@@ -387,7 +387,13 @@ object_ref<XObject> XObject::GetNativeObject(KernelState* kernel_state, void* na
     // Already initialized.
     // TODO: assert if the type of the object != as_type
     uint32_t handle = header->wait_list_blink;
-    auto object = kernel_state->object_table()->LookupObject<XObject>(handle);
+    // This function holds the global critical region for its whole body (the
+    // AcquireDirect() above), and this lookup runs on every guest
+    // KeSetEvent/wait/semaphore/mutant call that addresses the object by
+    // pointer -- the common case. Skip LookupObject's own redundant
+    // re-acquire of the same recursive mutex.
+    auto object =
+        kernel_state->object_table()->LookupObject<XObject>(handle, /*already_locked=*/true);
 
     // TODO(benvanik): assert nothing has been changed in the struct.
     return object;
