@@ -22,16 +22,41 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <string>
 
+#include <fmt/format.h>
 #include <rex/logging.h>
 #include <rex/ppc.h>
 
+// First-pass hooks on the two DRAW_INDX (DMA-indexed) writers produced ZERO
+// telemetry through a full boot->menu run even though the engine counted
+// ~3.7k host draws/frame -- the menu's tiny UI draws don't go through them.
+// The image contains more draw-packet writers (found by scanning for the
+// DRAW_INDX_2 opcode 0x3600 and li-encoded forms): the D3D method-table
+// handlers sub_824626B8 (entry 17), sub_82463E60 (entry 33, DRAW_INDX_2 --
+// inline-index draws, the natural fit for tiny UI quads), sub_82464590
+// (entry 38), plus sub_82455570 and -- notably OUTSIDE the D3D method table
+// entirely -- sub_82444A48/sub_82444A80 (a separate submission path, likely
+// the UI/video layer). All are hooked with per-function counters so the
+// next run tells us exactly which one carries the draw storm.
 REX_EXTERN(__imp__sub_82462810);
 REX_EXTERN(__imp__sub_824646E8);
+REX_EXTERN(__imp__sub_824626B8);
+REX_EXTERN(__imp__sub_82463E60);
+REX_EXTERN(__imp__sub_82464590);
+REX_EXTERN(__imp__sub_82455570);
+REX_EXTERN(__imp__sub_82444A48);
+REX_EXTERN(__imp__sub_82444A80);
 // Prior extern "C" declarations so the strong definitions below get C
 // linkage, matching the generated weak symbols they override.
 REX_EXTERN(sub_82462810);
 REX_EXTERN(sub_824646E8);
+REX_EXTERN(sub_824626B8);
+REX_EXTERN(sub_82463E60);
+REX_EXTERN(sub_82464590);
+REX_EXTERN(sub_82455570);
+REX_EXTERN(sub_82444A48);
+REX_EXTERN(sub_82444A80);
 
 namespace {
 
@@ -40,8 +65,10 @@ namespace {
 constexpr uint32_t kReportEveryDraws = 200000;
 
 std::atomic<uint64_t> g_total_calls{0};
-std::atomic<uint64_t> g_calls_a{0};  // sub_82462810
-std::atomic<uint64_t> g_calls_b{0};  // sub_824646E8
+// Per-hook call counters, indexed to match kHookNames.
+constexpr const char* kHookNames[8] = {"82462810", "824646E8", "824626B8", "82463E60",
+                                       "82464590", "82455570", "82444A48", "82444A80"};
+std::array<std::atomic<uint64_t>, 8> g_hook_calls{};
 
 // Primitive types are 6 bits (xenos::PrimitiveType, 0..63).
 std::array<std::atomic<uint64_t>, 64> g_prim_counts{};
@@ -96,8 +123,13 @@ void RecordDraw(uint32_t prim, uint32_t count) {
   uint64_t total = g_total_calls.fetch_add(1, std::memory_order_relaxed) + 1;
   if (total % kReportEveryDraws == 0) {
     // Snapshot (relaxed reads; telemetry precision, not accounting).
-    uint64_t a = g_calls_a.load(std::memory_order_relaxed);
-    uint64_t b = g_calls_b.load(std::memory_order_relaxed);
+    std::string per_hook;
+    for (size_t h = 0; h < g_hook_calls.size(); ++h) {
+      uint64_t n = g_hook_calls[h].load(std::memory_order_relaxed);
+      if (n) {
+        per_hook += fmt::format(" {}={}", kHookNames[h], n);
+      }
+    }
     // Top primitive types.
     uint32_t top_prim[3] = {64, 64, 64};
     uint64_t top_n[3] = {0, 0, 0};
@@ -116,10 +148,10 @@ void RecordDraw(uint32_t prim, uint32_t count) {
       }
     }
     REXGPU_INFO(
-        "[draw-telemetry] total={} (A={} B={}) prims: [{}]x{} [{}]x{} [{}]x{} "
+        "[draw-telemetry] total={} hooks:{} prims: [{}]x{} [{}]x{} [{}]x{} "
         "counts(<=4/<=16/<=64/<=256/<=1024/>1024): {}/{}/{}/{}/{}/{} "
         "runs(1/2-4/5-16/17-64/>64): {}/{}/{}/{}/{}",
-        total, a, b, top_prim[0], top_n[0], top_prim[1], top_n[1], top_prim[2], top_n[2],
+        total, per_hook, top_prim[0], top_n[0], top_prim[1], top_n[1], top_prim[2], top_n[2],
         g_count_buckets[0].load(std::memory_order_relaxed),
         g_count_buckets[1].load(std::memory_order_relaxed),
         g_count_buckets[2].load(std::memory_order_relaxed),
@@ -137,16 +169,23 @@ void RecordDraw(uint32_t prim, uint32_t count) {
 }  // namespace
 
 // Strong overrides of the generated weak definitions. Registers are passed
-// through to the original bodies untouched.
+// through to the original bodies untouched. Argument decode (r4=prim,
+// r5=count) is confirmed for the two DRAW_INDX writers; for the rest it is
+// a best guess until one shows up as the hot path -- the per-hook counters
+// are the ground truth either way.
 
-REX_FUNC(sub_82462810) {
-  g_calls_a.fetch_add(1, std::memory_order_relaxed);
-  RecordDraw(ctx.r4.u32 & 63, ctx.r5.u32 & 0xFFFF);
-  __imp__sub_82462810(ctx, base);
-}
+#define DRAW_TELEMETRY_HOOK(index, name)                 \
+  REX_FUNC(name) {                                       \
+    g_hook_calls[index].fetch_add(1, std::memory_order_relaxed); \
+    RecordDraw(ctx.r4.u32 & 63, ctx.r5.u32 & 0xFFFF);    \
+    __imp__##name(ctx, base);                            \
+  }
 
-REX_FUNC(sub_824646E8) {
-  g_calls_b.fetch_add(1, std::memory_order_relaxed);
-  RecordDraw(ctx.r4.u32 & 63, ctx.r5.u32 & 0xFFFF);
-  __imp__sub_824646E8(ctx, base);
-}
+DRAW_TELEMETRY_HOOK(0, sub_82462810)
+DRAW_TELEMETRY_HOOK(1, sub_824646E8)
+DRAW_TELEMETRY_HOOK(2, sub_824626B8)
+DRAW_TELEMETRY_HOOK(3, sub_82463E60)
+DRAW_TELEMETRY_HOOK(4, sub_82464590)
+DRAW_TELEMETRY_HOOK(5, sub_82455570)
+DRAW_TELEMETRY_HOOK(6, sub_82444A48)
+DRAW_TELEMETRY_HOOK(7, sub_82444A80)
