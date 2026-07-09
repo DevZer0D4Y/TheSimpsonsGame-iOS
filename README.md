@@ -98,6 +98,75 @@ the launcher (Settings → Input).
   your target in light scenes and fall short in heavier ones on Steam Deck's APU; this is an
   active area of work, not a hard cap anymore.
 
+## Performance roadmap
+
+Where this project is headed, in plain language.
+
+**The big picture:** today the recompiled game code runs natively on your CPU, but everything
+it asks the GPU to do still goes through an emulation-style translation layer (derived from the
+Xenia emulator): the game writes Xbox 360 GPU command packets, and the engine decodes them,
+emulates the 360's unusual video memory (EDRAM), and translates its shaders to Vulkan/D3D12 at
+runtime. That layer is mature and correct — but it's also where most of the remaining
+performance and smoothness is left on the table. The long-term goal is to **progressively
+replace that layer with a purpose-built native renderer** for this specific game, the same
+strategy other successful recompilation projects have used. Each stage below is useful on its
+own, and the current renderer always remains as a working fallback.
+
+### ✅ Recently shipped
+
+- **Real 60 FPS**: the game hardcoded "wait 2 screen refreshes between frames" (a 30 FPS lock)
+  independent of any settings — found and patched at the instruction level, matching the
+  community's verified 60 FPS patch for this title. The Framerate setting now actually works.
+- **Tear-free presentation**: main-menu flicker traced to a tearing-permitted swapchain default;
+  now prefers a tear-free mode with the same latency.
+- **Engine hot-path fixes**: removed a per-draw-call index-cache that the code's own upstream
+  history documents as a measured performance loss (it ran on *every* draw, and its per-frame
+  cache could never help unique draws); eliminated redundant re-acquisitions of the engine's
+  global lock on two hot paths (guest thread-sync calls, and the memory-fault handler that fires
+  tens of thousands of times during level streaming).
+- **Full-speed builds**: the 82,000 recompiled game functions — where nearly all CPU time goes —
+  were compiling at a lower optimization level than the rest of the project, and local builds
+  lacked the modern-CPU instruction baseline releases already used. Now unified: `-O3`,
+  `x86-64-v3` (AVX2-era, same requirement releases already had), and optional ThinLTO that
+  optimizes across all translation units at once.
+- **Built-in frame profiling**: the engine now logs per-frame stats (FPS, frame time, draw
+  calls, GPU sync stalls, cache hit rates) to a CSV when `perf_log_csv` is set in the config —
+  every optimization on this roadmap gets measured, not guessed.
+
+### 🔬 Phase 1 — measure & squeeze (in progress)
+
+- **Profile-guided optimization**: build once with instrumentation, play a real session, rebuild
+  — the compiler then lays out those 82k functions using real hotness data instead of guesses.
+- **Real gameplay captures**: current data covers the main menu (which issues a startling
+  ~3,700 tiny draw calls per frame at ~3 vertices each — likely per-glyph text/UI); in-level
+  profiles will decide what gets optimized next.
+- **Find the draw-burst source**: identify exactly which recompiled game function issues that
+  draw storm, so it can be fixed at the source rather than worked around downstream.
+
+### 🔧 Phase 2 — targeted engine surgery
+
+- **Batch the UI draw burst**: hook the specific game routine responsible (the recompiled code
+  supports overriding individual functions) and submit its glyphs/quads as a handful of draws
+  instead of thousands.
+- **Shader-compile stutter policy**: when new shader effects appear (scene transitions), the
+  engine currently holds back whole frames while compiling — tune/expose this tradeoff.
+- **Pipeline pre-warming**: optionally build the shader/pipeline cache right after install
+  instead of during your first play session.
+
+### 🚀 Phase 3 — the native renderer ("de-emulating" the GPU)
+
+The end-game, done as incremental takeovers rather than a risky rewrite:
+
+1. **Inventory**: dump and count the game's unique shaders (likely a few hundred — small enough
+   to convert ahead-of-time, offline) and map the boundary where "the game decides what to draw"
+   turns into GPU command packets.
+2. **Take over presentation**: replace the swap/present path first — small, provable, reversible.
+3. **Take over UI/2D**: a slim native batcher for menu/HUD/text rendering — this alone
+   eliminates the draw-storm problem at its source.
+4. **Take over world rendering**: the game's shaders converted ahead-of-time, its render passes
+   implemented directly, no more runtime command-packet decoding or EDRAM emulation on the hot
+   path — with the current renderer kept compilable as a reference/fallback throughout.
+
 ## Reporting issues
 
 Found a bug? Please [open an issue](https://github.com/YesterMester/TheSimpsonsGameRecomp/issues)
