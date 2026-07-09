@@ -13,6 +13,10 @@ include(generated/rexglue.cmake)
 # Sources
 set(SIMPSONS_SOURCES
     src/main.cpp
+    # Zero-behavior-change instrumentation of the two guest D3D draw entry
+    # points (the only PM4 DRAW_INDX writers in the image) -- measures how
+    # batchable the draw stream is before any draw-merging work is attempted.
+    src/draw_telemetry.cpp
 )
 
 if(WIN32)
