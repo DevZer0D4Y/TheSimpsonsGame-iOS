@@ -79,6 +79,10 @@ tools/*.tar.gz
 # extracted game content (copyrighted) - never ship
 gamedata_clean_extract/
 
+# external repos pulled as read-only reference material (licenses respected;
+# nothing copied without a per-file license check)
+tools/reference/
+
 # vendored dependencies: ship their sources, not their git object stores
 .git.vendored/
 

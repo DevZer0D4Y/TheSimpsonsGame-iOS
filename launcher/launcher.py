@@ -30,7 +30,7 @@ import zipfile
 import zlib
 from pathlib import Path
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 
 FROZEN = getattr(sys, "frozen", False)
 if FROZEN:
@@ -631,11 +631,24 @@ def check_updates():
         tag = data.get("tag_name", "")
         asset_name = _platform_asset_name()
         asset = next((a for a in data.get("assets", []) if a.get("name") == asset_name), None)
-        if tag and tag.lstrip("v") != VERSION and asset:
+
+        def _ver_tuple(s):
+            # "v0.3.1" / "0.3.1" -> (0, 3, 1); malformed parts count as 0 so a
+            # weird tag can never brick the comparison.
+            parts = []
+            for p in s.lstrip("vV").split("."):
+                digits = "".join(ch for ch in p if ch.isdigit())
+                parts.append(int(digits) if digits else 0)
+            return tuple(parts + [0] * (3 - len(parts)))
+
+        # Strictly newer only: a mismatched-but-older tag must never nag
+        # every user with a bogus "update available".
+        is_newer = bool(tag) and _ver_tuple(tag) > _ver_tuple(VERSION)
+        if is_newer and asset:
             update_state.update(checked=True, update_available=True,
                                 download_url=asset["browser_download_url"], latest_tag=tag,
                                 msg=f"Update available: {tag} (you're on {VERSION})")
-        elif tag and tag.lstrip("v") != VERSION:
+        elif is_newer:
             update_state.update(checked=True, update_available=False, download_url=None,
                                 msg=f"A newer release ({tag}) exists but has no {asset_name} asset for "
                                     f"this platform yet — see {data.get('html_url', '')}")

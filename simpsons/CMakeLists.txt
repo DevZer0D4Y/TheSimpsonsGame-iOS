@@ -33,6 +33,13 @@ endif()
 
 rexglue_setup_target(simpsons)
 
+# draw_telemetry.cpp calls fmt directly; the prebuilt SDK exposes fmt headers
+# transitively, but REXSDK_DIR (add_subdirectory) builds -- what CI uses --
+# need the explicit link for the target to see fmt's usage requirements.
+if(SIMPSONS_DRAW_TELEMETRY AND TARGET fmt::fmt)
+    target_link_libraries(simpsons PRIVATE fmt::fmt)
+endif()
+
 # The generated translation units are where nearly all guest CPU time goes,
 # but CMake's stock RelWithDebInfo only compiles them at -O2, and local builds
 # never got the -march=x86-64-v3 that CI already ships in every release
