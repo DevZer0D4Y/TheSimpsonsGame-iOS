@@ -30,7 +30,7 @@ import zipfile
 import zlib
 from pathlib import Path
 
-VERSION = "0.4.0"
+VERSION = "0.0.4"
 
 FROZEN = getattr(sys, "frozen", False)
 if FROZEN:
