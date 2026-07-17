@@ -21,6 +21,7 @@
 #include <rex/dbg.h>
 #include <rex/logging.h>
 #include <rex/perf/counter.h>
+#include <rex/platform.h>
 #include <SDL3/SDL.h>
 
 REXCVAR_DEFINE_BOOL(audio_mute, false, "Audio", "Mute audio output");
@@ -42,6 +43,7 @@ bool SDLAudioDriver::Initialize() {
   // Set audio category for proper OS audio handling
   SDL_SetHint(SDL_HINT_AUDIO_CATEGORY, "playback");
 
+#if REX_PLATFORM_LINUX
   // HAND PATCH: SDL's default audio driver auto-probe can land on "jack"
   // before ever trying pipewire/pulseaudio, and if no real JACK server is
   // reachable (common -- SteamOS runs PipeWire, whose JACK-compatibility
@@ -49,15 +51,29 @@ bool SDLAudioDriver::Initialize() {
   // tool environments like Steam Linux Runtime), SDL_InitSubSystem(AUDIO)
   // fails outright with "Can't open JACK client" instead of continuing on
   // to a driver that actually works. Steer it straight at the drivers that
-  // are real, present, and reliable on this platform.
+  // are real, present, and reliable on this platform. Linux only: naming
+  // these drivers on Windows/macOS makes SDL fail init entirely ("Audio
+  // target 'pipewire,pulseaudio,alsa' not available").
   SDL_SetHint(SDL_HINT_AUDIO_DRIVER, "pipewire,pulseaudio,alsa");
+#endif
 
   // Set app name for audio device identification
   SDL_SetAppMetadataProperty(SDL_PROP_APP_METADATA_NAME_STRING, "rexglue");
 
   if (!SDL_InitSubSystem(SDL_INIT_AUDIO)) {
-    REXAPU_ERROR("SDL_InitSubSystem(SDL_INIT_AUDIO) failed: {}", SDL_GetError());
-    return false;
+#if REX_PLATFORM_LINUX
+    // The steered driver list can itself be wrong on unusual setups (e.g. a
+    // bare ALSA-less system). Fall back to SDL's own probe order before
+    // giving up on audio entirely.
+    SDL_SetHint(SDL_HINT_AUDIO_DRIVER, "");
+    if (SDL_InitSubSystem(SDL_INIT_AUDIO)) {
+      REXAPU_WARN("preferred audio drivers unavailable; using SDL default probe");
+    } else
+#endif
+    {
+      REXAPU_ERROR("SDL_InitSubSystem(SDL_INIT_AUDIO) failed: {}", SDL_GetError());
+      return false;
+    }
   }
   sdl_initialized_ = true;
 
