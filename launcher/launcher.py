@@ -354,18 +354,25 @@ def status():
 
 # ------------------------------------------------------------ file browser
 
-BROWSE_ROOTS = [Path.home(), Path("/run/media"), Path("/media"), Path("/mnt")]
+def browse_roots():
+    if PLAT == "Windows":
+        # Drive letters, probed per call so USB drives plugged in while the
+        # launcher is open still show up.
+        drives = [Path(f"{d}:\\") for d in "ABCDEFGHIJKLMNOPQRSTUVWXYZ"]
+        return [Path.home()] + [d for d in drives if d.is_dir()]
+    return [Path.home(), Path("/run/media"), Path("/media"), Path("/mnt")]
 
 
 def browse(path_str):
     entries = []
+    roots = browse_roots()
     if not path_str:
-        for r in BROWSE_ROOTS:
+        for r in roots:
             if r.is_dir():
                 entries.append({"name": str(r), "path": str(r), "dir": True})
         return {"path": "", "up": None, "entries": entries}
     p = Path(path_str).resolve()
-    if not any(str(p).startswith(str(r)) for r in BROWSE_ROOTS):
+    if not any(str(p).startswith(str(r)) for r in roots):
         p = Path.home()
     try:
         for child in sorted(p.iterdir(), key=lambda c: (not c.is_dir(), c.name.lower())):
