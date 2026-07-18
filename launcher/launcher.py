@@ -9,6 +9,8 @@ The Simpsons Game — Recompiled : Launcher  (v3)
   language, audio — written to a launcher-owned block in simpsons.toml.
 - Patches tab (skip intro videos; more to come).
 - Save-data backup/restore, Add to Steam, GitHub update checks.
+- Diagnostics: one-click session logging (crashes, black screens,
+  performance samples) + support bundles for bug reports.
 """
 
 import http.server
@@ -18,6 +20,7 @@ import platform
 import re
 import secrets
 import shutil
+import signal
 import socket
 import struct
 import subprocess
@@ -52,10 +55,12 @@ else:
 ART_DIR = LAUNCHER_DIR / "art"
 MODS_DIR = LAUNCHER_DIR / "mods"
 BACKUPS_DIR = LAUNCHER_DIR / "backups"
+DIAG_DIR = LAUNCHER_DIR / "diagnostics"
 CONFIG_JSON = LAUNCHER_DIR / "launcher.json"
 
 DEFAULT_CONFIG = {
     "github_repo": "YesterMester/TheSimpsonsGameRecomp",
+    "diagnostics_enabled": False,
     "engine": {
         "Linux": "simpsons/out/build/linux-amd64-relwithdebinfo/simpsons",
         "Windows": "simpsons/out/build/win-amd64-relwithdebinfo/simpsons.exe",
@@ -83,6 +88,13 @@ def load_config():
     else:
         CONFIG_JSON.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
     return cfg
+
+
+def save_config():
+    try:
+        CONFIG_JSON.write_text(json.dumps(CONFIG, indent=2) + "\n", encoding="utf-8")
+    except Exception:
+        pass
 
 
 CONFIG = load_config()
@@ -345,6 +357,7 @@ def status():
         "backups": list_backups(),
         "patches": patches_list(),
         "github_repo": CONFIG.get("github_repo", ""),
+        "diagnostics_enabled": diagnostics_enabled(),
         "update": update_state,
         "steam_available": bool(shutil.which("steamos-add-to-steam") or shutil.which("steam")),
         "install": {"running": install_state["running"], "ok": install_state["ok"],
@@ -759,6 +772,414 @@ def apply_update():
         return False, f"Update failed: {e}"
 
 
+# ------------------------------------------------------------ diagnostics
+#
+# One switch for players who hit crashes / black screens / stutter: when
+# enabled, every PLAY press writes a session log (system info + full game
+# output + a plain-English diagnosis of how the game ended) and samples
+# CPU / RAM / GPU into a .csv while the game runs. A support bundle zips
+# the lot for attaching to a GitHub issue. Everything stays local.
+
+def diagnostics_enabled():
+    return bool(CONFIG.get("diagnostics_enabled", False))
+
+
+def set_diagnostics(enable):
+    CONFIG["diagnostics_enabled"] = bool(enable)
+    save_config()
+    return diagnostics_enabled()
+
+
+def _run_quiet(cmd, timeout=6):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True,
+                              timeout=timeout).stdout.strip()
+    except Exception:
+        return ""
+
+
+def _read_first(path, default=""):
+    try:
+        return Path(path).read_text(errors="replace").strip()
+    except Exception:
+        return default
+
+
+def _tail_file(path, n, max_bytes=131072):
+    """Last n lines of a possibly-huge file without reading all of it."""
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            f.seek(max(0, f.tell() - max_bytes))
+            return f.read().decode("utf-8", "replace").splitlines()[-n:]
+    except Exception:
+        return []
+
+
+def _gpu_perf_device():
+    """sysfs perf node of the first GPU exposing amdgpu's busy% (Steam Deck
+    and most AMD cards). None elsewhere -- sampling degrades gracefully."""
+    if PLAT != "Linux":
+        return None
+    for card in sorted(Path("/sys/class/drm").glob("card[0-9]")):
+        dev = card / "device"
+        if (dev / "gpu_busy_percent").exists():
+            return dev
+    return None
+
+
+def _win_mem_status():
+    """(total_mb, avail_mb) of physical RAM on Windows, or (None, None)."""
+    try:
+        import ctypes
+
+        class MEMORYSTATUSEX(ctypes.Structure):
+            _fields_ = [("dwLength", ctypes.c_uint32), ("dwMemoryLoad", ctypes.c_uint32),
+                        ("ullTotalPhys", ctypes.c_uint64), ("ullAvailPhys", ctypes.c_uint64),
+                        ("ullTotalPageFile", ctypes.c_uint64), ("ullAvailPageFile", ctypes.c_uint64),
+                        ("ullTotalVirtual", ctypes.c_uint64), ("ullAvailVirtual", ctypes.c_uint64),
+                        ("ullAvailExtendedVirtual", ctypes.c_uint64)]
+
+        st = MEMORYSTATUSEX()
+        st.dwLength = ctypes.sizeof(st)
+        if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(st)):
+            return int(st.ullTotalPhys) // (1 << 20), int(st.ullAvailPhys) // (1 << 20)
+    except Exception:
+        pass
+    return None, None
+
+
+def _win_proc_rss_mb(pid):
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class PROCESS_MEMORY_COUNTERS(ctypes.Structure):
+            _fields_ = [("cb", wintypes.DWORD), ("PageFaultCount", wintypes.DWORD),
+                        ("PeakWorkingSetSize", ctypes.c_size_t), ("WorkingSetSize", ctypes.c_size_t),
+                        ("QuotaPeakPagedPoolUsage", ctypes.c_size_t), ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                        ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t), ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                        ("PagefileUsage", ctypes.c_size_t), ("PeakPagefileUsage", ctypes.c_size_t)]
+
+        h = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)  # QUERY_LIMITED_INFORMATION
+        if not h:
+            return None
+        try:
+            pmc = PROCESS_MEMORY_COUNTERS()
+            pmc.cb = ctypes.sizeof(pmc)
+            if ctypes.windll.psapi.GetProcessMemoryInfo(h, ctypes.byref(pmc), pmc.cb):
+                return int(pmc.WorkingSetSize) // (1 << 20)
+        finally:
+            ctypes.windll.kernel32.CloseHandle(h)
+    except Exception:
+        pass
+    return None
+
+
+def system_info_text():
+    lines = [f"launcher: v{VERSION} ({'packaged' if FROZEN else 'dev tree'})",
+             f"platform: {platform.platform()}",
+             f"machine: {platform.machine()}",
+             f"python: {platform.python_version()}"]
+    if PLAT == "Linux":
+        m = re.search(r'^PRETTY_NAME="?([^"\n]+)', _read_first("/etc/os-release"), re.M)
+        if m:
+            lines.append(f"os: {m.group(1)}")
+        m = re.search(r"^model name\s*:\s*(.+)$", _read_first("/proc/cpuinfo"), re.M)
+        if m:
+            lines.append(f"cpu: {m.group(1).strip()}")
+        m = re.search(r"^MemTotal:\s*(\d+)", _read_first("/proc/meminfo"), re.M)
+        if m:
+            lines.append(f"ram: {int(m.group(1)) // 1024} MB")
+        for lspci_line in _run_quiet(["lspci"]).splitlines():
+            if re.search(r"VGA|3D controller|Display controller", lspci_line):
+                lines.append(f"gpu: {lspci_line.split(':', 2)[-1].strip()}")
+        dev = _gpu_perf_device()
+        if dev:
+            vram = _read_first(dev / "mem_info_vram_total")
+            if vram.isdigit():
+                lines.append(f"vram: {int(vram) // (1 << 20)} MB")
+    else:
+        cpu = os.environ.get("PROCESSOR_IDENTIFIER", "")
+        if cpu:
+            lines.append(f"cpu: {cpu}")
+        total, _avail = _win_mem_status()
+        if total:
+            lines.append(f"ram: {total} MB")
+        gpus = _run_quiet(["wmic", "path", "win32_VideoController", "get", "name"]).splitlines()
+        for g in gpus[1:]:
+            if g.strip():
+                lines.append(f"gpu: {g.strip()}")
+    lines += ["", "[settings]"]
+    lines += [f"{k} = {v}" for k, v in read_settings().items()]
+    lines += ["", "[patches]"]
+    lines += [f"{p['id']}: {p['state']}" for p in patches_list()]
+    return "\n".join(lines)
+
+
+def describe_exit_code(code):
+    if code is None:
+        return "unknown"
+    if code == 0:
+        return "0 (clean exit)"
+    if code < 0:
+        try:
+            name = signal.Signals(-code).name
+        except (ValueError, AttributeError):
+            name = f"signal {-code}"
+        return f"{code} (killed by {name})"
+    return f"{code} (error)"
+
+
+def diagnose_exit(code, duration, log_text):
+    """Turn an exit code + log tail into plain English a player can act on."""
+    low = (log_text or "").lower()
+    hints = []
+    if code == 0:
+        verdict = "The game exited normally."
+        if duration < 60:
+            hints.append("The session was very short — if the window went black or closed "
+                         "on its own, create a support bundle and attach it to a GitHub issue.")
+    elif code is not None and code < 0:
+        sig = -code
+        if sig == getattr(signal, "SIGKILL", 9):
+            verdict = ("The game was force-killed by the system (SIGKILL) — on Linux this is "
+                       "almost always the out-of-memory killer striking during a level-load "
+                       "memory spike.")
+            hints.append("Close other applications to free RAM, or lower the render "
+                         "resolution scale in Settings.")
+        elif sig == getattr(signal, "SIGTERM", 15):
+            verdict = "The game was stopped (SIGTERM) — usually the STOP button or a system shutdown."
+        else:
+            try:
+                name = signal.Signals(sig).name
+            except (ValueError, AttributeError):
+                name = f"signal {sig}"
+            verdict = f"The game crashed ({name})."
+    else:
+        verdict = f"The game exited with error code {code}."
+    if any(s in low for s in ("device lost", "vk_error_device_lost", "gpu hang", "gpu hung",
+                              "device_lost")):
+        hints.append("A GPU hang / 'device lost' shows in the log. If the 'Instant character "
+                     "pop-in' patch is enabled, disable it in the Patches tab — that is its "
+                     "known failure mode on Steam Deck. The launcher purges the shader cache "
+                     "automatically after a bad exit, so the next launch may stutter briefly "
+                     "while it rebuilds.")
+    if any(s in low for s in ("out of memory", "bad_alloc", "not enough memory")):
+        hints.append("An out-of-memory error shows in the log — close other applications or "
+                     "lower quality settings.")
+    if "vulkan" in low and ("failed" in low or "error" in low):
+        hints.append("Vulkan errors show in the log — make sure your graphics drivers are up "
+                     "to date.")
+    if code not in (0, None) and duration < 15:
+        hints.append("The game died during startup — check that game data is installed "
+                     "(Install tab) and try setting Settings → Resolution preset back to "
+                     "Automatic.")
+    return " ".join([verdict] + hints)
+
+
+class DiagSession:
+    """One diagnostic recording of one game run: a .log with system info +
+    game output + final summary, and a .perf.csv sampled every 2 seconds."""
+
+    SAMPLE_SECS = 2.0
+    KEEP_SESSIONS = 20
+
+    def __init__(self):
+        DIAG_DIR.mkdir(exist_ok=True)
+        self.name = time.strftime("session-%Y%m%d-%H%M%S")
+        self.log_path = DIAG_DIR / f"{self.name}.log"
+        self.perf_path = DIAG_DIR / f"{self.name}.perf.csv"
+        self.summary_path = DIAG_DIR / f"{self.name}.summary.json"
+        self.t0 = time.time()
+        self.peak_rss = 0
+        self.cpu_samples = []
+        self.gpu_samples = []
+        self._prune_old()
+
+    def _prune_old(self):
+        try:
+            for old in sorted(DIAG_DIR.glob("session-*.log"))[:-self.KEEP_SESSIONS]:
+                stem = old.name[:-len(".log")]
+                for suffix in (".log", ".perf.csv", ".summary.json"):
+                    (DIAG_DIR / (stem + suffix)).unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    def write_header(self, cmd, env_notes):
+        try:
+            with open(self.log_path, "w", encoding="utf-8") as f:
+                f.write("The Simpsons Game — Recompiled : diagnostic session log\n")
+                f.write(f"started: {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+                f.write(system_info_text() + "\n\n")
+                if env_notes:
+                    f.write("[launch environment]\n" + "\n".join(env_notes) + "\n\n")
+                f.write("command: " + " ".join(cmd) + "\n")
+                f.write("==== GAME OUTPUT ====\n")
+        except Exception:
+            pass
+
+    def game_output_handle(self):
+        try:
+            return open(self.log_path, "a", encoding="utf-8", errors="replace")
+        except Exception:
+            return subprocess.DEVNULL
+
+    def monitor(self, proc):
+        """Sample the game process until it exits. Cheap: a few tiny sysfs /
+        procfs reads every 2 s on Linux, one WinAPI call on Windows."""
+        try:
+            clk = os.sysconf("SC_CLK_TCK")
+        except (AttributeError, ValueError, OSError):
+            clk = 100
+        gpu_dev = _gpu_perf_device()
+        last = None  # (wall time, cpu ticks)
+        try:
+            pf = open(self.perf_path, "w", encoding="utf-8")
+        except Exception:
+            return
+        with pf:
+            pf.write("t_seconds,cpu_percent,rss_mb,threads,sys_avail_mb,"
+                     "gpu_busy_percent,vram_used_mb\n")
+            while proc.poll() is None:
+                time.sleep(self.SAMPLE_SECS)
+                if proc.poll() is not None:
+                    break
+                t = time.time()
+                cpu = rss = threads_n = sys_avail = gpu = vram = ""
+                if PLAT == "Linux":
+                    stat = _read_first(f"/proc/{proc.pid}/stat")
+                    if stat and ")" in stat:
+                        try:
+                            fields = stat.rsplit(")", 1)[1].split()
+                            ticks = int(fields[11]) + int(fields[12])  # utime+stime
+                            threads_n = fields[17]
+                            if last:
+                                cpu = f"{(ticks - last[1]) / clk / (t - last[0]) * 100:.0f}"
+                            last = (t, ticks)
+                        except (IndexError, ValueError):
+                            pass
+                    m = re.search(r"^VmRSS:\s*(\d+)",
+                                  _read_first(f"/proc/{proc.pid}/status"), re.M)
+                    if m:
+                        rss = str(int(m.group(1)) // 1024)
+                    m = re.search(r"^MemAvailable:\s*(\d+)", _read_first("/proc/meminfo"), re.M)
+                    if m:
+                        sys_avail = str(int(m.group(1)) // 1024)
+                    if gpu_dev:
+                        gpu = _read_first(gpu_dev / "gpu_busy_percent")
+                        v = _read_first(gpu_dev / "mem_info_vram_used")
+                        if v.isdigit():
+                            vram = str(int(v) // (1 << 20))
+                else:
+                    r = _win_proc_rss_mb(proc.pid)
+                    if r is not None:
+                        rss = str(r)
+                    _total, avail = _win_mem_status()
+                    if avail is not None:
+                        sys_avail = str(avail)
+                try:
+                    self.peak_rss = max(self.peak_rss, int(rss or 0))
+                    if cpu:
+                        self.cpu_samples.append(float(cpu))
+                    if gpu:
+                        self.gpu_samples.append(float(gpu))
+                except ValueError:
+                    pass
+                try:
+                    pf.write(f"{t - self.t0:.0f},{cpu},{rss},{threads_n},"
+                             f"{sys_avail},{gpu},{vram}\n")
+                    pf.flush()
+                except Exception:
+                    break
+
+    def finalize(self, code, notes=()):
+        duration = time.time() - self.t0
+        log_text = "\n".join(tail_game_log(200) + _tail_file(self.log_path, 200))
+        diagnosis = diagnose_exit(code, duration, log_text)
+        avg_cpu = round(sum(self.cpu_samples) / len(self.cpu_samples)) if self.cpu_samples else None
+        max_gpu = round(max(self.gpu_samples)) if self.gpu_samples else None
+        summary = {"name": self.name, "exit_code": code,
+                   "exit_desc": describe_exit_code(code),
+                   "duration_s": round(duration),
+                   "peak_rss_mb": self.peak_rss or None,
+                   "avg_cpu_percent": avg_cpu, "max_gpu_percent": max_gpu,
+                   "diagnosis": diagnosis, "notes": list(notes),
+                   "ended": time.strftime("%Y-%m-%d %H:%M:%S")}
+        try:
+            self.summary_path.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
+        except Exception:
+            pass
+        try:
+            with open(self.log_path, "a", encoding="utf-8") as f:
+                f.write("\n==== SESSION SUMMARY ====\n")
+                f.write(f"exit: {describe_exit_code(code)}\n")
+                f.write(f"duration: {round(duration)} s\n")
+                if self.peak_rss:
+                    f.write(f"peak game memory: {self.peak_rss} MB\n")
+                if avg_cpu is not None:
+                    f.write(f"average cpu: {avg_cpu}%\n")
+                if max_gpu is not None:
+                    f.write(f"peak gpu busy: {max_gpu}%\n")
+                for n in notes:
+                    f.write(n + "\n")
+                f.write("diagnosis: " + diagnosis + "\n")
+        except Exception:
+            pass
+
+
+def diagnostics_report():
+    sessions = sorted(DIAG_DIR.glob("session-*.log"), reverse=True) if DIAG_DIR.is_dir() else []
+    last_summary = None
+    summaries = sorted(DIAG_DIR.glob("session-*.summary.json"), reverse=True)
+    if summaries:
+        try:
+            last_summary = json.loads(summaries[0].read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return {
+        "enabled": diagnostics_enabled(),
+        "running": bool(game_running_pids()),
+        "dir": str(DIAG_DIR),
+        "sessions": [{"name": p.name, "size_kb": p.stat().st_size // 1024,
+                      "date": time.strftime("%Y-%m-%d %H:%M", time.localtime(p.stat().st_mtime))}
+                     for p in sessions[:8]],
+        "tail": _tail_file(sessions[0], 120) if sessions else [],
+        "last_summary": last_summary,
+    }
+
+
+def create_support_bundle():
+    """Zip recent diagnostics + config + engine log tails for a bug report.
+    Contents: system/hardware info, launcher settings, game settings
+    (simpsons.toml), session logs & perf samples, engine log tails. No save
+    data, no game content, nothing leaves the machine."""
+    try:
+        DIAG_DIR.mkdir(exist_ok=True)
+        path = DIAG_DIR / time.strftime("support-bundle-%Y%m%d-%H%M%S.zip")
+        with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
+            z.writestr("system-info.txt", system_info_text() + "\n")
+            for log in sorted(DIAG_DIR.glob("session-*.log"), reverse=True)[:3]:
+                stem = log.name[:-len(".log")]
+                z.writestr(f"sessions/{log.name}", "\n".join(_tail_file(log, 2000, 1 << 20)) + "\n")
+                for extra in (f"{stem}.perf.csv", f"{stem}.summary.json"):
+                    if (DIAG_DIR / extra).is_file():
+                        z.write(DIAG_DIR / extra, f"sessions/{extra}")
+            engine_logs = sorted((BUILD_DIR / "logs").glob("simpsons_*.log"),
+                                 key=lambda p: p.stat().st_mtime, reverse=True)[:2]
+            for elog in engine_logs:
+                z.writestr(f"engine-logs/{elog.name}",
+                           "\n".join(_tail_file(elog, 1000, 1 << 20)) + "\n")
+            for f in (GAME_TOML, CONFIG_JSON, LAUNCHER_DIR / "last_exit.txt",
+                      LAUNCHER_DIR / "last_run_debug.txt",
+                      LAUNCHER_DIR / "launcher_native_error.log"):
+                if f.is_file():
+                    z.write(f, f.name)
+        return True, str(path)
+    except Exception as e:  # noqa: BLE001
+        return False, f"bundle failed: {e}"
+
+
 # ----------------------------------------------------------------- launch
 
 def repair_saves():
@@ -837,11 +1258,12 @@ def auto_backup_saves():
         pass
 
 
-def _watch_game_exit(proc):
+def _watch_game_exit(proc, diag=None):
     """Record how the game ended; a GPU hang / kill mid-load can leave a corrupt
     shader cache behind, which then hangs the GPU on every later load. Purge the
     cache automatically after any abnormal exit."""
     code = proc.wait()
+    notes = []
     try:
         (LAUNCHER_DIR / "last_exit.txt").write_text(str(code))
         if code != 0:
@@ -851,8 +1273,14 @@ def _watch_game_exit(proc):
                 shutil.copytree(good, USER_DATA / "cache")
                 install_state["log"].append(
                     f"Game exited abnormally (code {code}) - known-good shader cache restored.")
+                notes.append("known-good shader cache restored after the abnormal exit")
     except Exception:
         pass
+    if diag:
+        try:
+            diag.finalize(code, notes)
+        except Exception:
+            pass
 
 
 def launch_game():
@@ -865,11 +1293,13 @@ def launch_game():
             install_state["log"].append("Save self-heal: " + ", ".join(repaired))
         auto_backup_saves()
         env = os.environ.copy()
+        env_notes = []
         # Lossless Scaling frame-gen (lsfg-vk) hooks Vulkan via a RenderDoc-style
         # capture layer that deadlocks this game's FSI render path (GPU hang,
         # "device lost" on level load -- the 2026-07-05 crash saga). Hard-disable
         # it for the game regardless of the user's global LS settings.
         env["DISABLE_LSFG"] = "1"
+        env_notes.append("DISABLE_LSFG=1 (Lossless Scaling frame-gen disabled for stability)")
         if patch_instant_popin_state() == "on":
             # capture a driver dump if the GPU ever hangs (black-box recorder)
             env["RADV_DEBUG"] = "hang"
@@ -883,13 +1313,17 @@ def launch_game():
             if icd.exists() and (gl_lib / "libvulkan_radeon.so").exists():
                 env["VK_DRIVER_FILES"] = str(icd)
                 env["LD_LIBRARY_PATH"] = env.get("LD_LIBRARY_PATH", "") + ":" + str(gl_lib)
+                env_notes.append("instant pop-in patch active: RADV_DEBUG=hang + newer Mesa driver")
         # Experiments survive stale launcher backends: extra env is read from
         # launcher-env.json at every PLAY press, not baked into this process.
         env_file = LAUNCHER_DIR / "launcher-env.json"
         if env_file.exists():
             try:
-                for k, v in json.loads(env_file.read_text()).items():
+                overrides = json.loads(env_file.read_text())
+                for k, v in overrides.items():
                     env[str(k)] = str(v)
+                if overrides:
+                    env_notes.append("launcher-env.json overrides: " + ", ".join(map(str, overrides)))
             except Exception:
                 pass
         libs = [str(_resolve(d)) for d in CONFIG["lib_dirs"].get(PLAT, [])]
@@ -901,10 +1335,23 @@ def launch_game():
         if debug_gdb.exists() and shutil.which("gdb"):
             # temporary diagnostics mode: capture a backtrace if the game crashes
             cmd = ["gdb", "-batch", "-x", str(debug_gdb), "--args"] + cmd
-        out = open(crash_log, "w") if debug_gdb.exists() else subprocess.DEVNULL
+        diag = DiagSession() if diagnostics_enabled() else None
+        if diag:
+            diag.write_header(cmd, env_notes)
+        if debug_gdb.exists():
+            out = open(crash_log, "w")
+            if diag:
+                with open(diag.log_path, "a", encoding="utf-8") as f:
+                    f.write("(gdb diagnostics mode: game output captured in last_run_debug.txt)\n")
+        elif diag:
+            out = diag.game_output_handle()
+        else:
+            out = subprocess.DEVNULL
         game_proc = subprocess.Popen(cmd, cwd=str(BUILD_DIR), env=env,
                                      stdout=out, stderr=subprocess.STDOUT
-                                     if debug_gdb.exists() else subprocess.DEVNULL)
+                                     if out is not subprocess.DEVNULL else subprocess.DEVNULL)
+        if out is not subprocess.DEVNULL:
+            out.close()  # the child holds its own duplicate of the fd
         # HAND PATCH: level-load memory spikes were getting the game SIGKILLed
         # by systemd-oomd. This used to be handled by wrapping the launch in
         # `systemd-run --user --scope`, which hands the process off into a
@@ -919,7 +1366,9 @@ def launch_game():
             (Path(f"/proc/{game_proc.pid}/oom_score_adj")).write_text("-1000")
         except OSError:
             pass
-        threading.Thread(target=_watch_game_exit, args=(game_proc,), daemon=True).start()
+        if diag:
+            threading.Thread(target=diag.monitor, args=(game_proc,), daemon=True).start()
+        threading.Thread(target=_watch_game_exit, args=(game_proc, diag), daemon=True).start()
         return True, "launched"
 
 
@@ -989,6 +1438,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                                     "restart_needed": [k for k, v in SETTINGS_SCHEMA.items() if v[2]]})
         if path == "/api/log":
             return self._send(200, {"lines": tail_game_log()})
+        if path == "/api/diagnostics":
+            return self._send(200, diagnostics_report())
         if path == "/api/browse":
             q = urllib.parse.parse_qs(parsed.query)
             return self._send(200, browse((q.get("path") or [""])[0]))
@@ -1044,6 +1495,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 ok, msg = patch_instant_popin(bool(body.get("enable")))
                 return self._send(200, {"ok": ok, "msg": msg})
             return self._send(404, {"ok": False, "msg": "unknown patch"})
+        if path == "/api/diagnostics":
+            return self._send(200, {"ok": True,
+                                    "enabled": set_diagnostics(body.get("enable"))})
+        if path == "/api/support-bundle":
+            ok, msg = create_support_bundle()
+            return self._send(200, {"ok": ok, "msg": msg})
         if path == "/api/check-updates":
             threading.Thread(target=check_updates, daemon=True).start()
             return self._send(200, {"ok": True})

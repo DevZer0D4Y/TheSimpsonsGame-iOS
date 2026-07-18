@@ -189,6 +189,7 @@
     <button data-tab="settings">⚙ Settings</button>
     <button data-tab="patches">🩹 Patches</button>
     <button data-tab="mods">🧩 Mods</button>
+    <button data-tab="support">🩺 Support</button>
     <button data-tab="about">ℹ About</button>
   </nav>
 
@@ -412,6 +413,44 @@
     </div>
   </section>
 
+  <!-- ============================ SUPPORT =========================== -->
+  <section id="tab-support" class="hidden">
+    <div class="callout info">
+      <span class="em">🩺</span>
+      <div>Game crashing, showing a <b>black screen</b>, or stuttering? Turn on diagnostic
+      logging below, play until the problem happens, then create a <b>support bundle</b> and
+      attach it to a GitHub issue. Everything stays on your machine until you decide to
+      share it.</div>
+    </div>
+    <div class="card">
+      <h2>DIAGNOSTIC LOGGING</h2>
+      <label class="switch"><input type="checkbox" id="diagtoggle">
+        Log my game sessions (crashes, black screens &amp; performance)</label>
+      <p class="muted" id="diagstate" style="margin-top:10px"></p>
+    </div>
+    <div class="card">
+      <h2>LAST GAME SESSION</h2>
+      <div id="diagsummary" class="muted">No diagnostic sessions recorded yet —
+        enable logging above, then press PLAY.</div>
+    </div>
+    <div class="card">
+      <h2>SESSION LOG</h2>
+      <div class="console" id="diaglog" style="height:260px">–</div>
+      <p class="muted" id="diagdir" style="margin-top:8px"></p>
+    </div>
+    <div class="card">
+      <h2>SUPPORT BUNDLE</h2>
+      <p class="muted">Packs your recent session logs, performance samples, system info and
+        settings into a single zip you can attach to a
+        <a href="#" target="_blank" rel="noopener" id="issueslink">GitHub issue</a>.
+        It contains no save data and no game content, and nothing is uploaded automatically.</p>
+      <div class="row" style="margin-top:12px">
+        <button class="bigbtn gold" id="bundlebtn">📦 Create support bundle</button>
+        <span class="muted" id="bundlemsg"></span>
+      </div>
+    </div>
+  </section>
+
   <!-- ============================= ABOUT ============================ -->
   <section id="tab-about" class="hidden">
     <div class="card" id="updatecard">
@@ -575,6 +614,7 @@ document.querySelectorAll("nav button").forEach(b => b.onclick = () => {
   b.classList.add("active");
   document.querySelectorAll("section").forEach(s => s.classList.add("hidden"));
   $("#tab-" + b.dataset.tab).classList.remove("hidden");
+  if (b.dataset.tab === "support") refreshDiag();
 });
 
 /* hero art rotation */
@@ -616,6 +656,7 @@ async function refresh(){
     }
     if (st.github_repo) {
       $("#aboutgithub").innerHTML = `Source code: <a href="https://github.com/${st.github_repo}" target="_blank" rel="noopener">github.com/${st.github_repo}</a>`;
+      $("#issueslink").href = `https://github.com/${st.github_repo}/issues`;
     }
     /* install progress */
     const inst = st.install;
@@ -745,6 +786,49 @@ async function togglePatch(id, enable){
   }
   refresh();
 }
+
+/* diagnostics / support */
+async function refreshDiag(){
+  if ($("#tab-support").classList.contains("hidden")) return;
+  const d = await api.get("/api/diagnostics").catch(()=>null);
+  if (!d) return;
+  $("#diagtoggle").checked = d.enabled;
+  $("#diagstate").innerHTML = d.enabled
+    ? 'Diagnostic logging is <b class="ok">ON</b> — every PLAY session records the game\'s ' +
+      'output plus CPU, RAM and GPU samples every 2 seconds. The overhead is negligible, ' +
+      'so it\'s fine to leave on.'
+    : 'Diagnostic logging is <b>OFF</b> — flip it on if the game crashes, black-screens or ' +
+      'runs badly, then play until the problem happens again.';
+  const s = d.last_summary;
+  if (s){
+    const rows = [
+      ["When", s.ended || ""],
+      ["Result", s.exit_desc || ""],
+      ["Duration", (s.duration_s ?? "?") + " s"],
+      s.peak_rss_mb ? ["Peak game RAM", s.peak_rss_mb + " MB"] : null,
+      s.avg_cpu_percent != null ? ["Average CPU", s.avg_cpu_percent + "%"] : null,
+      s.max_gpu_percent != null ? ["Peak GPU busy", s.max_gpu_percent + "%"] : null,
+    ].filter(Boolean);
+    const okExit = s.exit_code === 0;
+    $("#diagsummary").innerHTML =
+      "<table>" + rows.map(r => `<tr><th style="width:170px">${r[0]}</th><td>${r[1]}</td></tr>`).join("") + "</table>" +
+      `<div class="callout ${okExit ? "info" : "warn"}" style="margin:12px 0 0">` +
+      `<span class="em">${okExit ? "✅" : "⚠"}</span><div>${s.diagnosis || ""}</div></div>`;
+  }
+  $("#diaglog").textContent = (d.tail && d.tail.length) ? d.tail.join("\n") : "–";
+  $("#diaglog").scrollTop = 1e9;
+  if (d.dir) $("#diagdir").textContent = "Logs are saved to " + d.dir;
+}
+setInterval(refreshDiag, 3000); refreshDiag();
+$("#diagtoggle").onchange = async e => {
+  await api.post("/api/diagnostics", {enable: e.target.checked}).catch(()=>null);
+  refreshDiag();
+};
+$("#bundlebtn").onclick = async () => {
+  $("#bundlemsg").textContent = "packing…";
+  const r = await api.post("/api/support-bundle").catch(()=>({ok:false, msg:"request failed"}));
+  $("#bundlemsg").textContent = r.ok ? "✔ saved: " + r.msg : "✘ " + (r.msg || "failed");
+};
 
 /* updates */
 $("#updatebtn").onclick = async () => {
