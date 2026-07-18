@@ -24,13 +24,18 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
 import zlib
 from pathlib import Path
 
-VERSION = "0.0.4"
+# Dev-tree fallback only: release.yml stamps the real release tag over this
+# at build time, so packaged builds always know exactly which release they
+# are (otherwise every launcher shipped inside vX.Y.Z.W would compare itself
+# against its own release and nag "update available" forever).
+VERSION = "0.0.4.1"
 
 FROZEN = getattr(sys, "frozen", False)
 if FROZEN:
@@ -621,32 +626,40 @@ def check_updates():
                             msg="No GitHub repository configured.")
         return
     try:
-        # NOT /releases/latest: that endpoint explicitly excludes drafts AND
-        # prereleases, and this project's releases are published as
-        # prereleases (accurate for early builds) via release.yml. List all
-        # releases newest-first and take the first non-draft instead.
+        # /releases/latest is exactly what we want: the release GitHub marks
+        # "latest" — published, non-draft, non-prerelease. release.yml always
+        # publishes with make_latest on and prerelease off, so this is always
+        # the build players should be offered. (Historic note: this used to
+        # walk the full /releases list because early releases were published
+        # as prereleases, which /releases/latest excludes.)
         req = urllib.request.Request(
-            f"https://api.github.com/repos/{repo}/releases",
+            f"https://api.github.com/repos/{repo}/releases/latest",
             headers={"User-Agent": f"simpsons-launcher/{VERSION}"})
-        with urllib.request.urlopen(req, timeout=8) as r:
-            releases = json.loads(r.read())
-        data = next((rel for rel in releases if not rel.get("draft")), None)
-        if not data:
-            update_state.update(checked=True, update_available=False, download_url=None,
-                                msg="No published releases yet.")
-            return
+        try:
+            with urllib.request.urlopen(req, timeout=8) as r:
+                data = json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                update_state.update(checked=True, update_available=False, download_url=None,
+                                    msg="No published releases yet.")
+                return
+            raise
         tag = data.get("tag_name", "")
         asset_name = _platform_asset_name()
         asset = next((a for a in data.get("assets", []) if a.get("name") == asset_name), None)
 
         def _ver_tuple(s):
             # "v0.3.1" / "0.3.1" -> (0, 3, 1); malformed parts count as 0 so a
-            # weird tag can never brick the comparison.
+            # weird tag can never brick the comparison. Trailing zeros are
+            # stripped so hotfix-style tags of different lengths compare
+            # sanely: v0.0.4.0 == 0.0.4, while v0.0.4.1 > 0.0.4.
             parts = []
             for p in s.lstrip("vV").split("."):
                 digits = "".join(ch for ch in p if ch.isdigit())
                 parts.append(int(digits) if digits else 0)
-            return tuple(parts + [0] * (3 - len(parts)))
+            while parts and parts[-1] == 0:
+                parts.pop()
+            return tuple(parts)
 
         # Strictly newer only: a mismatched-but-older tag must never nag
         # every user with a bogus "update available".

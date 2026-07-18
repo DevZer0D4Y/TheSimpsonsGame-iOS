@@ -67,6 +67,24 @@ jobs:
             -DCMAKE_C_COMPILER=clang "-DCMAKE_C_FLAGS=-DWIN32 -Wno-deprecated-declarations"
           cmake --build tools/extract-xiso/build
 
+      - name: Stamp launcher version from release tag
+        shell: pwsh
+        run: |
+          # The packaged launcher must know exactly which release it is,
+          # otherwise its update checker compares a stale hardcoded VERSION
+          # against this very release and nags "update available" forever.
+          $v = "${{ inputs.tag }}".TrimStart("vV")
+          $py = "launcher/launcher.py"
+          $src = Get-Content $py -Raw
+          # No trailing $ anchor: .NET's (?m)$ matches before \n but not
+          # before \r\n, and Windows checkouts are usually CRLF.
+          $stamped = $src -replace '(?m)^VERSION = ".*"', "VERSION = `"$v`""
+          Set-Content $py -Value $stamped -Encoding utf8 -NoNewline
+          if (-not (Select-String -Path $py -Pattern "^VERSION = `"$([regex]::Escape($v))`"$" -Quiet)) {
+            Write-Error "Failed to stamp VERSION = `"$v`" into $py"
+            exit 1
+          }
+
       - name: Build launcher .exe (native window)
         shell: pwsh
         run: |
@@ -165,6 +183,18 @@ jobs:
           cmake -S tools/extract-xiso -B tools/extract-xiso/build -G Ninja -DCMAKE_C_COMPILER=clang-20
           cmake --build tools/extract-xiso/build
 
+      - name: Stamp launcher version from release tag
+        run: |
+          # Same reason as the Windows job: the shipped launcher must report
+          # this release's own version or it will offer itself as an update.
+          v="${{ inputs.tag }}"
+          v="${v#v}"; v="${v#V}"
+          sed -i "s/^VERSION = \".*\"/VERSION = \"$v\"/" launcher/launcher.py
+          grep -q "^VERSION = \"$v\"" launcher/launcher.py || {
+            echo "Failed to stamp VERSION = \"$v\" into launcher/launcher.py"
+            exit 1
+          }
+
       - name: Package
         run: |
           bd="simpsons/out/build/linux-amd64-relwithdebinfo"
@@ -223,7 +253,7 @@ jobs:
 
   # ---------------------------------------------------------------- Release
   release:
-    name: Draft GitHub release
+    name: GitHub release (latest, non-prerelease)
     needs: [windows, linux]
     runs-on: ubuntu-latest
     steps:
@@ -231,13 +261,17 @@ jobs:
         with:
           path: artifacts
 
-      - name: Create draft release
+      # Always a full release marked "latest" on publish — never a prerelease.
+      # The launcher's update checker uses /releases/latest, which ignores
+      # prereleases entirely, so a prerelease would be invisible to players.
+      - name: Create release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ inputs.tag }}
           name: The Simpsons Game — Recompiled ${{ inputs.tag }}
           draft: ${{ inputs.draft }}
-          prerelease: true
+          prerelease: false
+          make_latest: true
           fail_on_unmatched_files: true
           files: artifacts/**/*
           body: |
