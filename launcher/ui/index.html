@@ -508,6 +508,22 @@
   </section>
 </div>
 
+<!-- update prompt modal (shown automatically at startup when a newer
+     release is found; the About tab keeps the manual path) -->
+<div class="modal hidden" id="updatemodal">
+  <div class="box" style="width:520px">
+    <div class="head"><b>🍩 Update available</b>
+      <button class="smallbtn" id="updatelater">✕ Later</button></div>
+    <div style="padding:20px">
+      <p class="muted" id="updatemodaltext" style="margin-bottom:16px"></p>
+      <div class="row">
+        <button class="bigbtn gold" id="updatenowbtn">⬇ Update now</button>
+        <span class="muted" id="updatemodalprogress"></span>
+      </div>
+    </div>
+  </div>
+</div>
+
 <!-- file browser modal -->
 <div class="modal hidden" id="browsemodal">
   <div class="box">
@@ -653,6 +669,7 @@ async function refresh(){
       $("#applyupdatebtn").classList.toggle("hidden", !st.update.update_available);
       $("#applyupdatebtn").disabled = !!st.update.applying;
       $("#updatebtn").disabled = !!st.update.applying;
+      maybePromptUpdate(st.update, st.version);
     }
     if (st.github_repo) {
       $("#aboutgithub").innerHTML = `Source code: <a href="https://github.com/${st.github_repo}" target="_blank" rel="noopener">github.com/${st.github_repo}</a>`;
@@ -733,7 +750,9 @@ function closeBrowse(){ $("#browsemodal").classList.add("hidden"); }
 $("#browsebtn").onclick = () => { $("#browsemodal").classList.remove("hidden"); loadBrowse("").catch(closeBrowse); };
 $("#browseclose").addEventListener("click", closeBrowse);
 $("#browsemodal").addEventListener("click", e => { if (e.target === $("#browsemodal")) closeBrowse(); });
-document.addEventListener("keydown", e => { if (e.key === "Escape") closeBrowse(); });
+document.addEventListener("keydown", e => {
+  if (e.key === "Escape"){ closeBrowse(); $("#updatemodal").classList.add("hidden"); }
+});
 async function loadBrowse(path){
   const d = await api.get("/api/browse?path=" + encodeURIComponent(path));
   $("#browsepath").textContent = d.path || "Choose a starting location";
@@ -828,6 +847,47 @@ $("#bundlebtn").onclick = async () => {
   $("#bundlemsg").textContent = "packing…";
   const r = await api.post("/api/support-bundle").catch(()=>({ok:false, msg:"request failed"}));
   $("#bundlemsg").textContent = r.ok ? "✔ saved: " + r.msg : "✘ " + (r.msg || "failed");
+};
+
+/* automatic update prompt: the backend checks GitHub in the background at
+   every launcher start; the first status poll that reports a newer release
+   pops this dialog once per run. "Later" just closes it — the About tab
+   keeps the manual path, and the prompt returns on the next launch. */
+let updatePromptShown = false;
+function maybePromptUpdate(u, currentVersion){
+  const modal = $("#updatemodal");
+  if (!modal.classList.contains("hidden")){
+    /* dialog is open — mirror live progress while the update applies */
+    if (u.applying){
+      $("#updatenowbtn").disabled = true;
+      $("#updatemodalprogress").textContent = u.apply_msg || "Updating…";
+    } else if (u.apply_msg && !u.update_available){
+      $("#updatenowbtn").disabled = true;
+      $("#updatemodalprogress").textContent = u.apply_msg;
+    }
+    return;
+  }
+  if (u.update_available && !u.applying && !updatePromptShown){
+    updatePromptShown = true;
+    $("#updatemodaltext").innerHTML =
+      `A new version of the launcher &amp; game engine is out: <b>${u.latest_tag}</b> ` +
+      `(you're on <b>v${currentVersion}</b>).<br><br>Updating takes a minute and doesn't ` +
+      `touch your saves, settings or installed game data. Update now?`;
+    $("#updatenowbtn").disabled = false;
+    $("#updatemodalprogress").textContent = "";
+    modal.classList.remove("hidden");
+  }
+}
+$("#updatelater").onclick = () => $("#updatemodal").classList.add("hidden");
+$("#updatemodal").addEventListener("click", e => {
+  if (e.target === $("#updatemodal")) $("#updatemodal").classList.add("hidden");
+});
+$("#updatenowbtn").onclick = async () => {
+  $("#updatenowbtn").disabled = true;
+  $("#updatemodalprogress").textContent = "starting update…";
+  await api.post("/api/apply-update").catch(() => {
+    $("#updatemodalprogress").textContent = "update request failed — try the About tab";
+  });
 };
 
 /* updates */
