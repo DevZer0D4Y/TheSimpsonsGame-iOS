@@ -285,6 +285,12 @@ This project's own original code (launcher, hand-written engine patches, build t
 licensed under the [GNU GPLv3](LICENSE). Vendored/bundled third-party components keep their own
 original licenses — see [Credits](#credits) below and `tools/rexglue-sdk/thirdparty/`.
 
+**A note on AI assistance:** parts of this project — research into the game's internals, build
+tooling, and bug fixes — have been developed with the assistance of Claude AI, in the interest of
+getting a working release out and turning around fixes as quickly as possible for a solo,
+fan-made effort. Treat it as a fast-moving hobby project rather than a polished commercial
+release.
+
 ## Credits
 
 - Built on a [XenonRecomp](https://github.com/hedge-dev/XenonRecomp)-style static
