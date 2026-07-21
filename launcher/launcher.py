@@ -65,6 +65,10 @@ DEFAULT_CONFIG = {
         "Linux": "simpsons/out/build/linux-amd64-relwithdebinfo/simpsons",
         "Windows": "simpsons/out/build/win-amd64-relwithdebinfo/simpsons.exe",
     },
+    "extract_xiso": {
+        "Linux": "tools/extract-xiso/build/extract-xiso",
+        "Windows": "tools/extract-xiso/build/extract-xiso.exe",
+    },
     "lib_dirs": {
         "Linux": ["tools/rexglue-bin/linux-amd64/lib",
                   "/home/.steamos/offload/nix/store/ah4525ca553drv47jhvgpl9sl87i7a1d-libxml2-2.13.8/lib"],
@@ -112,9 +116,7 @@ if FROZEN:
     EXTRACT_XISO = ROOT / ("extract-xiso.exe" if PLAT == "Windows" else "extract-xiso")
 else:
     GAME_BIN = _resolve(CONFIG["engine"].get(PLAT, CONFIG["engine"]["Linux"]))
-    EXTRACT_XISO = ROOT / "tools/extract-xiso/build/extract-xiso"
-    if PLAT == "Windows":
-        EXTRACT_XISO = EXTRACT_XISO.with_suffix(".exe")
+    EXTRACT_XISO = _resolve(CONFIG["extract_xiso"].get(PLAT, CONFIG["extract_xiso"]["Linux"]))
 BUILD_DIR = GAME_BIN.parent
 GAME_TOML = BUILD_DIR / "simpsons.toml"
 GAMEDATA = ROOT / "gamedata"

@@ -214,11 +214,12 @@ jobs:
           printf '# The Simpsons Game - runtime configuration (edit these via the launcher)\ngpu_allow_invalid_fetch_constants = false\ngpu_shader_max_cf_iterations = 0\n' > release/simpsons.toml
 
           # launcher.py's DEFAULT_CONFIG assumes the nested dev-tree layout
-          # (simpsons/out/build/.../simpsons). This package is flat instead
-          # (simpsons sits right next to launcher/), so ship a launcher.json
-          # override describing the real layout -- otherwise the bundled
-          # launcher can't find the engine it's sitting right next to.
-          printf '{"engine": {"Linux": "simpsons"}, "lib_dirs": {"Linux": ["."]}}\n' > release/launcher/launcher.json
+          # (simpsons/out/build/.../simpsons, tools/extract-xiso/build/...).
+          # This package is flat instead (simpsons and extract-xiso sit right
+          # next to launcher/), so ship a launcher.json override describing
+          # the real layout -- otherwise the bundled launcher can't find the
+          # engine or the ISO extractor it's sitting right next to.
+          printf '{"engine": {"Linux": "simpsons"}, "extract_xiso": {"Linux": "extract-xiso"}, "lib_dirs": {"Linux": ["."]}}\n' > release/launcher/launcher.json
 
           # One obvious double-clickable/runnable entry point at the top of
           # the download, so a player never has to know the internal layout.
