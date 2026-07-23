@@ -331,6 +331,37 @@ struct MemExportRange {
 void AddMemExportRanges(const RegisterFile& regs, const Shader& shader,
                         std::vector<MemExportRange>& ranges_out);
 
+// HAND PATCH: shared verdict on a draw whose vertex shader statically touches
+// fetch constants of the "invalid" type (this game marks streamed / absent
+// vertex streams that way). Both backends and the pipeline cache pre-check
+// need the exact same classification, so it lives here instead of being
+// duplicated per backend (the duplicated copies had already drifted apart
+// once, which is how admitted character draws ended up rasterization-muted).
+enum class InvalidVertexFetchVerdict : uint32_t {
+  // No used fetch slot has the invalid type - completely ordinary draw.
+  kNone,
+  // Every invalid slot is an all-zero OPTIONAL stream (stride-0 secondary
+  // binding, e.g. this game's absent blend-shape streams). The shader
+  // provably never reads those slots (dynamic branch around them, and the
+  // translator zero-clamps size-0 fetches), so the draw is safe to rasterize
+  // like any valid one. Gated by gpu_allow_null_optional_streams.
+  kRasterize,
+  // At least one invalid slot carries a plausible stale address/size - a
+  // RenderWare streaming "priming" draw. Its vertex shading + memexport must
+  // run so the CPU readback can finalize the entity, but its rasterized
+  // output is garbage (and has wedged the Van Gogh scan converter), so the
+  // caller must run it with rasterization fully disabled. Gated by
+  // gpu_allow_invalid_fetch_constants.
+  kPrimeWithoutRasterization,
+  // A null MAIN stream (entity genuinely mid-stream: all-zero vertex data
+  // collapses skinned positions into scan-converter poison), garbage
+  // constants, or the gating cvar for the shape found is off. Drop the draw.
+  kVeto,
+};
+
+InvalidVertexFetchVerdict ClassifyInvalidVertexFetch(const RegisterFile& regs,
+                                                     const Shader& vertex_shader);
+
 // To avoid passing values that the shader won't understand (even though
 // Direct3D 9 shouldn't pass them anyway).
 xenos::CopySampleSelect SanitizeCopySampleSelect(xenos::CopySampleSelect copy_sample_select,

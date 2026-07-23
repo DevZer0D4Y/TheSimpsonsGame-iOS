@@ -55,35 +55,36 @@ the launcher (Settings → Input).
 
 ## Known issues
 
-- **"Instant character pop-in" patch is dangerous on Steam Deck's GPU.** Characters/props
-  normally pop in a few seconds after a level loads (the game's own disc data marks their
-  streaming meshes as temporarily "invalid," which the engine correctly declines to draw until
-  they're ready — this is the accepted default behavior). There's a known community fix
-  (`gpu_allow_invalid_fetch_constants`) that makes them appear instantly instead, exposed in the
-  launcher's Patches tab — but on Steam Deck's AMD APU it crashes on *any* level load, on
-  **both** Linux/Vulkan (RADV) *and* Windows/D3D12: on Windows it triggers a kernel **BSOD**
-  (`PAGE_FAULT_IN_NONPAGED_AREA`, bugcheck `0x50`) in the AMD driver. The same crash on two
-  independent, completely unrelated driver stacks (and the D3D12 code path here is entirely
-  unmodified, stock Xenia logic) points at the Van Gogh APU itself, not a driver or engine bug.
-  It's reported to work on most other/desktop GPUs. **Leave it off on Steam Deck** unless you're
-  specifically testing it.
-  **Workaround if you hit pop-in with the patch off (the normal/default case):** do this once,
-  in **Level 1**, at the start of your play session — it then stays fixed for every level you
-  play afterward, not just Level 1:
-  1. Start Level 1 and jump across the two jump pads near the beginning. They'll render
-     invisible (that's the pop-in), but they still work — jump across anyway.
-  2. Don't climb up onto the first ledge just past them.
-  3. Rotate the camera into the wall and hold it there until it snaps back to center on its
-     own — let it reset itself, don't rotate it back yourself.
-  4. Leave the level (if you've already completed it, just exit back out).
-  Pop-in is then fixed for the rest of that session, across every level — the same effect as a
-  full level reload but instant.
+- **Missing characters ("eternal pop-in") — largely fixed by default.** The game marks the
+  vertex streams of streamed meshes "invalid" while they load, and additionally leaves the
+  *optional* blend-shape streams of many finished character meshes permanently marked invalid.
+  The engine used to throw away any draw touching an invalid stream, which is why characters
+  could stay invisible indefinitely. It now tells the two cases apart: meshes whose only
+  "invalid" streams are those absent optional ones (which their shaders provably never read)
+  are drawn normally, by default, on every platform (`gpu_allow_null_optional_streams`).
+  Entities genuinely mid-stream still appear a moment later — that's real loading. If you still
+  see long-lasting invisible characters, grab the log and open an issue; the old Level-1
+  camera-into-wall workaround should no longer be necessary.
+- **"Instant character pop-in" patch is dangerous on Steam Deck's GPU.** On top of the default
+  fix above, the community's full fix (`gpu_allow_invalid_fetch_constants`, launcher Patches
+  tab) also runs the game's stale-descriptor streaming "priming" draws — but on Steam Deck's
+  AMD APU it has crashed on level loads, on **both** Linux/Vulkan (RADV) *and* Windows/D3D12:
+  on Windows it triggers a kernel **BSOD** (`PAGE_FAULT_IN_NONPAGED_AREA`, bugcheck `0x50`) in
+  the AMD driver. The same crash on two independent driver stacks points at the Van Gogh APU
+  itself. Those priming draws now run with rasterization disabled entirely (they only exist to
+  feed the game's vertex-readback streaming), which is expected to remove the crash trigger,
+  but this hasn't been re-verified on Deck hardware yet. **Leave it off on Steam Deck** unless
+  you're specifically testing it.
 - Boot logo videos (EA/Fox/Gracie Films) may show green flicker — a bug in the *game's own*
   guest-side video decoder, not something introduced by this port. (THIS SHOULD BE FIXED)
 - In-game audio can sound crunchy under load.
 - Main menu UI flicker was traced to the Vulkan presenter defaulting to tearing-permitted
   ("immediate") presentation; it now prefers a tear-free present mode (mailbox) when the driver
-  supports it, same latency characteristics either way. Report back if you still see it.
+  supports it, same latency characteristics either way. On drivers that don't offer mailbox,
+  the launcher's VSync setting (on by default) now also rules out the tearing-permitted
+  fallback modes, so presentation lands on classic vsync instead of silently tearing. The
+  engine log's "Created … swapchain" line now names the mode in plain words if you want to
+  check what your driver picked. Report back if you still see flicker with VSync on.
 - The framerate setting (Settings → Framerate) applies the same guest instruction patch as the
   community's own 60 FPS unlock for this game (verified against the `xenia-canary/game-patches`
   entry for this title) on top of reporting a higher display refresh rate — both were required;
@@ -114,6 +115,17 @@ own, and the current renderer always remains as a working fallback.
 
 ### ✅ Recently shipped
 
+- **Missing characters drawn by default**: finished character meshes whose absent optional
+  blend-shape streams are permanently marked "invalid" on disc are no longer thrown away —
+  they draw normally out of the box, without the crash-prone experimental pop-in patch (see
+  Known issues).
+- **Guaranteed tear-free presentation**: with VSync on, the presenter can no longer silently
+  fall back to a tearing-permitted mode on drivers without mailbox support.
+- **GPU thread no longer burns a core while idle**: the command processor used to spin-yield
+  aggressively whenever the ring drained, competing with the recompiled game code for CPU; it
+  now naps on its wake event (microsecond wake-up) after a short spin. Guest-side GPU waits
+  also poll finer-grained (500 µs instead of up to several ms), and the CPU-ahead-of-GPU stall
+  waits on a single fence instead of every in-flight one.
 - **Real 60 FPS**: the game hardcoded "wait 2 screen refreshes between frames" (a 30 FPS lock)
   independent of any settings — found and patched at the instruction level, matching the
   community's verified 60 FPS patch for this title. The Framerate setting now actually works.

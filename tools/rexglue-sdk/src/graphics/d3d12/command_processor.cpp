@@ -2317,6 +2317,16 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     return false;
   }
   pipeline_cache_->AnalyzeShaderUcode(*vertex_shader);
+  // HAND PATCH: settle the invalid-fetch-constant verdict once, up front
+  // (shared with the Vulkan backend - see draw_util::ClassifyInvalidVertexFetch
+  // for the taxonomy). kVeto draws are dropped here; kRasterize draws (absent
+  // optional streams only) render like any valid draw; priming draws (stale
+  // streaming addresses) run muted below.
+  draw_util::InvalidVertexFetchVerdict invalid_vfetch_verdict =
+      draw_util::ClassifyInvalidVertexFetch(regs, *vertex_shader);
+  if (invalid_vfetch_verdict == draw_util::InvalidVertexFetchVerdict::kVeto) {
+    return false;
+  }
   bool memexport_used_vertex = vertex_shader->memexport_eM_written() != 0;
 
   // Pixel shader analysis.
@@ -2500,11 +2510,14 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   // Must not call anything that can change the descriptor heap from now on!
 
   // Ensure vertex buffers are resident.
-  // HAND PATCH (Windows/D3D12 port of the Vulkan priming-draw fix): draws
-  // admitted with invalid-type vertex fetch constants finalize streamed
+  // HAND PATCH (shared with Vulkan, see draw_util::ClassifyInvalidVertexFetch):
+  // priming draws (plausible stale streaming addresses) finalize streamed
   // characters via the vertex shader's memexport; they must run, but their
-  // rasterized output is degenerate, so a priming draw is muted below.
-  bool priming_draw = false;
+  // rasterized output is degenerate, so they are muted below. Draws whose
+  // only invalid slots are absent optional streams rasterize normally --
+  // muting those made finished characters invisible.
+  bool priming_draw =
+      invalid_vfetch_verdict == draw_util::InvalidVertexFetchVerdict::kPrimeWithoutRasterization;
   const Shader::ConstantRegisterMap& constant_map_vertex = vertex_shader->constant_register_map();
   for (uint32_t i = 0; i < rex::countof(constant_map_vertex.vertex_fetch_bitmap); ++i) {
     uint32_t vfetch_bits_remaining = constant_map_vertex.vertex_fetch_bitmap[i];
@@ -2517,53 +2530,9 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
         continue;
       }
       xenos::xe_gpu_vertex_fetch_t vfetch_constant = regs.GetVertexFetch(vfetch_index);
-      switch (vfetch_constant.type) {
-        case xenos::FetchConstantType::kVertex:
-          break;
-        case xenos::FetchConstantType::kInvalidVertex: {
-          // HAND PATCH: port of the Vulkan null-stream stride gate. The game
-          // marks streamed meshes' vertex fetch constants "invalid" while they
-          // stream in. Admit two safe shapes when gpu_allow_invalid_fetch_constants
-          // is set: (a) plausible address/size (streamed meshes; real Xenos drew
-          // them), and (b) ALL-ZERO constants on OPTIONAL (secondary, stride 0)
-          // streams -- the game's absent blend-shape streams, which the shader
-          // dynamically branches around. A null MAIN stream (stride > 0) means the
-          // entity is still streaming: all-zero data collapses skinned positions
-          // to (0,0,0,0), whose perspective divide yields NaN screen coords that
-          // wedge the Van Gogh pixel pipeline -- keep vetoing those.
-          bool plausible = vfetch_constant.address != 0 &&
-                           vfetch_constant.size != 0 &&
-                           (uint64_t(vfetch_constant.size) << 2) <= (64u << 20);
-          bool null_stream =
-              vfetch_constant.address == 0 && vfetch_constant.size == 0;
-          if (null_stream) {
-            for (const Shader::VertexBinding& vfetch_binding :
-                 vertex_shader->vertex_bindings()) {
-              if (vfetch_binding.fetch_constant == vfetch_index) {
-                if (vfetch_binding.stride_words != 0) {
-                  null_stream = false;  // null MAIN stream -> veto this draw
-                }
-                break;
-              }
-            }
-          }
-          if (REXCVAR_GET(gpu_allow_invalid_fetch_constants) &&
-              (plausible || null_stream)) {
-            priming_draw = true;
-            break;
-          }
-          REXGPU_WARN(
-              "Vertex fetch constant {} ({:08X} {:08X}) has \"invalid\" type! "
-              "This is incorrect behavior, but you can try bypassing this by "
-              "launching Xenia with --gpu_allow_invalid_fetch_constants=true.",
-              vfetch_index, vfetch_constant.dword_0, vfetch_constant.dword_1);
-          return false;
-        }
-        default:
-          REXGPU_WARN("Vertex fetch constant {} ({:08X} {:08X}) is completely invalid!",
-                      vfetch_index, vfetch_constant.dword_0, vfetch_constant.dword_1);
-          return false;
-      }
+      // Invalid-type slots already passed classification above (a kVeto draw
+      // never reaches this loop), so both valid and admitted-invalid slots
+      // just need their buffer ranges resident.
       VertexBufferState& state = vertex_buffer_states_[vfetch_index];
       if (state.address == vfetch_constant.address && state.size == vfetch_constant.size) {
         vertex_buffers_in_sync_[vfetch_index >> 6] |= vfetch_bit;

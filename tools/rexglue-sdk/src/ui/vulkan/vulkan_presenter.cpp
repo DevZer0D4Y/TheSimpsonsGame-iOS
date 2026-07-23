@@ -1382,12 +1382,33 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
     REXLOG_ERROR("VulkanPresenter: Failed to create a swapchain");
     return VK_NULL_HANDLE;
   }
+  // Name the mode in the log - "presentation mode 1" kept getting misread
+  // while chasing menu flicker, and whether the driver actually gave us a
+  // tear-free mode is the first thing to check in a flicker report.
+  const char* present_mode_name;
+  switch (swapchain_create_info.presentMode) {
+    case VK_PRESENT_MODE_IMMEDIATE_KHR:
+      present_mode_name = "immediate (tearing permitted)";
+      break;
+    case VK_PRESENT_MODE_MAILBOX_KHR:
+      present_mode_name = "mailbox (tear-free)";
+      break;
+    case VK_PRESENT_MODE_FIFO_KHR:
+      present_mode_name = "fifo (vsync)";
+      break;
+    case VK_PRESENT_MODE_FIFO_RELAXED_KHR:
+      present_mode_name = "fifo relaxed (tearing on late frames)";
+      break;
+    default:
+      present_mode_name = "unknown";
+      break;
+  }
   REXLOG_INFO(
       "VulkanPresenter: Created {}x{} swapchain with format {}, color space "
-      "{}, presentation mode {}",
+      "{}, presentation mode {} ({})",
       swapchain_create_info.imageExtent.width, swapchain_create_info.imageExtent.height,
       uint32_t(swapchain_create_info.imageFormat), uint32_t(swapchain_create_info.imageColorSpace),
-      uint32_t(swapchain_create_info.presentMode));
+      uint32_t(swapchain_create_info.presentMode), present_mode_name);
 
   present_queue_family_out = queue_family_index_present;
   image_format_out = swapchain_create_info.imageFormat;

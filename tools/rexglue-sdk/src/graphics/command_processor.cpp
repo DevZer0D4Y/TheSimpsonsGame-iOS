@@ -289,20 +289,26 @@ void CommandProcessor::WorkerThreadMain() {
     if (write_ptr_index == 0xBAADF00D || read_ptr_index_ == write_ptr_index) {
       SCOPE_profile_cpu_i("gpu", "rex::graphics::CommandProcessor::Stall");
       // We've run out of commands to execute.
-      // We spin here waiting for new ones, as the overhead of waiting on our
-      // event is too high.
+      // HAND PATCH: the old policy here was 500 sched-yield spins before ever
+      // touching the event, then a 5 ms timed wait. That made sense for an
+      // emulator whose GPU thread had a core to itself; in this recomp the
+      // same cores also run the recompiled game code, and a yield storm on
+      // every ring drain steals cycles from the thread that is about to feed
+      // us more commands. UpdateWritePointer signals the event, so a real
+      // wait wakes in microseconds; keep only a short yield burst to catch
+      // back-to-back submissions, then sleep on the event. The 1 ms timeout
+      // (down from 5) bounds how long a CallInThread posted from another
+      // thread can sit unnoticed, since those don't signal the event.
       PrepareForWait();
       uint32_t loop_count = 0;
       do {
-        // If we spin around too much, revert to a "low-power" state.
-        if (loop_count > 500) {
-          const int wait_time_ms = 5;
+        if (loop_count < 32) {
+          rex::thread::MaybeYield();
+          loop_count++;
+        } else {
           rex::thread::Wait(write_ptr_index_event_.get(), true,
-                            std::chrono::milliseconds(wait_time_ms));
+                            std::chrono::milliseconds(1));
         }
-
-        rex::thread::MaybeYield();
-        loop_count++;
         write_ptr_index = write_ptr_index_.load();
       } while (worker_running_ && pending_fns_.empty() &&
                (write_ptr_index == 0xBAADF00D || read_ptr_index_ == write_ptr_index));
@@ -1177,7 +1183,15 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
           // User wants it fast and dangerous.
           rex::thread::MaybeYield();
         } else {
-          rex::thread::Sleep(std::chrono::milliseconds(wait / 0x100));
+          // HAND PATCH: `wait` is the guest's suggested poll interval, not a
+          // required duration (real hardware just re-polls). Sleeping the full
+          // interval (e.g. 4 ms at the common 0x400) meant the condition was
+          // noticed up to that long after it became true, serializing the ring
+          // behind a stall that had already ended. Poll at least every 500 us
+          // instead; still >95% idle, but the wake-up lag stops being a
+          // per-frame tax.
+          uint64_t wait_us = uint64_t(wait) * 1000 / 0x100;
+          rex::thread::Sleep(std::chrono::microseconds(std::min<uint64_t>(wait_us, 500)));
         }
         rex::thread::SyncMemory();
         ReturnFromWait();

@@ -128,6 +128,15 @@ PORT = 8712
 SETTINGS_BEGIN = "# >>> LAUNCHER SETTINGS (managed block - do not edit by hand) >>>"
 SETTINGS_END = "# <<< LAUNCHER SETTINGS <<<"
 
+# Keys the launcher derives from the schema values rather than exposing
+# directly. The Vulkan presenter picks its present mode independently of the
+# vsync flag (which only paces the guest's vblank), so without these a driver
+# with no mailbox support silently falls back to immediate (tearing) - the
+# original main-menu flicker - no matter what vsync says. With vsync on, the
+# tearing-permitted modes are disallowed so the fallback chain lands on fifo.
+DERIVED_KEYS = ("vulkan_allow_present_mode_immediate",
+                "vulkan_allow_present_mode_fifo_relaxed")
+
 # key -> (type, default, needs_restart)
 SETTINGS_SCHEMA = {
     # display
@@ -135,7 +144,9 @@ SETTINGS_SCHEMA = {
     "resolution": ("str", "", True),               # "", 720p, 1080p, 1440p, 4k
     "window_width": ("int", 0, True),
     "window_height": ("int", 0, True),
-    "vsync": ("bool", True, False),
+    # vsync also picks the present-mode fallback (see DERIVED_KEYS), which is
+    # chosen once at swapchain creation - hence the restart flag.
+    "vsync": ("bool", True, True),
     "present_letterbox": ("bool", True, False),
     # quality
     "resolution_scale": ("int", 1, True),
@@ -222,7 +233,8 @@ def write_settings(new_values):
                 continue
             if in_block:
                 continue
-            if "=" in s and not s.startswith("#") and s.partition("=")[0].strip() in SETTINGS_SCHEMA:
+            key = s.partition("=")[0].strip()
+            if "=" in s and not s.startswith("#") and (key in SETTINGS_SCHEMA or key in DERIVED_KEYS):
                 continue
             lines.append(line)
         while lines and not lines[-1].strip():
@@ -230,6 +242,9 @@ def write_settings(new_values):
     block = [SETTINGS_BEGIN]
     for k, (typ, _d, _r) in SETTINGS_SCHEMA.items():
         block.append(f"{k} = {_fmt(values[k], typ)}")
+    allow_tearing = not values["vsync"]
+    for k in DERIVED_KEYS:
+        block.append(f"{k} = {_fmt(allow_tearing, 'bool')}")
     block.append(SETTINGS_END)
     GAME_TOML.write_text("\n".join(lines + ["", *block]) + "\n", encoding="utf-8")
     return values
@@ -301,10 +316,13 @@ def patch_instant_popin(enable):
 def patches_list():
     return [
         {"id": "instant_popin", "name": "Instant character pop-in (community fix)",
-         "desc": "EXPERIMENTAL - currently CRASHES on Steam Deck during level "
-                 "loads (a GPU driver interaction; the same fix works in Xenia "
-                 "on desktop GPUs). Leave OFF on Deck. Kept for future driver "
-                 "updates and the Windows build.",
+         "desc": "EXPERIMENTAL - the engine now draws finished characters with "
+                 "absent optional streams by default, so most missing-character "
+                 "cases no longer need this. This toggle additionally runs the "
+                 "stale streaming 'priming' draws; it has CRASHED on Steam Deck "
+                 "during level loads in the past (a GPU driver interaction; the "
+                 "same fix works in Xenia on desktop GPUs). Try it only if "
+                 "things still stream in late.",
          "state": patch_instant_popin_state(), "available": GAME_TOML.exists()},
         {"id": "skip_intro", "name": "Skip intro logo videos",
          "desc": "Boots straight past the EA / Fox / Gracie logo movies.",

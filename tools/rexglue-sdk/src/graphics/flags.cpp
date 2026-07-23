@@ -15,6 +15,20 @@
 
 REXCVAR_DEFINE_BOOL(gpu_allow_invalid_fetch_constants, false, "GPU",
                     "Allow invalid fetch constants");
+// HAND PATCH: this game leaves the vertex fetch constants of absent optional
+// streams (blend-shape deltas on morphless meshes, slots 89-94) permanently
+// all-zero with the "invalid" type. The shaders never read those slots at
+// runtime (they branch around them, and the translator zero-clamps size-0
+// fetches anyway), but static shader analysis still flags them, so vetoing
+// on them threw away entire otherwise-valid character draws -- the "eternal
+// pop-in" where characters simply never appeared. Admitting these is safe on
+// every GPU tested and needs none of the risky stale-address admission that
+// gpu_allow_invalid_fetch_constants also turns on, so it gets its own switch
+// and defaults to on.
+REXCVAR_DEFINE_BOOL(gpu_allow_null_optional_streams, true, "GPU",
+                    "Draw meshes whose only invalid vertex fetch constants are "
+                    "all-zero optional (stride 0) streams the shader never "
+                    "actually reads.");
 REXCVAR_DEFINE_BOOL(native_2x_msaa, true, "GPU", "Enable native 2x MSAA");
 REXCVAR_DEFINE_BOOL(depth_float24_round, false, "GPU", "Round float24 depth values");
 REXCVAR_DEFINE_BOOL(depth_float24_convert_in_pixel_shader, false, "GPU",

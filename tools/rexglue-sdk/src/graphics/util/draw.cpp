@@ -10,6 +10,7 @@
  */
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 
 #include <rex/assert.h>
@@ -681,6 +682,110 @@ void AddMemExportRanges(const RegisterFile& regs, const Shader& shader,
       ranges_out.emplace_back(uint32_t(stream.base_address), stream_size_bytes);
     }
   }
+}
+
+InvalidVertexFetchVerdict ClassifyInvalidVertexFetch(const RegisterFile& regs,
+                                                     const Shader& vertex_shader) {
+  // HAND PATCH: single source of truth for how draws with invalid-type vertex
+  // fetch constants are treated; see the header for the shape taxonomy and
+  // flags.cpp for the two gating cvars. Scans EVERY fetch slot the shader can
+  // touch (no residency-cache filtering - the verdict must not change between
+  // draws just because a slot's buffer state was already cached).
+  bool saw_invalid = false;
+  bool saw_stale_address = false;
+  const Shader::ConstantRegisterMap& constant_map = vertex_shader.constant_register_map();
+  for (uint32_t i = 0; i < rex::countof(constant_map.vertex_fetch_bitmap); ++i) {
+    uint32_t vfetch_bits_remaining = constant_map.vertex_fetch_bitmap[i];
+    uint32_t j;
+    while (rex::bit_scan_forward(vfetch_bits_remaining, &j)) {
+      vfetch_bits_remaining &= ~(uint32_t(1) << j);
+      uint32_t vfetch_index = i * 32 + j;
+      xenos::xe_gpu_vertex_fetch_t vfetch_constant = regs.GetVertexFetch(vfetch_index);
+      switch (vfetch_constant.type) {
+        case xenos::FetchConstantType::kVertex:
+          continue;
+        case xenos::FetchConstantType::kInvalidVertex:
+          break;
+        default:
+          REXGPU_WARN("Vertex fetch constant {} ({:08X} {:08X}) is completely invalid!",
+                      vfetch_index, vfetch_constant.dword_0, vfetch_constant.dword_1);
+          return InvalidVertexFetchVerdict::kVeto;
+      }
+      saw_invalid = true;
+      if (vfetch_constant.address == 0 && vfetch_constant.size == 0) {
+        // All-zero constants: harmless on an optional (stride 0) stream the
+        // shader skips, poison on a main stream (all-zero vertex data makes
+        // (0,0,0,0)-class positions that wedge the scan converter). Tell the
+        // two apart by the binding stride, exactly like the null-stream gate
+        // this classification replaced.
+        bool optional_stream = true;
+        for (const Shader::VertexBinding& vfetch_binding : vertex_shader.vertex_bindings()) {
+          if (vfetch_binding.fetch_constant == vfetch_index) {
+            optional_stream = vfetch_binding.stride_words == 0;
+            break;
+          }
+        }
+        if (!optional_stream) {
+          static std::atomic<uint32_t> null_main_logs{0};
+          uint32_t null_main_n = null_main_logs.fetch_add(1, std::memory_order_relaxed);
+          if (null_main_n < 16 || (null_main_n & 1023) == 0) {
+            REXGPU_WARN(
+                "[NULL-MAIN-STREAM] draw vetoed: slot={} vs={:016X} "
+                "(entity still streaming; occurrence {})",
+                vfetch_index, vertex_shader.ucode_data_hash(), null_main_n + 1);
+          }
+          return InvalidVertexFetchVerdict::kVeto;
+        }
+        if (!REXCVAR_GET(gpu_allow_null_optional_streams) &&
+            !REXCVAR_GET(gpu_allow_invalid_fetch_constants)) {
+          return InvalidVertexFetchVerdict::kVeto;
+        }
+        continue;
+      }
+      if (vfetch_constant.address != 0 && vfetch_constant.size != 0 &&
+          (uint64_t(vfetch_constant.size) << 2) <= (64u << 20)) {
+        // Plausible stale address/size - a streaming priming draw, only under
+        // the experimental flag, and never rasterized.
+        if (!REXCVAR_GET(gpu_allow_invalid_fetch_constants)) {
+          static std::atomic<uint32_t> invalid_vfetch_logs{0};
+          if (invalid_vfetch_logs.fetch_add(1, std::memory_order_relaxed) < 16) {
+            REXGPU_WARN(
+                "Vertex fetch constant {} ({:08X} {:08X}) has \"invalid\" type - draw "
+                "skipped (gpu_allow_invalid_fetch_constants would admit it as a "
+                "priming draw)",
+                vfetch_index, vfetch_constant.dword_0, vfetch_constant.dword_1);
+          }
+          return InvalidVertexFetchVerdict::kVeto;
+        }
+        saw_stale_address = true;
+        continue;
+      }
+      // Nonzero garbage (address without size or vice versa, or an absurd
+      // size): nothing safe can be made of this draw.
+      static std::atomic<uint32_t> garbage_vfetch_logs{0};
+      if (garbage_vfetch_logs.fetch_add(1, std::memory_order_relaxed) < 16) {
+        REXGPU_WARN(
+            "Vertex fetch constant {} ({:08X} {:08X}) has \"invalid\" type and no usable "
+            "buffer - draw skipped",
+            vfetch_index, vfetch_constant.dword_0, vfetch_constant.dword_1);
+      }
+      return InvalidVertexFetchVerdict::kVeto;
+    }
+  }
+  if (!saw_invalid) {
+    return InvalidVertexFetchVerdict::kNone;
+  }
+  if (saw_stale_address) {
+    static std::atomic<uint32_t> priming_logs{0};
+    uint32_t log_n = priming_logs.fetch_add(1, std::memory_order_relaxed);
+    if (log_n < 256 || (log_n & 255) == 0) {
+      REXGPU_WARN("[INVALID-VFETCH-PRIMING] vs={:016X} admitted without rasterization "
+                  "(occurrence {})",
+                  vertex_shader.ucode_data_hash(), log_n + 1);
+    }
+    return InvalidVertexFetchVerdict::kPrimeWithoutRasterization;
+  }
+  return InvalidVertexFetchVerdict::kRasterize;
 }
 
 xenos::CopySampleSelect SanitizeCopySampleSelect(xenos::CopySampleSelect copy_sample_select,

@@ -3612,41 +3612,6 @@ Shader* VulkanCommandProcessor::LoadShader(xenos::ShaderType shader_type, uint32
   return pipeline_cache_->LoadShader(shader_type, host_address, dword_count);
 }
 
-namespace {
-// HAND PATCH: read-only pre-check mirroring the admit/veto classification
-// further down in IssueDraw (the kInvalidVertex case), used ONLY to pick the
-// pipeline's rasterizer_discard state before ConfigurePipeline runs -- the
-// real, authoritative classification (which also does buffer-sync side
-// effects and can still veto the whole draw) still happens later and is
-// unaffected by this. Safe to duplicate: purely reads already-computed shader
-// metadata and current register state, no side effects.
-bool VulkanIsLikelyPrimingDraw(const RegisterFile& regs, const VulkanShader* vertex_shader) {
-  if (!REXCVAR_GET(gpu_allow_invalid_fetch_constants)) {
-    return false;
-  }
-  const Shader::ConstantRegisterMap& constant_map_vertex = vertex_shader->constant_register_map();
-  for (uint32_t i = 0; i < rex::countof(constant_map_vertex.vertex_fetch_bitmap); ++i) {
-    uint32_t vfetch_bits_remaining = constant_map_vertex.vertex_fetch_bitmap[i];
-    uint32_t j;
-    while (rex::bit_scan_forward(vfetch_bits_remaining, &j)) {
-      vfetch_bits_remaining &= ~(uint32_t(1) << j);
-      uint32_t vfetch_index = i * 32 + j;
-      xenos::xe_gpu_vertex_fetch_t vfetch_constant = regs.GetVertexFetch(vfetch_index);
-      if (vfetch_constant.type != xenos::FetchConstantType::kInvalidVertex) {
-        continue;
-      }
-      bool plausible = vfetch_constant.address != 0 && vfetch_constant.size != 0 &&
-                       (uint64_t(vfetch_constant.size) << 2) <= (64u << 20);
-      bool null_stream = vfetch_constant.address == 0 && vfetch_constant.size == 0;
-      if (plausible || null_stream) {
-        return true;
-      }
-    }
-  }
-  return false;
-}
-}  // namespace
-
 bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
                                        IndexBufferInfo* index_buffer_info,
                                        bool major_mode_explicit) {
@@ -3689,6 +3654,18 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     return draw_fail("missing_vertex_shader");
   }
   pipeline_cache_->AnalyzeShaderUcode(*vertex_shader);
+  // HAND PATCH: settle the invalid-fetch-constant verdict once, up front, and
+  // use it for the pipeline's rasterizer_discard state, the scissor mute, and
+  // the residency loop below. The verdict scans all fetch slots (not just the
+  // ones whose buffer state is stale), so it cannot flip between consecutive
+  // draws the way the old inline check could.
+  draw_util::InvalidVertexFetchVerdict invalid_vfetch_verdict =
+      draw_util::ClassifyInvalidVertexFetch(regs, *vertex_shader);
+  if (invalid_vfetch_verdict == draw_util::InvalidVertexFetchVerdict::kVeto) {
+    // Nothing safe can be drawn or primed from this draw's fetch constants;
+    // classification already logged why.
+    return false;
+  }
   bool memexport_used_vertex = vertex_shader->memexport_eM_written() != 0;
   if (memexport_used_vertex) {
     if (!device_properties.vertexPipelineStoresAndAtomics) {
@@ -3909,17 +3886,21 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   // textures.
   VkPipeline pipeline;
   void* pipeline_handle = nullptr;
-  // HAND PATCH: force rasterizer_discard for priming draws (see the
-  // kInvalidVertex case above) instead of relying only on the 1x1 scissor
-  // mute below -- this skips the fixed-function clip/rasterize/scan-convert
-  // stages for these draws at the pipeline level, rather than merely
-  // shrinking the area they can affect while still running the full
-  // rasterizer path that was observed to wedge on this hardware.
+  // HAND PATCH: force rasterizer_discard for priming draws (stale-address
+  // streaming draws admitted by the classification above) instead of relying
+  // only on the scissor mute below -- this skips the fixed-function
+  // clip/rasterize/scan-convert stages for these draws at the pipeline level,
+  // rather than merely shrinking the area they can affect while still running
+  // the full rasterizer path that was observed to wedge on this hardware.
+  // Draws whose only invalid slots are absent optional streams (kRasterize)
+  // are real character geometry and rasterize normally.
   if (!pipeline_cache_->ConfigurePipeline(
           vertex_shader_translation, pixel_shader_translation, primitive_processing_result,
           normalized_depth_control, normalized_color_mask,
           render_target_cache_->last_update_render_pass_key(), pipeline, pipeline_layout_provider,
-          &pipeline_handle, VulkanIsLikelyPrimingDraw(regs, vertex_shader))) {
+          &pipeline_handle,
+          invalid_vfetch_verdict ==
+              draw_util::InvalidVertexFetchVerdict::kPrimeWithoutRasterization)) {
     return draw_fail("configure_pipeline");
   }
   bool pipeline_is_placeholder = false;
@@ -4044,15 +4025,18 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   }
 
   // Ensure vertex buffers are resident.
-  // HAND PATCH: "priming draw" = a draw admitted with invalid-type fetch
-  // constants (gpu_allow_invalid_fetch_constants). This game finalizes
-  // characters through such draws: the vertex shader memexports skinned
-  // vertices, the CPU reads them back, and only then valid fetch constants
-  // are written (RenderWare streaming). The draw MUST execute for entities to
-  // ever appear -- but its rasterized output is meaningless (and degenerate
-  // enough to wedge the VanGogh pixel pipeline), so it is drawn under a 1x1
-  // scissor: full vertex work + memexport, no pixel work.
-  bool priming_draw = false;
+  // HAND PATCH: "priming draw" = a draw with plausible stale-address fetch
+  // constants admitted by ClassifyInvalidVertexFetch (see draw_util). This
+  // game finalizes streamed characters through such draws: the vertex shader
+  // memexports skinned vertices, the CPU reads them back, and only then valid
+  // fetch constants are written (RenderWare streaming). The draw MUST execute
+  // for entities to ever appear -- but its rasterized output is meaningless
+  // (and degenerate enough to wedge the VanGogh pixel pipeline), so it runs
+  // with rasterization disabled: full vertex work + memexport, no pixel work.
+  // Draws whose only invalid slots are absent optional streams rasterize
+  // normally -- muting those made finished characters invisible.
+  bool priming_draw =
+      invalid_vfetch_verdict == draw_util::InvalidVertexFetchVerdict::kPrimeWithoutRasterization;
   const Shader::ConstantRegisterMap& constant_map_vertex = vertex_shader->constant_register_map();
   for (uint32_t i = 0; i < rex::countof(constant_map_vertex.vertex_fetch_bitmap); ++i) {
     uint32_t vfetch_bits_remaining = constant_map_vertex.vertex_fetch_bitmap[i];
@@ -4065,87 +4049,9 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
         continue;
       }
       xenos::xe_gpu_vertex_fetch_t vfetch_constant = regs.GetVertexFetch(vfetch_index);
-      switch (vfetch_constant.type) {
-        case xenos::FetchConstantType::kVertex:
-          break;
-        case xenos::FetchConstantType::kInvalidVertex: {
-          // HAND PATCH: this game marks streamed meshes' vertex fetch constants
-          // with the "invalid" type. Two safe shapes are drawn when
-          // gpu_allow_invalid_fetch_constants is set:
-          //  - plausible address/size (streamed meshes; real Xenos drew them);
-          //  - ALL-ZERO constants on optional vertex streams: the SPIR-V
-          //    translator now zero-clamps fetches whose size field is 0
-          //    (spirv_translator_fetch.cpp HAND PATCH), so the shader reads
-          //    zeros -- matching hardware -- instead of live guest memory at
-          //    address 0 (which fed garbage attributes and hung the GPU).
-          //    Failing the whole draw for these caused multi-second entity
-          //    pop-in after level loads, since static shader analysis flags
-          //    even conditionally-used fetch slots.
-          // Nonzero-garbage constants are still rejected.
-          bool plausible = vfetch_constant.address != 0 &&
-                           vfetch_constant.size != 0 &&
-                           (uint64_t(vfetch_constant.size) << 2) <= (64u << 20);
-          bool null_stream = vfetch_constant.address == 0 && vfetch_constant.size == 0;
-          // A null stream is only safe when it is a SECONDARY binding
-          // (stride 0 -- e.g. this game's absent blend-shape streams, which
-          // the shader skips via a dynamic branch and never actually reads).
-          // A null MAIN stream (stride > 0) means the entity is still
-          // streaming in: all-zero vertex data collapses skinned positions to
-          // (0,0,0,0)-class geometry whose pixel work wedges the GPU. Keep
-          // vetoing those draws -- that is a few frames of genuine loading,
-          // not the permanent pop-in.
-          if (null_stream) {
-            for (const Shader::VertexBinding& vfetch_binding : vertex_shader->vertex_bindings()) {
-              if (vfetch_binding.fetch_constant == vfetch_index) {
-                if (vfetch_binding.stride_words != 0) {
-                  null_stream = false;
-                  static std::atomic<uint32_t> null_main_logs{0};
-                  uint32_t null_main_n = null_main_logs.fetch_add(1, std::memory_order_relaxed);
-                  if (null_main_n < 16 || (null_main_n & 1023) == 0) {
-                    REXGPU_WARN(
-                        "[NULL-MAIN-STREAM] draw vetoed: slot={} stride_words={} vs={:016X} "
-                        "(entity still streaming; occurrence {})",
-                        vfetch_index, vfetch_binding.stride_words,
-                        vertex_shader->ucode_data_hash(), null_main_n + 1);
-                  }
-                }
-                break;
-              }
-            }
-          }
-          if (REXCVAR_GET(gpu_allow_invalid_fetch_constants) && (plausible || null_stream)) {
-            priming_draw = true;
-            // HAND PATCH DIAGNOSTIC: characterize every allowed-invalid draw so
-            // the poison ones (GPU overdraw storms at level load) can be told
-            // apart from the benign pop-in draws (null optional streams).
-            static std::atomic<uint32_t> allowed_invalid_logs{0};
-            uint32_t log_n = allowed_invalid_logs.fetch_add(1, std::memory_order_relaxed);
-            if (log_n < 256 || (log_n & 255) == 0) {
-              REXGPU_WARN(
-                  "[INVALID-VFETCH-ALLOWED] slot={} dwords={:08X},{:08X} addr=0x{:08X} "
-                  "size_dw={} kind={} vs={:016X} ps={:016X} occurrence={}",
-                  vfetch_index, vfetch_constant.dword_0, vfetch_constant.dword_1,
-                  uint32_t(vfetch_constant.address) << 2, uint32_t(vfetch_constant.size),
-                  null_stream ? "null" : "plausible",
-                  vertex_shader->ucode_data_hash(),
-                  pixel_shader ? pixel_shader->ucode_data_hash() : 0, log_n + 1);
-            }
-            break;
-          }
-          static std::atomic<uint32_t> invalid_vfetch_logs{0};
-          if (invalid_vfetch_logs.fetch_add(1, std::memory_order_relaxed) < 16) {
-            REXGPU_WARN(
-                "Vertex fetch constant {} ({:08X} {:08X}) has \"invalid\" type "
-                "and no usable buffer -- draw skipped",
-                vfetch_index, vfetch_constant.dword_0, vfetch_constant.dword_1);
-          }
-          return false;
-        }
-        default:
-          REXGPU_WARN("Vertex fetch constant {} ({:08X} {:08X}) is completely invalid!",
-                      vfetch_index, vfetch_constant.dword_0, vfetch_constant.dword_1);
-          return false;
-      }
+      // Invalid-type slots already passed classification above (a kVeto draw
+      // never reaches this loop), so both valid and admitted-invalid slots
+      // just need their buffer ranges resident.
       VertexBufferState& state = vertex_buffer_states_[vfetch_index];
       if (state.address == vfetch_constant.address && state.size == vfetch_constant.size) {
         vertex_buffers_in_sync_[vfetch_index >> 6] |= vfetch_bit;
@@ -5258,13 +5164,17 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
     // lost CPU time that could've been doing other work this frame.
     PROFILE_CMD_BUFFER_STALL();
     // Await in a blocking way if requested.
-    // TODO(Triang3l): Await only one fence. "Fence signal operations that are
-    // defined by vkQueueSubmit additionally include in the first
-    // synchronization scope all commands that occur earlier in submission
-    // order."
-    VkResult wait_result =
-        dfn.vkWaitForFences(device, uint32_t(await_submission - submission_completed_),
-                            submissions_in_flight_fences_.data(), VK_TRUE, UINT64_MAX);
+    // HAND PATCH: resolves the long-standing upstream TODO here. "Fence signal
+    // operations that are defined by vkQueueSubmit additionally include in the
+    // first synchronization scope all commands that occur earlier in
+    // submission order", so when the last needed submission's fence signals,
+    // everything before it on this queue has finished too -- the driver only
+    // has to track and wake on one fence instead of N while the CPU is
+    // already losing time in this stall.
+    VkResult wait_result = dfn.vkWaitForFences(
+        device, 1,
+        &submissions_in_flight_fences_[size_t(await_submission - submission_completed_) - 1],
+        VK_TRUE, UINT64_MAX);
     if (wait_result == VK_SUCCESS) {
       fences_awaited += await_submission - submission_completed_;
     } else {
