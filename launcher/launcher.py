@@ -120,7 +120,27 @@ else:
 BUILD_DIR = GAME_BIN.parent
 GAME_TOML = BUILD_DIR / "simpsons.toml"
 GAMEDATA = ROOT / "gamedata"
-USER_DATA = Path.home() / ".local/share/simpsons"
+
+
+def _user_data_dir():
+    """Where the engine keeps saves and its cache — must match ReXApp::SetupEnvironment.
+
+    Windows uses local app data (the engine moved off Documents, which is often
+    OneDrive-redirected); everything else uses the XDG data home. This was
+    hardcoded to the Linux path, so every save feature here silently did
+    nothing on Windows.
+    """
+    if PLAT == "Windows":
+        base = os.environ.get("LOCALAPPDATA")
+        if base:
+            return Path(base) / "simpsons"
+        return Path.home() / "AppData" / "Local" / "simpsons"
+    xdg = os.environ.get("XDG_DATA_HOME")
+    base = Path(xdg) if xdg else Path.home() / ".local" / "share"
+    return base / "simpsons"
+
+
+USER_DATA = _user_data_dir()
 
 TOKEN = secrets.token_hex(16)
 PORT = 8712
@@ -344,8 +364,32 @@ def game_running_pids():
         return []
 
 
+def _find_ci(directory, name):
+    """Locate a file case-insensitively, the way the guest filesystem does.
+
+    extract-xiso preserves whatever case the disc used, so a Linux install can
+    end up with DEFAULT.XEX while everything looks for default.xex.
+    """
+    if not directory.is_dir():
+        return None
+    exact = directory / name
+    if exact.is_file():
+        return exact
+    lowered = name.lower()
+    for entry in directory.iterdir():
+        if entry.is_file() and entry.name.lower() == lowered:
+            return entry
+    return None
+
+
+def _looks_like_game_dir(directory):
+    return (directory / "movies").is_dir() and _find_ci(directory, "default.xex") is not None
+
+
 def gamedata_ok():
-    return (GAMEDATA / "movies").is_dir()
+    # The engine needs default.xex as well as the movies folder; checking only
+    # for movies let a half-extracted install look ready and fail at boot.
+    return _looks_like_game_dir(GAMEDATA)
 
 
 def art_files():
@@ -573,11 +617,17 @@ def run_install(iso_path):
         p.wait()
         if p.returncode != 0:
             return fail(f"extract-xiso exited with {p.returncode}")
-        if not (target / "movies").is_dir():
-            nested = [d for d in target.iterdir() if (d / "movies").is_dir()]
+        if not _looks_like_game_dir(target):
+            nested = [d for d in target.iterdir() if d.is_dir() and _looks_like_game_dir(d)]
             if not nested:
-                return fail("Extraction finished but game files not recognized "
-                            "(is this The Simpsons Game Xbox 360 ISO?)")
+                # Say what was actually extracted - a silent "DONE!" here used to
+                # hand the engine a folder with no default.xex in it, which only
+                # showed up later as a cryptic "Entrypoint XEX not found".
+                found = sorted(p.name for p in target.iterdir())[:12] if target.is_dir() else []
+                return fail("Extraction finished but this doesn't look like The Simpsons "
+                            "Game (need both default.xex and a movies folder). "
+                            + (f"Extracted instead: {', '.join(found)}" if found
+                               else "Nothing was extracted."))
             target = nested[0]
         log.append("Extraction complete. Installing game data ...")
         if GAMEDATA.exists():
@@ -1308,6 +1358,17 @@ def launch_game():
     with game_proc_lock:
         if game_running_pids():
             return False, "Game is already running"
+        if not GAMEDATA.is_dir():
+            return False, ("No game data installed yet — use the Install tab to install "
+                           "from your Xbox 360 ISO.")
+        if _find_ci(GAMEDATA, "default.xex") is None:
+            return False, ("Game data is incomplete: default.xex is missing from "
+                           f"{GAMEDATA}. Re-run the install from your ISO in the "
+                           "Install tab.")
+        if not (GAMEDATA / "movies").is_dir():
+            return False, ("Game data is incomplete: the movies folder is missing from "
+                           f"{GAMEDATA}. Re-run the install from your ISO in the "
+                           "Install tab.")
         repaired = repair_saves()
         if repaired:
             install_state["log"].append("Save self-heal: " + ", ".join(repaired))

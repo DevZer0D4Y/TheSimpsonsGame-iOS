@@ -84,6 +84,11 @@ std::filesystem::path GetUserFolder() {
   return std::filesystem::path(home) / ".local" / "share";
 }
 
+std::filesystem::path GetLegacyUserFolder() {
+  // The POSIX location has always been the XDG data home - nothing to migrate.
+  return {};
+}
+
 FILE* OpenFile(const std::filesystem::path& path, const std::string_view mode) {
   return fopen(path.c_str(), std::string(mode).c_str());
 }

@@ -18,6 +18,7 @@
 #include <rex/logging/sink.h>
 #include <rex/logging.h>
 #include <rex/perf/counter.h>
+#include <rex/string/utf8.h>
 #include <rex/ui/overlay/console_overlay.h>
 #include <rex/ui/overlay/debug_overlay.h>
 #include <rex/ui/overlay/settings_overlay.h>
@@ -108,6 +109,29 @@ bool ReXApp::SetupEnvironment() {
     user_dir = user_data_cvar;
   } else {
     user_dir = rex::filesystem::GetUserFolder() / GetName();
+    // Saves used to live under a different folder on Windows (Documents).
+    // Move them across once so nobody loses progress to the relocation; the
+    // shader cache is left behind deliberately since it is disposable and
+    // regenerates, and is the bulkiest part by far.
+    auto legacy_root = rex::filesystem::GetLegacyUserFolder();
+    if (!legacy_root.empty() && !user_dir.empty()) {
+      auto legacy_dir = legacy_root / GetName();
+      std::error_code ec;
+      if (std::filesystem::is_directory(legacy_dir, ec) &&
+          !std::filesystem::exists(user_dir, ec)) {
+        std::filesystem::remove_all(legacy_dir / "cache", ec);
+        std::filesystem::create_directories(user_dir.parent_path(), ec);
+        std::filesystem::rename(legacy_dir, user_dir, ec);
+        if (ec) {
+          // Cross-volume moves fail; fall back to a copy and keep the
+          // original rather than risk losing saves.
+          ec.clear();
+          std::filesystem::copy(legacy_dir, user_dir,
+                                std::filesystem::copy_options::recursive, ec);
+        }
+        migrated_user_data_from_ = ec ? std::filesystem::path() : legacy_dir;
+      }
+    }
   }
 
   // Update data: cvar override, or empty (opt-in)
@@ -171,6 +195,9 @@ bool ReXApp::SetupEnvironment() {
   }
   if (!user_data_root_.empty()) {
     REXLOG_INFO("  User data:      {}", user_data_root_.string());
+  }
+  if (!migrated_user_data_from_.empty()) {
+    REXLOG_INFO("  Moved existing save data here from {}", migrated_user_data_from_.string());
   }
   if (!update_data_root_.empty()) {
     REXLOG_INFO("  Update data:    {}", update_data_root_.string());
@@ -249,10 +276,42 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
     std::replace(host_tail.begin(), host_tail.end(), '\\', '/');
     auto xex_host = paths.game_data_root / host_tail;
     if (!std::filesystem::is_regular_file(xex_host)) {
-      auto msg = fmt::format("Entrypoint XEX not found: {}", xex_host.string());
-      REXLOG_ERROR("{}", msg);
-      rex::ShowSimpleMessageBox(rex::SimpleMessageBoxType::Error, msg);
-      return false;
+      // The guest filesystem matches names case-insensitively (Entry::GetChild
+      // uses utf8_equal_case), so an extraction that produced DEFAULT.XEX
+      // loads perfectly well - only this pre-check, which hits the host
+      // filesystem directly, was case-sensitive on Linux and rejected it.
+      // Retry the lookup the way the VFS would before giving up.
+      std::error_code ec;
+      bool found_case_insensitive = false;
+      for (const auto& dir_entry :
+           std::filesystem::directory_iterator(xex_host.parent_path(), ec)) {
+        if (!dir_entry.is_regular_file(ec)) {
+          continue;
+        }
+        if (rex::string::utf8_equal_case(dir_entry.path().filename().string(),
+                                         xex_host.filename().string())) {
+          xex_host = dir_entry.path();
+          found_case_insensitive = true;
+          break;
+        }
+      }
+      if (!found_case_insensitive) {
+        // Say what to actually do about it - "not found" alone sent people
+        // hunting for a file the installer was supposed to put there.
+        bool have_dir = std::filesystem::is_directory(paths.game_data_root, ec);
+        auto msg = fmt::format(
+            "Game data is missing its executable ({} not found).\n\n"
+            "The game data folder is:\n{}\n\n{}",
+            xex_host.filename().string(), paths.game_data_root.string(),
+            have_dir ? "That folder exists but has no default.xex in it, so the install is "
+                       "incomplete. Open the launcher's Install tab and install from your "
+                       "Xbox 360 ISO again."
+                     : "That folder does not exist. Open the launcher's Install tab and "
+                       "install from your Xbox 360 ISO.");
+        REXLOG_ERROR("{}", msg);
+        rex::ShowSimpleMessageBox(rex::SimpleMessageBoxType::Error, msg);
+        return false;
+      }
     }
   }
 

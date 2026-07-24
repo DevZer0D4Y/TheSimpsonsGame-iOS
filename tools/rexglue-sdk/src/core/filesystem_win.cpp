@@ -52,14 +52,31 @@ std::filesystem::path GetExecutableFolder() {
   return GetExecutablePath().parent_path();
 }
 
-std::filesystem::path GetUserFolder() {
+namespace {
+std::filesystem::path GetKnownFolder(REFKNOWNFOLDERID id) {
   std::filesystem::path result;
   PWSTR path;
-  if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Documents, KF_FLAG_DEFAULT, nullptr, &path))) {
+  if (SUCCEEDED(SHGetKnownFolderPath(id, KF_FLAG_DEFAULT, nullptr, &path))) {
     result.assign(path);
     CoTaskMemFree(path);
   }
   return result;
+}
+}  // namespace
+
+std::filesystem::path GetUserFolder() {
+  // Local app data, the Windows counterpart of the XDG data home used on
+  // POSIX. This used to be FOLDERID_Documents, which put saves and the shader
+  // cache in the user's Documents folder -- against the platform conventions,
+  // and actively harmful when Documents is redirected into OneDrive, where
+  // the cache gets uploaded and file locking is unpredictable.
+  return GetKnownFolder(FOLDERID_LocalAppData);
+}
+
+std::filesystem::path GetLegacyUserFolder() {
+  // Must be queried, not guessed: a redirected Documents folder is exactly the
+  // case whose data needs rescuing, and it is not %USERPROFILE%\Documents.
+  return GetKnownFolder(FOLDERID_Documents);
 }
 
 bool CreateEmptyFile(const std::filesystem::path& path) {

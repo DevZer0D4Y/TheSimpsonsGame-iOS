@@ -209,6 +209,9 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
   std::filesystem::path user_data_root_;
   std::filesystem::path update_data_root_;
   std::filesystem::path cache_root_;
+  // Set only when this run relocated save data from an older build's folder,
+  // so the move can be reported in the startup log.
+  std::filesystem::path migrated_user_data_from_;
   std::unique_ptr<Runtime> runtime_;
   std::unique_ptr<ui::Window> window_;
   std::thread module_thread_;

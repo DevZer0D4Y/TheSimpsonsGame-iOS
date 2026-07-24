@@ -132,6 +132,11 @@
   .console{background:#06070a; color:#9fd0ef; font:12px/1.55 "SF Mono", Consolas, monospace; border-radius:var(--radius-sm);
     border:1px solid var(--border); padding:14px; height:200px; overflow-y:auto;
     white-space:pre-wrap; word-break:break-all}
+  .console:focus{outline:1px solid var(--border); outline-offset:2px}
+  .minibtn{font-family:inherit; font-size:11px; font-weight:700; letter-spacing:.04em; padding:4px 10px;
+    margin-left:12px; border-radius:var(--radius-sm); border:1px solid var(--border);
+    background:transparent; color:var(--muted); cursor:pointer; vertical-align:middle}
+  .minibtn:hover{color:#fff; border-color:#7aa7c7}
   .row{display:flex; gap:10px; align-items:center; flex-wrap:wrap}
   .row input[type=text]{flex:1; min-width:200px}
   .bigbtn{font-family:inherit; font-size:13.5px; font-weight:700; padding:11px 20px; border-radius:var(--radius-sm);
@@ -216,8 +221,10 @@
       <span class="muted" id="steammsg"></span>
     </div>
     <div class="card" style="margin-top:16px">
-      <h2>GAME CONSOLE OUTPUT</h2>
-      <div class="console" id="gamelog">–</div>
+      <h2>GAME CONSOLE OUTPUT
+        <button class="minibtn" id="copylogbtn" title="Copy the console output to the clipboard">Copy</button>
+      </h2>
+      <div class="console" id="gamelog" tabindex="0">–</div>
     </div>
   </section>
 
@@ -675,10 +682,16 @@ async function refresh(){
       $("#aboutgithub").innerHTML = `Source code: <a href="https://github.com/${st.github_repo}" target="_blank" rel="noopener">github.com/${st.github_repo}</a>`;
       $("#issueslink").href = `https://github.com/${st.github_repo}/issues`;
     }
-    /* install progress */
+    /* install progress - same selection-preserving rules as the game console */
     const inst = st.install;
-    $("#installlog").textContent = (inst.log && inst.log.length) ? inst.log.join("\n") : "–";
-    $("#installlog").scrollTop = 1e9;
+    const ilog = $("#installlog");
+    const itext = (inst.log && inst.log.length) ? inst.log.join("\n") : "–";
+    const isel = window.getSelection();
+    if (itext !== ilog.textContent && !(isel && !isel.isCollapsed && ilog.contains(isel.anchorNode))) {
+      const iStuck = ilog.scrollHeight - ilog.scrollTop - ilog.clientHeight < 24;
+      ilog.textContent = itext;
+      if (iStuck) ilog.scrollTop = 1e9;
+    }
     $("#installbtn").disabled = inst.running;
     $("#installstate").innerHTML = inst.running ? "⏳ Working…" :
       inst.ok === true ? '<span class="ok">✔ Installed successfully!</span>' :
@@ -718,12 +731,67 @@ function updateBanner(mnk){
   }
 }
 
-/* game log */
+/* game log
+   Rewriting textContent destroys any selection the user is making inside the
+   pane, so only touch the DOM when the text actually changed, and stop polling
+   once the game has exited (the file is static then - there is nothing to pick
+   up, and the rewrite was making the log impossible to select and copy).
+   Keep polling for one extra cycle after the game stops so the final lines,
+   written as it shut down, still land. */
+let lastLogText = null, logPollAfterStop = 0;
 setInterval(async () => {
   if ($("#tab-play").classList.contains("hidden")) return;
+  const running = !lastStatus || lastStatus.running;
+  if (running) {
+    logPollAfterStop = 1;
+  } else if (logPollAfterStop > 0) {
+    logPollAfterStop--;
+  } else {
+    return;
+  }
   const r = await api.get("/api/log").catch(()=>null);
-  if (r && r.lines){ const el=$("#gamelog"); el.textContent = r.lines.join("\n") || "–"; el.scrollTop = 1e9; }
+  if (!r || !r.lines) return;
+  const el = $("#gamelog");
+  const text = r.lines.join("\n") || "–";
+  if (text === lastLogText) return;
+  lastLogText = text;
+  // Don't yank the pane out from under someone reading or selecting it.
+  const sel = window.getSelection();
+  if (sel && !sel.isCollapsed && el.contains(sel.anchorNode)) return;
+  const stuckToBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 24;
+  el.textContent = text;
+  if (stuckToBottom) el.scrollTop = 1e9;
 }, 3000);
+
+/* Ctrl+A inside a console pane selects that pane, not the whole launcher. */
+document.addEventListener("keydown", e => {
+  if (!(e.ctrlKey || e.metaKey) || e.key.toLowerCase() !== "a") return;
+  const pane = e.target.closest && e.target.closest(".console");
+  if (!pane) return;
+  e.preventDefault();
+  const range = document.createRange();
+  range.selectNodeContents(pane);
+  const sel = window.getSelection();
+  sel.removeAllRanges();
+  sel.addRange(range);
+});
+
+$("#copylogbtn").onclick = async () => {
+  const btn = $("#copylogbtn"), text = $("#gamelog").textContent;
+  try {
+    await navigator.clipboard.writeText(text);
+    btn.textContent = "Copied!";
+  } catch (err) {
+    // Clipboard access can be denied; fall back to selecting it for Ctrl+C.
+    const range = document.createRange();
+    range.selectNodeContents($("#gamelog"));
+    const sel = window.getSelection();
+    sel.removeAllRanges();
+    sel.addRange(range);
+    btn.textContent = "Press Ctrl+C";
+  }
+  setTimeout(() => { btn.textContent = "Copy"; }, 2000);
+};
 
 /* play / stop / steam */
 $("#playbtn").onclick = () => api.post("/api/launch").then(r => {

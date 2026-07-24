@@ -75,6 +75,13 @@ the launcher (Settings → Input).
   feed the game's vertex-readback streaming), which is expected to remove the crash trigger,
   but this hasn't been re-verified on Deck hardware yet. **Leave it off on Steam Deck** unless
   you're specifically testing it.
+- **Windows saves moved to the right place.** Saves and the shader cache used to be written to
+  your **Documents** folder, which is wrong for Windows and breaks badly when Documents is
+  redirected into OneDrive. They now live in `%LOCALAPPDATA%\simpsons` (the local app data
+  folder). If you already had saves in Documents, the engine moves them across automatically
+  the first time you launch it and notes the move in the log — you don't need to do anything.
+  The disposable shader cache is not moved; it just rebuilds. Linux is unchanged
+  (`~/.local/share/simpsons`).
 - Boot logo videos (EA/Fox/Gracie Films) may show green flicker — a bug in the *game's own*
   guest-side video decoder, not something introduced by this port. (THIS SHOULD BE FIXED)
 - In-game audio can sound crunchy under load.
