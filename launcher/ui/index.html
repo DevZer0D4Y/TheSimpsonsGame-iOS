@@ -5,88 +5,95 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>The Simpsons Game — Recompiled</title>
 <style>
+  /* Springfield-at-night palette: one true accent (the game's own nuclear
+     yellow); every other colour is a semantic signal (ready/warn/danger/info)
+     rather than decoration. Warm charcoal neutrals instead of blue-black,
+     square-ish tag labels instead of pills, flat bordered cards with a left
+     accent rail instead of uniform drop shadows. */
   :root{
-    --bg:#0a0c10; --bg-soft:#0f1319;
-    --surface:#161b22; --surface-2:#1c222b; --surface-glass:rgba(22,27,34,.72);
-    --border:rgba(255,255,255,.08); --border-strong:rgba(255,255,255,.16);
-    --text:#eef1f5; --text-dim:#9aa4b2; --text-faint:#6b7480;
-    --yellow:#FFD90F; --yellow-dim:#caa90c;
-    --sky:#57B9E8; --green:#5BC888; --red:#F0654D; --pink:#F06292;
-    --warn-bg:rgba(255,217,15,.10); --warn-border:rgba(255,217,15,.35);
-    --danger-bg:rgba(240,101,77,.12); --danger-border:rgba(240,101,77,.4);
-    --radius:16px; --radius-sm:10px;
-    --shadow:0 8px 24px rgba(0,0,0,.35);
+    --bg:#141110; --bg-vignette: radial-gradient(120% 90% at 50% -10%, rgba(0,0,0,0) 55%, rgba(0,0,0,.55) 100%);
+    --surface:#1c1815; --surface-2:#241f1a; --surface-glass:rgba(28,24,21,.82);
+    --border:rgba(244,232,199,.10); --border-strong:rgba(244,232,199,.22);
+    --text:#f3ead9; --text-dim:#b3a68e; --text-faint:#7d715d;
+    --yellow:#F6C915; --yellow-dim:#c79f10; --yellow-ink:#241a00;
+    --sky:#7FA6B0; --green:#8CB33B; --red:#E2593E; --pink:#F06292;
+    --warn-bg:rgba(246,201,21,.10); --warn-border:rgba(246,201,21,.35);
+    --danger-bg:rgba(226,89,62,.12); --danger-border:rgba(226,89,62,.4);
+    --radius:6px; --radius-sm:4px;
+    --shadow:0 10px 26px rgba(0,0,0,.4);
   }
   *{box-sizing:border-box; margin:0; padding:0}
   html{color-scheme:dark}
-  body{font-family:"Segoe UI", system-ui, -apple-system, "Inter", Arial, sans-serif;
-    background:
-      radial-gradient(1100px 600px at 15% -10%, rgba(87,185,232,.14), transparent 60%),
-      radial-gradient(900px 500px at 100% 0%, rgba(255,217,15,.08), transparent 55%),
-      var(--bg);
-    color:var(--text); min-height:100vh; line-height:1.4;}
+  body{font-family:-apple-system, "Segoe UI", "Noto Sans", "Ubuntu", Roboto, Arial, sans-serif;
+    background:var(--bg-vignette), var(--bg);
+    color:var(--text); min-height:100vh; line-height:1.45;}
 
   .wrap{position:relative; z-index:1; max-width:1120px; margin:0 auto; padding:28px 24px 60px}
-  header{display:flex; align-items:center; gap:16px; margin-bottom:22px}
-  .donut{width:46px;height:46px;border-radius:50%;
+  header{display:flex; align-items:center; gap:16px; margin-bottom:24px}
+  .donut{width:44px;height:44px;border-radius:50%;
     background:radial-gradient(circle at 50% 50%, transparent 0 8px, #E8A33D 8px 10px, var(--pink) 10px 20px, #D5822B 20px 21.5px);
-    position:relative; flex:none; filter:drop-shadow(0 2px 6px rgba(0,0,0,.4)); animation:spinSlow 16s linear infinite}
+    position:relative; flex:none; filter:drop-shadow(0 2px 6px rgba(0,0,0,.5)); animation:spinSlow 16s linear infinite}
   .donut i{position:absolute;width:5px;height:2px;border-radius:2px}
   @keyframes spinSlow{to{transform:rotate(360deg)}}
-  h1{font-size:22px; font-weight:800; letter-spacing:.3px; color:var(--text)}
-  h1 small{display:block; font-size:11px; font-weight:700; color:var(--yellow); letter-spacing:3px; margin-top:2px}
+  h1{font-size:19px; font-weight:800; letter-spacing:1.5px; text-transform:uppercase; color:var(--text)}
+  h1 small{display:block; font-size:10.5px; font-weight:700; color:var(--yellow); letter-spacing:4px; margin-top:3px}
   .headerspacer{flex:1}
-  .verchip{font-size:12px; color:var(--text-faint); font-weight:600; border:1px solid var(--border);
-    padding:5px 11px; border-radius:999px; background:var(--surface)}
+  .verchip{font-family:"SF Mono", Consolas, monospace; font-size:11.5px; color:var(--text-faint); font-weight:600;
+    border:1px solid var(--border); padding:5px 10px; border-radius:var(--radius-sm); background:var(--surface)}
 
-  nav{display:flex; gap:6px; margin-bottom:20px; flex-wrap:wrap; border-bottom:1px solid var(--border); padding-bottom:0}
-  nav button{font-family:inherit; font-size:13.5px; font-weight:700; letter-spacing:.2px; border:none;
-    background:transparent; color:var(--text-dim); padding:11px 16px; cursor:pointer;
-    border-bottom:2px solid transparent; transition:color .15s, border-color .15s;}
+  nav{display:flex; gap:2px; margin-bottom:22px; flex-wrap:wrap; border-bottom:1px solid var(--border); padding-bottom:0}
+  nav button{font-family:inherit; font-size:12.5px; font-weight:800; letter-spacing:1px; text-transform:uppercase; border:none;
+    background:transparent; color:var(--text-dim); padding:12px 18px; cursor:pointer;
+    border-bottom:3px solid transparent; transition:color .15s, border-color .15s;}
   nav button:hover{color:var(--text)}
   nav button.active{color:var(--yellow); border-bottom-color:var(--yellow)}
 
-  .card{background:var(--surface); border:1px solid var(--border); border-radius:var(--radius);
-        box-shadow:var(--shadow); padding:22px; margin-bottom:16px}
-  h2{font-size:15px; font-weight:800; letter-spacing:.4px; margin-bottom:14px; color:var(--text)}
-  h3{font-size:12.5px; font-weight:800; letter-spacing:.6px; text-transform:uppercase; margin:20px 0 12px; color:var(--sky)}
+  .card{background:var(--surface); border:1px solid var(--border); border-left:3px solid var(--border-strong);
+        border-radius:var(--radius); padding:22px; margin-bottom:16px}
+  h2{font-size:13px; font-weight:800; letter-spacing:1.6px; text-transform:uppercase; margin-bottom:16px; color:var(--text);
+     display:flex; align-items:center; gap:9px}
+  h2::before{content:""; width:8px; height:8px; background:var(--yellow); flex:none}
+  h3{font-size:11.5px; font-weight:800; letter-spacing:1.4px; text-transform:uppercase; margin:22px 0 12px; color:var(--sky)}
 
-  .hero{position:relative; border:1px solid var(--border); border-radius:var(--radius); overflow:hidden;
-        height:340px; box-shadow:var(--shadow); background:#0d0f12}
+  .hero{position:relative; border:1px solid var(--border); border-top:3px solid var(--yellow); border-radius:var(--radius); overflow:hidden;
+        height:340px; box-shadow:var(--shadow); background:#100e0c}
   .hero img{width:100%; height:100%; object-fit:cover; display:block; transition:opacity .8s}
   .hero .scrim{position:absolute; inset:0;
-       background:linear-gradient(180deg, rgba(10,12,16,.15) 30%, rgba(10,12,16,.92) 100%)}
+       background:linear-gradient(180deg, rgba(14,12,10,.1) 30%, rgba(14,12,10,.94) 100%)}
   .hero .inner{position:absolute; left:26px; right:26px; bottom:22px; display:flex;
        align-items:flex-end; justify-content:space-between; gap:14px}
-  .playbtn{font-family:inherit; font-size:16px; font-weight:800; letter-spacing:.5px; padding:15px 40px;
-    border-radius:var(--radius-sm); border:none; background:var(--yellow); color:#1a1300; cursor:pointer;
-    box-shadow:0 4px 18px rgba(255,217,15,.35); transition:transform .1s, box-shadow .1s;}
-  .playbtn:hover:not(:disabled){transform:translateY(-1px); box-shadow:0 6px 22px rgba(255,217,15,.45)}
-  .playbtn:disabled{background:#3a3f47; color:var(--text-faint); cursor:not-allowed; box-shadow:none}
-  .stopbtn{font-family:inherit; font-size:13px; font-weight:700; padding:11px 18px; border-radius:var(--radius-sm);
+  .playbtn{font-family:inherit; font-size:15px; font-weight:800; letter-spacing:2px; text-transform:uppercase; padding:16px 42px;
+    border-radius:var(--radius-sm); border:none; background:var(--yellow); color:var(--yellow-ink); cursor:pointer;
+    transition:transform .1s, background .1s;}
+  .playbtn:hover:not(:disabled){transform:translateY(-1px); background:#ffd530}
+  .playbtn:disabled{background:#3a352c; color:var(--text-faint); cursor:not-allowed}
+  .stopbtn{font-family:inherit; font-size:12.5px; font-weight:800; letter-spacing:1px; text-transform:uppercase; padding:12px 18px; border-radius:var(--radius-sm);
     border:1px solid var(--danger-border); background:var(--danger-bg); color:#ffb4a4; cursor:pointer;}
-  .statusline{color:var(--text); font-weight:600; font-size:13.5px; opacity:.9}
+  .statusline{color:var(--text); font-weight:600; font-size:13.5px; opacity:.92}
   .banner{display:flex; gap:12px; align-items:center; background:var(--surface-2);
     border:1px solid var(--border); border-radius:var(--radius-sm); padding:12px 16px; margin-top:14px;
     font-size:13px; color:var(--text-dim);}
-  .banner.kbm{border-color:rgba(91,200,136,.35); background:rgba(91,200,136,.08); color:#bfe9cf}
+  .banner.kbm{border-color:rgba(140,179,59,.35); background:rgba(140,179,59,.08); color:#d3e6ae}
   .banner .em{font-size:19px}
-  .badges{display:flex; gap:8px; margin-top:14px; flex-wrap:wrap}
-  .badge{font-weight:700; font-size:11.5px; letter-spacing:.3px; border:1px solid var(--border);
-    padding:6px 12px; border-radius:999px; background:var(--surface-2); color:var(--text-dim)}
-  .badge.ready{background:rgba(91,200,136,.14); border-color:rgba(91,200,136,.35); color:#a6e9c1}
-  .badge.experimental{background:rgba(255,217,15,.12); border-color:rgba(255,217,15,.35); color:var(--yellow)}
-  .badge .dot{display:inline-block;width:7px;height:7px;border-radius:50%;
-    background:currentColor; margin-right:6px; opacity:.9}
+  .badges{display:flex; gap:10px; margin-top:14px; flex-wrap:wrap}
+  .badge{font-weight:800; font-size:10.5px; letter-spacing:.8px; text-transform:uppercase; border:1px solid var(--border);
+    border-left:3px solid var(--text-faint); padding:6px 11px 6px 9px; border-radius:2px; background:var(--surface-2); color:var(--text-dim)}
+  .badge.ready{background:rgba(140,179,59,.12); border-color:rgba(140,179,59,.3); border-left-color:var(--green); color:#cfe4a4}
+  .badge.experimental{background:rgba(246,201,21,.1); border-color:rgba(246,201,21,.3); border-left-color:var(--yellow); color:var(--yellow)}
+  .badge .dot{display:none}
 
   /* disclaimer / warning callouts */
   .callout{border-radius:var(--radius-sm); padding:14px 16px; font-size:13px; line-height:1.55;
-    display:flex; gap:12px; align-items:flex-start; margin-bottom:14px}
-  .callout .em{font-size:19px; flex:none; line-height:1}
+    display:flex; gap:14px; align-items:flex-start; margin-bottom:14px}
+  .callout .tag{flex:none; font-family:"SF Mono", Consolas, monospace; font-size:10px; font-weight:800;
+    letter-spacing:1px; text-transform:uppercase; padding:3px 7px; border-radius:2px; margin-top:1px}
   .callout b{color:var(--text)}
-  .callout.warn{background:var(--warn-bg); border:1px solid var(--warn-border); color:#f2e7b8}
-  .callout.danger{background:var(--danger-bg); border:1px solid var(--danger-border); color:#f5c6bb}
-  .callout.info{background:rgba(87,185,232,.08); border:1px solid rgba(87,185,232,.3); color:#c9e6f5}
+  .callout.warn{background:var(--warn-bg); border:1px solid var(--warn-border); border-left:3px solid var(--yellow); color:#f2e7b8}
+  .callout.warn .tag{background:rgba(246,201,21,.18); color:var(--yellow)}
+  .callout.danger{background:var(--danger-bg); border:1px solid var(--danger-border); border-left:3px solid var(--red); color:#f5c6bb}
+  .callout.danger .tag{background:rgba(226,89,62,.2); color:#ff9782}
+  .callout.info{background:rgba(127,166,176,.08); border:1px solid rgba(127,166,176,.3); border-left:3px solid var(--sky); color:#cfe1e5}
+  .callout.info .tag{background:rgba(127,166,176,.2); color:var(--sky)}
   .footer-legal{margin-top:26px; padding-top:18px; border-top:1px solid var(--border);
     font-size:11.5px; color:var(--text-faint); line-height:1.6; text-align:center}
 
@@ -96,7 +103,7 @@
   .field select,.field input[type=text],.field input[type=number]{
     width:100%; font-family:inherit; font-weight:600; font-size:13.5px; padding:10px 12px; color:var(--text);
     border:1px solid var(--border); border-radius:var(--radius-sm); background:var(--surface-2);}
-  .field select:focus,.field input:focus{outline:none; border-color:var(--sky)}
+  .field select:focus,.field input:focus{outline:none; border-color:var(--yellow)}
   /* Custom dropdown: native <select> popups are separate OS-level popup
      windows, and that class of popup is known to fail to render (or render
      off-screen) inside an embedded QWebEngineView window on Linux/Wayland.
@@ -108,64 +115,66 @@
   .customselect-trigger{width:100%; display:flex; align-items:center; justify-content:space-between; gap:10px;
     font-family:inherit; font-weight:600; font-size:13.5px; padding:10px 12px; color:var(--text); text-align:left;
     border:1px solid var(--border); border-radius:var(--radius-sm); background:var(--surface-2); cursor:pointer;}
-  .customselect-trigger:focus{outline:none; border-color:var(--sky)}
+  .customselect-trigger:focus{outline:none; border-color:var(--yellow-dim)}
   .customselect-trigger .arrow{color:var(--text-faint); font-size:11px; transition:transform .15s}
-  .customselect.open .customselect-trigger{border-color:var(--sky)}
+  .customselect.open .customselect-trigger{border-color:var(--yellow-dim)}
   .customselect.open .customselect-trigger .arrow{transform:rotate(180deg)}
   .customselect-panel{display:none; position:absolute; left:0; right:0; top:calc(100% + 4px); z-index:40;
     background:var(--surface-2); border:1px solid var(--border); border-radius:var(--radius-sm);
     box-shadow:var(--shadow); max-height:260px; overflow-y:auto; padding:4px;}
   .customselect.open .customselect-panel{display:block}
-  .customselect-option{padding:9px 10px; border-radius:6px; font-size:13.5px; font-weight:600; color:var(--text);
+  .customselect-option{padding:9px 10px; border-radius:2px; font-size:13.5px; font-weight:600; color:var(--text);
     cursor:pointer; white-space:normal; line-height:1.4;}
-  .customselect-option:hover,.customselect-option.hl{background:var(--surface-3, rgba(255,255,255,.06))}
-  .customselect-option.sel{color:var(--sky)}
+  .customselect-option:hover,.customselect-option.hl{background:var(--surface-3, rgba(244,232,199,.07))}
+  .customselect-option.sel{color:var(--yellow)}
   .field .hint{font-weight:500; color:var(--text-faint); font-size:11.5px; margin-top:6px; line-height:1.5}
-  .field input[type=range]{width:100%; accent-color:var(--sky)}
+  .field input[type=range]{width:100%; accent-color:var(--yellow)}
   .switch{display:flex; align-items:center; gap:10px; cursor:pointer; user-select:none; color:var(--text)}
-  .switch input{width:18px;height:18px; accent-color:var(--sky)}
-  .savebtn{margin-top:18px; font-family:inherit; font-size:14px; font-weight:800; padding:12px 28px;
-    border-radius:var(--radius-sm); border:none; background:var(--green); color:#08210f;
-    cursor:pointer; box-shadow:0 4px 14px rgba(91,200,136,.3)}
-  .saved{color:#a6e9c1; font-weight:700; margin-left:12px; font-size:13px}
+  .switch input{width:18px;height:18px; accent-color:var(--yellow)}
+  .savebtn{margin-top:18px; font-family:inherit; font-size:13px; font-weight:800; letter-spacing:1px; text-transform:uppercase;
+    padding:13px 30px; border-radius:var(--radius-sm); border:none; background:var(--green); color:#0d1c04; cursor:pointer;}
+  .saved{color:#cfe4a4; font-weight:700; margin-left:12px; font-size:13px}
 
-  .console{background:#06070a; color:#9fd0ef; font:12px/1.55 "SF Mono", Consolas, monospace; border-radius:var(--radius-sm);
+  .console{background:#0a0806; color:#d9c9a0; font:12px/1.55 "SF Mono", Consolas, monospace; border-radius:var(--radius-sm);
     border:1px solid var(--border); padding:14px; height:200px; overflow-y:auto;
     white-space:pre-wrap; word-break:break-all}
-  .console:focus{outline:1px solid var(--border); outline-offset:2px}
-  .minibtn{font-family:inherit; font-size:11px; font-weight:700; letter-spacing:.04em; padding:4px 10px;
-    margin-left:12px; border-radius:var(--radius-sm); border:1px solid var(--border);
-    background:transparent; color:var(--muted); cursor:pointer; vertical-align:middle}
-  .minibtn:hover{color:#fff; border-color:#7aa7c7}
+  .console:focus{outline:1px solid var(--border-strong); outline-offset:2px}
+  .minibtn{font-family:inherit; font-size:10.5px; font-weight:800; letter-spacing:.6px; text-transform:uppercase;
+    padding:4px 10px; margin-left:12px; border-radius:var(--radius-sm); border:1px solid var(--border);
+    background:transparent; color:var(--text-dim); cursor:pointer; vertical-align:middle}
+  .minibtn:hover{color:var(--text); border-color:var(--yellow-dim)}
   .row{display:flex; gap:10px; align-items:center; flex-wrap:wrap}
   .row input[type=text]{flex:1; min-width:200px}
-  .bigbtn{font-family:inherit; font-size:13.5px; font-weight:700; padding:11px 20px; border-radius:var(--radius-sm);
+  .bigbtn{font-family:inherit; font-size:12.5px; font-weight:800; letter-spacing:.6px; text-transform:uppercase;
+    padding:11px 20px; border-radius:var(--radius-sm);
     border:1px solid var(--border-strong); background:var(--surface-2); color:var(--text); cursor:pointer;
     white-space:nowrap; transition:background .15s, border-color .15s;}
-  .bigbtn:hover:not(:disabled){background:#242b35; border-color:var(--sky)}
-  .bigbtn.alt{background:var(--sky); color:#05202e; border-color:var(--sky)}
-  .bigbtn.gold{background:var(--yellow); color:#1a1300; border-color:var(--yellow)}
-  .bigbtn:disabled{background:#20242b; color:var(--text-faint); cursor:not-allowed; border-color:var(--border)}
-  .smallbtn{font-family:inherit; font-weight:700; font-size:11.5px; padding:7px 13px;
-    border-radius:8px; border:1px solid var(--border-strong); background:var(--surface-2); color:var(--text); cursor:pointer}
-  .ok{color:#a6e9c1} .err{color:#f5988a}
+  .bigbtn:hover:not(:disabled){background:#2c2620; border-color:var(--yellow-dim)}
+  .bigbtn.alt{background:var(--sky); color:#0a1214; border-color:var(--sky)}
+  .bigbtn.gold{background:var(--yellow); color:var(--yellow-ink); border-color:var(--yellow)}
+  .bigbtn:disabled{background:#221e19; color:var(--text-faint); cursor:not-allowed; border-color:var(--border)}
+  .smallbtn{font-family:inherit; font-weight:800; letter-spacing:.4px; text-transform:uppercase; font-size:10.5px; padding:7px 12px;
+    border-radius:var(--radius-sm); border:1px solid var(--border-strong); background:var(--surface-2); color:var(--text); cursor:pointer}
+  .ok{color:#cfe4a4} .err{color:#f5988a}
   .muted{color:var(--text-dim); font-size:13.5px; line-height:1.6}
-  .lockart{font-size:50px; text-align:center; padding:20px 0 6px; opacity:.7}
-  a{color:var(--sky); text-decoration:none} a:hover{text-decoration:underline}
+  .lockart{font-family:"SF Mono", Consolas, monospace; font-size:11px; font-weight:800; letter-spacing:2px;
+    text-transform:uppercase; text-align:center; padding:18px 0 4px; color:var(--text-faint)}
+  a{color:var(--sky); text-decoration:none} a:hover{text-decoration:underline; color:#9dc0ca}
   .hidden{display:none}
 
   table{width:100%; border-collapse:collapse; font-size:12.5px}
   td,th{border-bottom:1px solid var(--border); padding:9px 6px; text-align:left; color:var(--text-dim)}
+  th{font-weight:800; letter-spacing:.6px; text-transform:uppercase; font-size:10.5px; color:var(--text-faint)}
 
   /* file browser modal */
-  .modal{position:fixed; inset:0; background:rgba(0,0,0,.65); z-index:50;
+  .modal{position:fixed; inset:0; background:rgba(0,0,0,.7); z-index:50;
     display:flex; align-items:center; justify-content:center; backdrop-filter:blur(3px)}
   .modal.hidden{display:none}
-  .modal .box{background:var(--surface); border:1px solid var(--border-strong); border-radius:var(--radius);
+  .modal .box{background:var(--surface); border:1px solid var(--border-strong); border-top:3px solid var(--yellow); border-radius:var(--radius);
     width:640px; max-width:92vw; max-height:80vh; display:flex; flex-direction:column;
-    box-shadow:0 20px 60px rgba(0,0,0,.5)}
+    box-shadow:0 20px 60px rgba(0,0,0,.55)}
   .modal .head{padding:16px 20px; border-bottom:1px solid var(--border);
-    display:flex; justify-content:space-between; align-items:center; font-weight:700}
+    display:flex; justify-content:space-between; align-items:center; font-weight:800; letter-spacing:.4px}
   .modal .path{font-family:monospace; font-size:11.5px; color:var(--text-faint); padding:8px 20px;
     border-bottom:1px solid var(--border); word-break:break-all}
   .modal .list{overflow-y:auto; flex:1; padding:6px 0}
@@ -189,13 +198,13 @@
   </header>
 
   <nav>
-    <button data-tab="play" class="active">▶ Play</button>
-    <button data-tab="install">💿 Install</button>
-    <button data-tab="settings">⚙ Settings</button>
-    <button data-tab="patches">🩹 Patches</button>
-    <button data-tab="mods">🧩 Mods</button>
-    <button data-tab="support">🩺 Support</button>
-    <button data-tab="about">ℹ About</button>
+    <button data-tab="play" class="active">Play</button>
+    <button data-tab="install">Install</button>
+    <button data-tab="settings">Settings</button>
+    <button data-tab="patches">Patches</button>
+    <button data-tab="mods">Mods</button>
+    <button data-tab="support">Support</button>
+    <button data-tab="about">About</button>
   </nav>
 
   <!-- ============================= PLAY ============================= -->
@@ -212,12 +221,11 @@
       </div>
     </div>
     <div class="banner" id="inputbanner">
-      <span class="em">🎮</span>
       <span id="inputbannertext">A controller is currently <u>required</u> — keyboard &amp; mouse can be enabled in Settings → Input (experimental).</span>
     </div>
     <div class="badges" id="platformbadges"></div>
     <div class="row" style="margin-top:14px">
-      <button class="bigbtn" id="steambtn">🎮 Add to Steam (Gaming Mode)</button>
+      <button class="bigbtn" id="steambtn">Add to Steam (Gaming Mode)</button>
       <span class="muted" id="steammsg"></span>
     </div>
     <div class="card" style="margin-top:16px">
@@ -231,7 +239,7 @@
   <!-- ============================ INSTALL =========================== -->
   <section id="tab-install" class="hidden">
     <div class="callout info">
-      <span class="em">💿</span>
+      <span class="tag">Note</span>
       <div>This project ships <b>no copyrighted game files</b>. Provide an ISO of
       <b>The Simpsons Game (Xbox 360)</b> that <b>you personally own</b> — the launcher reads
       your disc image locally and installs it next to the recompiled engine. Nothing is
@@ -241,7 +249,7 @@
       <h2>INSTALL FROM YOUR GAME DISC</h2>
       <div class="row">
         <input type="text" id="isopath" placeholder="/path/to/Simpsons_Game.iso">
-        <button class="bigbtn alt" id="browsebtn">📂 Browse…</button>
+        <button class="bigbtn alt" id="browsebtn">Browse…</button>
         <button class="bigbtn gold" id="installbtn">Extract &amp; Install</button>
       </div>
       <p class="muted" id="installstate" style="margin-top:10px"></p>
@@ -250,7 +258,7 @@
     <div class="card">
       <h2>SAVE DATA</h2>
       <div class="row">
-        <button class="bigbtn" id="backupbtn">💾 Back up saves</button>
+        <button class="bigbtn" id="backupbtn">Back up saves</button>
         <span class="muted" id="backupmsg"></span>
       </div>
       <table id="backuptable" style="margin-top:12px"></table>
@@ -284,7 +292,7 @@
             <option value="1440p">1440p</option>
             <option value="4k">4K</option>
           </select>
-          <div class="hint">⚠ Experimental — changes the game's internal video mode; can crash some scenes. Use Automatic if unstable. Restart needed.</div>
+          <div class="hint">Experimental — changes the game's internal video mode; can crash some scenes. Use Automatic if unstable. Restart needed.</div>
         </div>
         <div class="field">
           <label class="switch"><input type="checkbox" id="s-vsync"> VSync</label>
@@ -385,13 +393,13 @@
         </div>
       </div>
     </div>
-    <button class="savebtn" id="savebtn">Save Settings</button><span class="saved hidden" id="savedmark">✔ saved — restart the game for some changes</span>
+    <button class="savebtn" id="savebtn">Save Settings</button><span class="saved hidden" id="savedmark">Saved — restart the game for some changes</span>
   </section>
 
   <!-- ============================ PATCHES =========================== -->
   <section id="tab-patches" class="hidden">
     <div class="callout warn" id="popin-warning">
-      <span class="em">⚠</span>
+      <span class="tag">Warning</span>
       <div><b>Steam Deck players:</b> the "Instant character pop-in" patch below is known to
       <b>hang the GPU and crash the whole desktop session</b> on Steam Deck's AMD hardware —
       this reproduces identically whether you're on SteamOS or Steam Deck's own Windows
@@ -410,8 +418,8 @@
   <!-- ============================= MODS ============================= -->
   <section id="tab-mods" class="hidden">
     <div class="card">
-      <div class="lockart">🔒🍩</div>
-      <h2 style="text-align:center">MODS — COMING SOON</h2>
+      <div class="lockart">Not yet available</div>
+      <h2 style="justify-content:center">MODS — COMING SOON</h2>
       <p class="muted" style="text-align:center">
         A mod loader (texture packs, model swaps, gameplay tweaks) is planned.<br>
         Drop files into <code>launcher/mods/</code> — they'll be listed here, ready for the loader.
@@ -423,7 +431,7 @@
   <!-- ============================ SUPPORT =========================== -->
   <section id="tab-support" class="hidden">
     <div class="callout info">
-      <span class="em">🩺</span>
+      <span class="tag">Help</span>
       <div>Game crashing, showing a <b>black screen</b>, or stuttering? Turn on diagnostic
       logging below, play until the problem happens, then create a <b>support bundle</b> and
       attach it to a GitHub issue. Everything stays on your machine until you decide to
@@ -452,7 +460,7 @@
         <a href="#" target="_blank" rel="noopener" id="issueslink">GitHub issue</a>.
         It contains no save data and no game content, and nothing is uploaded automatically.</p>
       <div class="row" style="margin-top:12px">
-        <button class="bigbtn gold" id="bundlebtn">📦 Create support bundle</button>
+        <button class="bigbtn gold" id="bundlebtn">Create support bundle</button>
         <span class="muted" id="bundlemsg"></span>
       </div>
     </div>
@@ -463,14 +471,14 @@
     <div class="card" id="updatecard">
       <h2>UPDATES</h2>
       <div class="row">
-        <button class="bigbtn" id="updatebtn">🔄 Check for updates</button>
-        <button class="bigbtn gold hidden" id="applyupdatebtn">⬇ Update now</button>
+        <button class="bigbtn" id="updatebtn">Check for updates</button>
+        <button class="bigbtn gold hidden" id="applyupdatebtn">Update now</button>
         <span class="muted" id="updatemsg"></span>
       </div>
     </div>
 
     <div class="callout danger">
-      <span class="em">⚖</span>
+      <span class="tag">Legal</span>
       <div><b>Ownership &amp; legal notice.</b> <i>The Simpsons Game</i> © 2007 Electronic Arts /
       Fox. This is an unaffiliated, non-commercial preservation/compatibility project — it is
       not endorsed by, sponsored by, or affiliated with EA, Fox, or any rightsholder. It
@@ -519,12 +527,12 @@
      release is found; the About tab keeps the manual path) -->
 <div class="modal hidden" id="updatemodal">
   <div class="box" style="width:520px">
-    <div class="head"><b>🍩 Update available</b>
-      <button class="smallbtn" id="updatelater">✕ Later</button></div>
+    <div class="head"><b>Update available</b>
+      <button class="smallbtn" id="updatelater">Later</button></div>
     <div style="padding:20px">
       <p class="muted" id="updatemodaltext" style="margin-bottom:16px"></p>
       <div class="row">
-        <button class="bigbtn gold" id="updatenowbtn">⬇ Update now</button>
+        <button class="bigbtn gold" id="updatenowbtn">Update now</button>
         <span class="muted" id="updatemodalprogress"></span>
       </div>
     </div>
@@ -535,7 +543,7 @@
 <div class="modal hidden" id="browsemodal">
   <div class="box">
     <div class="head"><b>Choose your game ISO</b>
-      <button class="smallbtn" id="browseclose">✕ Close</button></div>
+      <button class="smallbtn" id="browseclose">Close</button></div>
     <div class="path" id="browsepath"></div>
     <div class="list" id="browselist"></div>
   </div>
@@ -693,9 +701,9 @@ async function refresh(){
       if (iStuck) ilog.scrollTop = 1e9;
     }
     $("#installbtn").disabled = inst.running;
-    $("#installstate").innerHTML = inst.running ? "⏳ Working…" :
-      inst.ok === true ? '<span class="ok">✔ Installed successfully!</span>' :
-      inst.ok === false ? '<span class="err">✘ Install failed — see log below.</span>' :
+    $("#installstate").innerHTML = inst.running ? "Working…" :
+      inst.ok === true ? '<span class="ok">Installed successfully.</span>' :
+      inst.ok === false ? '<span class="err">Install failed — see log below.</span>' :
       st.gamedata_ready ? "Game data is installed. You can re-install over it from another ISO." :
       "No game data found yet.";
     /* backups */
@@ -704,7 +712,7 @@ async function refresh(){
        <td><button class="smallbtn" onclick="restoreSave('${b.name}')">Restore</button></td></tr>`).join("") ||
       "<tr><td class='muted'>No backups yet.</td></tr>";
     /* mods */
-    $("#modtable").innerHTML = (st.mods||[]).map(m => `<tr><td>🧩 ${m}</td><td class="muted">waiting for mod loader</td></tr>`).join("") ||
+    $("#modtable").innerHTML = (st.mods||[]).map(m => `<tr><td>${m}</td><td class="muted">waiting for mod loader</td></tr>`).join("") ||
       "<tr><td class='muted'>No mod files found.</td></tr>";
     /* patches */
     $("#patchlist").innerHTML = (st.patches||[]).map(p => `
@@ -834,10 +842,10 @@ async function loadBrowse(path){
     div.onclick = fn;
     list.appendChild(div);
   };
-  if (d.up !== null && d.path) addEntry("⬆ ..", "", () => loadBrowse(d.up));
+  if (d.up !== null && d.path) addEntry("..", "", () => loadBrowse(d.up));
   for (const e of d.entries){
-    if (e.dir) addEntry("📁 " + e.name, "", () => loadBrowse(e.path));
-    else addEntry("💿 " + e.name, e.size_mb + " MB", () => pickIso(e.path));
+    if (e.dir) addEntry(e.name, "", () => loadBrowse(e.path));
+    else addEntry(e.name, e.size_mb + " MB", () => pickIso(e.path));
   }
   if (!d.entries.length && !(d.up !== null && d.path)){
     const div = document.createElement("div"); div.className = "entry muted";
@@ -849,13 +857,13 @@ function pickIso(p){ $("#isopath").value = p; closeBrowse(); }
 /* saves */
 $("#backupbtn").onclick = async () => {
   const r = await api.post("/api/backup-saves");
-  $("#backupmsg").textContent = r.ok ? "✔ " + r.msg : r.msg;
+  $("#backupmsg").textContent = r.msg;
   refresh();
 };
 async function restoreSave(name){
   if (!confirm("Restore this backup? Current saves will be overwritten.")) return;
   const r = await api.post("/api/restore-saves", {name});
-  $("#backupmsg").textContent = r.ok ? "✔ restored" : r.msg;
+  $("#backupmsg").textContent = r.ok ? "Restored." : r.msg;
 }
 
 /* patches */
@@ -900,7 +908,7 @@ async function refreshDiag(){
     $("#diagsummary").innerHTML =
       "<table>" + rows.map(r => `<tr><th style="width:170px">${r[0]}</th><td>${r[1]}</td></tr>`).join("") + "</table>" +
       `<div class="callout ${okExit ? "info" : "warn"}" style="margin:12px 0 0">` +
-      `<span class="em">${okExit ? "✅" : "⚠"}</span><div>${s.diagnosis || ""}</div></div>`;
+      `<span class="tag">${okExit ? "OK" : "Issue"}</span><div>${s.diagnosis || ""}</div></div>`;
   }
   $("#diaglog").textContent = (d.tail && d.tail.length) ? d.tail.join("\n") : "–";
   $("#diaglog").scrollTop = 1e9;
@@ -914,7 +922,7 @@ $("#diagtoggle").onchange = async e => {
 $("#bundlebtn").onclick = async () => {
   $("#bundlemsg").textContent = "packing…";
   const r = await api.post("/api/support-bundle").catch(()=>({ok:false, msg:"request failed"}));
-  $("#bundlemsg").textContent = r.ok ? "✔ saved: " + r.msg : "✘ " + (r.msg || "failed");
+  $("#bundlemsg").textContent = r.ok ? "Saved: " + r.msg : (r.msg || "failed");
 };
 
 /* automatic update prompt: the backend checks GitHub in the background at
