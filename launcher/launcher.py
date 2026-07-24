@@ -38,7 +38,7 @@ from pathlib import Path
 # at build time, so packaged builds always know exactly which release they
 # are (otherwise every launcher shipped inside vX.Y.Z.W would compare itself
 # against its own release and nag "update available" forever).
-VERSION = "0.0.4.1"
+VERSION = "0.0.5"
 
 FROZEN = getattr(sys, "frozen", False)
 if FROZEN:
@@ -811,7 +811,12 @@ def apply_update():
                 else:
                     dst.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(src, dst)
-                installed.append(rel_dst or rel_src)
+                # Normalise to a string: UPDATE_MANAGED_PATHS supplies plain
+                # strings, but the glob pass below hands us a Path. Mixing the
+                # two blew up the "Installed: ..." join at the end -- after the
+                # files had already been copied -- so a successful update was
+                # reported as a failure.
+                installed.append(Path(rel_dst or rel_src).as_posix())
 
             for rel in UPDATE_MANAGED_PATHS:
                 install_one(rel)
