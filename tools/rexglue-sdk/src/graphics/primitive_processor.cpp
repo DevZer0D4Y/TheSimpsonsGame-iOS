@@ -1524,7 +1524,13 @@ std::pair<uint32_t, uint32_t> PrimitiveProcessor::MemoryInvalidationCallback(
           // the specified range.
           if (entry_key.base < physical_address_end) {
             uint32_t entry_end = entry_key.base + entry_key.GetSizeBytes();
-            if (entry_end > physical_address_end) {
+            // Half-open interval overlap: the entry survives only if it ends at
+            // or before the invalidated range starts. Comparing against the
+            // range END instead kept every entry the write fully covered --
+            // that is, the common case of the guest rewriting a whole index
+            // buffer in place -- so those draws kept reusing stale converted
+            // indices.
+            if (entry_end > physical_address_start) {
               // Invalidate the entry.
               any_invalidated = true;
               // Remove the entry from the cache map.

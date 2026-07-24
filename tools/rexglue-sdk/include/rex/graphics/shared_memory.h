@@ -189,16 +189,25 @@ class SharedMemory {
   // Things below should be fully protected by global_critical_region.
   // ***************************************************************************
 
-  // Double-buffered valid-page flags for lockless checks in RequestRanges.
-  std::vector<uint64_t> valid_buffer_a_;
-  std::vector<uint64_t> valid_buffer_b_;
-  std::atomic<uint64_t*> active_valid_flags_{nullptr};
-  std::atomic<uint64_t*> staging_valid_flags_{nullptr};
+  // Valid-page flags. Every mutation happens under global_critical_region;
+  // the all-valid fast path in RequestRanges reads them without the lock,
+  // which is why the storage is a stable allocation whose address never
+  // changes for the lifetime of the buffer.
+  //
+  // This used to be double-buffered with an active/staging pointer swap at
+  // frame end so the frame-end refresh could run lock-free. That was unsound:
+  // the swap raced guest-thread invalidations (which load the active pointer
+  // under the lock, then clear bits through it), so a clear could land in the
+  // buffer being retired while the promoted buffer kept a stale VALID bit for
+  // a page the guest had just rewritten. RequestRanges then took its
+  // all-valid fast path and skipped the upload entirely, leaving the GPU
+  // reading the previous frame's bytes for that page. Refreshing only "dirty"
+  // 16 MB superblocks made it worse: untouched superblocks of the promoted
+  // buffer were a two-frame-old snapshot.
+  std::vector<uint64_t> system_page_flags_valid_;
+  std::atomic<uint64_t*> valid_flags_{nullptr};
   // Subset of valid pages containing data written by the GPU.
   std::vector<uint64_t> system_page_flags_valid_and_gpu_written_;
-  // Dirty state tracking for frame-end page-state refresh.
-  std::atomic<bool> gpu_written_data_dirty_{false};
-  std::atomic<uint32_t> dirty_blocks_{0};
   uint32_t num_system_page_flags_ = 0;
 
   static std::pair<uint32_t, uint32_t> MemoryInvalidationCallbackThunk(

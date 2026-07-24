@@ -78,13 +78,22 @@ the launcher (Settings → Input).
 - Boot logo videos (EA/Fox/Gracie Films) may show green flicker — a bug in the *game's own*
   guest-side video decoder, not something introduced by this port. (THIS SHOULD BE FIXED)
 - In-game audio can sound crunchy under load.
-- Main menu UI flicker was traced to the Vulkan presenter defaulting to tearing-permitted
-  ("immediate") presentation; it now prefers a tear-free present mode (mailbox) when the driver
-  supports it, same latency characteristics either way. On drivers that don't offer mailbox,
-  the launcher's VSync setting (on by default) now also rules out the tearing-permitted
-  fallback modes, so presentation lands on classic vsync instead of silently tearing. The
-  engine log's "Created … swapchain" line now names the mode in plain words if you want to
-  check what your driver picked. Report back if you still see flicker with VSync on.
+- **Main menu flicker / UI elements flying around.** Two separate bugs wore this costume:
+  1. *Tearing.* The Vulkan presenter defaulted to tearing-permitted ("immediate") presentation.
+     It now prefers a tear-free mode (mailbox), and on drivers that don't offer mailbox the
+     launcher's VSync setting (on by default) rules out the tearing-permitted fallbacks too, so
+     presentation lands on classic vsync instead of silently tearing. The engine log's
+     "Created … swapchain" line names the chosen mode in plain words if you want to check.
+  2. *Menu elements jumping to wrong positions while navigating.* This one wasn't presentation
+     at all — it was a cache-coherence race in the engine's guest-memory mirror. The table
+     tracking which memory pages still need re-uploading to the GPU was double-buffered and
+     swapped once per frame *without* the lock every other writer holds, so a page the game had
+     just rewritten could keep a stale "already uploaded" mark. The engine then skipped that
+     upload and the GPU drew the previous frame's vertex data — scattered UI quads landing at
+     last frame's positions for a frame or two, which is why it showed up while moving through
+     the menu and not while sitting still. The page table is now a single lock-protected copy
+     (matching upstream Xenia's semantics), which cannot go stale. Please report whether this
+     clears it up.
 - The framerate setting (Settings → Framerate) applies the same guest instruction patch as the
   community's own 60 FPS unlock for this game (verified against the `xenia-canary/game-patches`
   entry for this title) on top of reporting a higher display refresh rate — both were required;
@@ -121,6 +130,12 @@ own, and the current renderer always remains as a working fallback.
   Known issues).
 - **Guaranteed tear-free presentation**: with VSync on, the presenter can no longer silently
   fall back to a tearing-permitted mode on drivers without mailbox support.
+- **Fixed stale-geometry corruption** (menu elements flying to wrong positions): the
+  valid-page table behind the guest-memory→GPU mirror was swapped between two buffers each
+  frame without holding the lock its other writers use, so an invalidation could be lost and a
+  rewritten page stay marked "already uploaded" — the GPU then drew last frame's vertices.
+  Collapsed to one lock-protected table. A matching interval-overlap bug in the converted-index
+  cache (which skipped invalidating any entry a write fully covered) was fixed alongside it.
 - **GPU thread no longer burns a core while idle**: the command processor used to spin-yield
   aggressively whenever the ring drained, competing with the recompiled game code for CPU; it
   now naps on its wake event (microsecond wake-up) after a short spin. Guest-side GPU waits
