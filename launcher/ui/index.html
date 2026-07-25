@@ -454,6 +454,23 @@
       <p class="muted" id="diagdir" style="margin-top:8px"></p>
     </div>
     <div class="card">
+      <h2>PERFORMANCE CAPTURE</h2>
+      <p class="muted">Records which parts of the game are actually expensive: how many draw calls
+        each frame and which game routine issues them, how many shader variants get built, and
+        where frame time goes. Used to decide what to optimise next. It slows the game slightly
+        and writes an extra log, so leave it off for normal play.</p>
+      <div class="callout warn" style="margin-top:12px">
+        <span class="tag">How</span>
+        <div>Arm it, launch the game, play the scene you care about for a minute or two, then
+          <b>quit the game normally</b> — force-killing it loses the data. Then create a support
+          bundle below; the capture is included automatically.</div>
+      </div>
+      <div class="row" style="margin-top:12px">
+        <button class="bigbtn" id="capturebtn">Arm performance capture</button>
+        <span class="muted" id="capturemsg"></span>
+      </div>
+    </div>
+    <div class="card">
       <h2>SUPPORT BUNDLE</h2>
       <p class="muted">Packs your recent session logs, performance samples, system info and
         settings into a single zip you can attach to a
@@ -664,6 +681,7 @@ async function refresh(){
   try{
     const st = await api.get("/api/status");
     lastStatus = st;
+    renderCapture(st.capture_armed);
     artList = st.art || [];
     const img = $("#heroimg");
     if (artList.length && !img.src) img.src = "/art/" + artList[0];
@@ -918,6 +936,25 @@ setInterval(refreshDiag, 3000); refreshDiag();
 $("#diagtoggle").onchange = async e => {
   await api.post("/api/diagnostics", {enable: e.target.checked}).catch(()=>null);
   refreshDiag();
+};
+function renderCapture(armed){
+  const b = $("#capturebtn");
+  b.textContent = armed ? "Disarm performance capture" : "Arm performance capture";
+  b.classList.toggle("gold", !armed);
+  if (armed && !$("#capturemsg").textContent) {
+    $("#capturemsg").textContent = "Armed — takes effect next launch.";
+  }
+}
+$("#capturebtn").onclick = async () => {
+  const armed = $("#capturebtn").textContent.startsWith("Disarm");
+  $("#capturemsg").textContent = "…";
+  try {
+    const r = await api.post("/api/capture", { enable: !armed });
+    $("#capturemsg").textContent = r.msg || "";
+    renderCapture(r.armed);
+  } catch (e) {
+    $("#capturemsg").textContent = "Failed: " + e;
+  }
 };
 $("#bundlebtn").onclick = async () => {
   $("#bundlemsg").textContent = "packing…";

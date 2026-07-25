@@ -21,6 +21,7 @@
 #include <rex/graphics/pipeline/texture/info.h>
 #include <rex/graphics/video_mode_util.h>
 #include <rex/graphics/xenos.h>
+#include <rex/perf/counter.h>
 #include <rex/kernel/xboxkrnl/private.h>
 #include <rex/kernel/xboxkrnl/rtl.h>
 #include <rex/kernel/xboxkrnl/video.h>
@@ -433,6 +434,11 @@ void VdSwap_entry(mapped_void buffer_ptr,      // ptr into primary ringbuffer
                   mapped_u32 frontbuffer_ptr,  // ptr to frontbuffer address
                   mapped_u32 texture_format_ptr, mapped_u32 color_space_ptr, mapped_u32 width,
                   mapped_u32 height) {
+  // Frame boundary as the GUEST sees it -- guest-side instrumentation joins
+  // against this, and it must be stamped before any work below so a draw
+  // recorded after this point belongs to the next frame.
+  rex::perf::AdvanceGuestFrameIndex();
+
   // All of these parameters are REQUIRED.
   assert(buffer_ptr);
   assert(fetch_ptr);

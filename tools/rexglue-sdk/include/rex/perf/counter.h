@@ -23,6 +23,14 @@ REXCVAR_DECLARE(std::string, perf_log_csv);
 
 namespace rex::perf {
 
+// Monotonic count of guest frames presented, incremented in VdSwap on the
+// guest thread itself. Deliberately NOT behind REXGLUE_ENABLE_PERF_COUNTERS
+// and deliberately not the command processor's own frame counter: guest-side
+// instrumentation needs a frame boundary observed at the moment the guest
+// declares one, with no command-queue skew, and it has to work in any build.
+uint64_t GuestFrameIndex();
+void AdvanceGuestFrameIndex();
+
 enum class CounterId : uint16_t {
   // Frame
   kFrameTimeUs,

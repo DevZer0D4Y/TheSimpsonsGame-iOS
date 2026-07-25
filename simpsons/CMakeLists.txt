@@ -10,20 +10,19 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 include(generated/rexglue.cmake)
 
-# Opt-in: pass-through instrumentation of the guest draw-submission
-# functions (call counts, primitive mix, batchability run-lengths -- see
-# src/draw_telemetry.cpp). Off by default so the normal play build carries
-# zero extra code in the draw path; flip on deliberately for a measurement
-# session, then rebuild off again.
-option(SIMPSONS_DRAW_TELEMETRY "Instrument guest draw submission" OFF)
-
-# Sources
+# Pass-through instrumentation of the guest draw-submission functions (see
+# src/draw_telemetry.cpp) is always compiled in and gated at RUNTIME by the
+# `draw_telemetry` cvar, which defaults off. It used to be a build option, but
+# that made a measurement session require a full rebuild of the 82k recompiled
+# functions on the player's machine -- and worse, `option()` writes a CACHE
+# entry, so flipping the default could not override the OFF already sitting in
+# an existing build directory: the build would silently produce a
+# telemetry-free binary that looked correct. With the hooks always present,
+# turning the cvar off costs one relaxed atomic load and a branch per draw.
 set(SIMPSONS_SOURCES
     src/main.cpp
+    src/draw_telemetry.cpp
 )
-if(SIMPSONS_DRAW_TELEMETRY)
-    list(APPEND SIMPSONS_SOURCES src/draw_telemetry.cpp)
-endif()
 
 if(WIN32)
     add_executable(simpsons WIN32 ${SIMPSONS_SOURCES})
@@ -36,7 +35,7 @@ rexglue_setup_target(simpsons)
 # draw_telemetry.cpp calls fmt directly; the prebuilt SDK exposes fmt headers
 # transitively, but REXSDK_DIR (add_subdirectory) builds -- what CI uses --
 # need the explicit link for the target to see fmt's usage requirements.
-if(SIMPSONS_DRAW_TELEMETRY AND TARGET fmt::fmt)
+if(TARGET fmt::fmt)
     target_link_libraries(simpsons PRIVATE fmt::fmt)
 endif()
 

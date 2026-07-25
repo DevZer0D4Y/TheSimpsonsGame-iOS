@@ -422,6 +422,10 @@ class VulkanPipelineCache {
   VkShaderModule depth_float24_truncate_fragment_shader_ = VK_NULL_HANDLE;
   VkShaderModule depth_float24_round_fragment_shader_ = VK_NULL_HANDLE;
 
+  // Diagnostic: dumps every (shader, specialization) pair instantiated this
+  // session, for judging ahead-of-time shader conversion feasibility.
+  void WriteShaderInventory() const;
+
   std::unordered_map<PipelineDescription, Pipeline, PipelineDescription::Hasher> pipelines_;
 
   // Previously used pipeline, to avoid lookups if the state wasn't changed.

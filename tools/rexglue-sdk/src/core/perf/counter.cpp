@@ -24,6 +24,18 @@ REXCVAR_DEFINE_STRING(perf_log_csv, "", "Perf",
 namespace rex::perf {
 
 namespace {
+std::atomic<uint64_t> g_guest_frame_index{0};
+}  // namespace
+
+uint64_t GuestFrameIndex() {
+  return g_guest_frame_index.load(std::memory_order_relaxed);
+}
+
+void AdvanceGuestFrameIndex() {
+  g_guest_frame_index.fetch_add(1, std::memory_order_relaxed);
+}
+
+namespace {
 
 constexpr size_t kNumCounters = static_cast<size_t>(CounterId::kCount);
 
@@ -143,10 +155,15 @@ void SetCsvLogPath(const std::string& path) {
     return;
   }
 
-  // Write header
+  // Write header. The two frame-identity columns come first so a row can be
+  // joined against anything else recorded during the session -- guest-side
+  // draw telemetry stamps the same guest_frame, and logging the command
+  // processor's own frame index alongside it makes the guest/CP skew visible
+  // rather than assumed. Without these the CSV is a pile of anonymous rows
+  // that cannot be attributed to a scene.
+  std::fputs("guest_frame,cp_frame", g_csv_file);
   for (size_t i = 0; i < kNumCounters; ++i) {
-    if (i > 0)
-      std::fputc(',', g_csv_file);
+    std::fputc(',', g_csv_file);
     std::fputs(kCounterNames[i], g_csv_file);
   }
   std::fputc('\n', g_csv_file);
@@ -156,9 +173,10 @@ void WriteCsvFrame() {
   if (!g_csv_file)
     return;
 
+  std::fprintf(g_csv_file, "%llu,%llu", static_cast<unsigned long long>(GuestFrameIndex()),
+               static_cast<unsigned long long>(g_csv_frame_count));
   for (size_t i = 0; i < kNumCounters; ++i) {
-    if (i > 0)
-      std::fputc(',', g_csv_file);
+    std::fputc(',', g_csv_file);
     std::fprintf(g_csv_file, "%lld",
                  static_cast<long long>(g_snapshot[i].load(std::memory_order_relaxed)));
   }

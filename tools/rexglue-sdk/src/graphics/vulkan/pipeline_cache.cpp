@@ -56,6 +56,17 @@ REXCVAR_DEFINE_INT32(
     .range(-1, 32)
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
+// Answers "is ahead-of-time shader conversion tractable" -- the translator
+// specializes each shader on a modification key, so what matters is not how
+// many shaders the game has but how many VARIANTS it actually instantiates.
+// The pipeline map already holds exactly that pairing, so dumping it at
+// shutdown is authoritative, unlike parsing the on-disk cache (whose record
+// layout is compiler-ABI dependent) or dump_shaders (which on Vulkan never
+// records the modification at all).
+REXCVAR_DEFINE_STRING(shader_inventory_csv, "", "GPU",
+                      "Path to write the (shader, specialization) inventory to at exit "
+                      "(empty = disabled). Diagnostic.");
+
 REXCVAR_DEFINE_BOOL(vulkan_tessellation_wireframe, false, "GPU/Vulkan",
                     "Render tessellation as wireframe")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
@@ -792,7 +803,33 @@ void VulkanPipelineCache::EndSubmission() {
   ProcessDeferredPipelineDestructions(false);
 }
 
+void VulkanPipelineCache::WriteShaderInventory() const {
+  std::string path = REXCVAR_GET(shader_inventory_csv);
+  if (path.empty()) {
+    return;
+  }
+  FILE* file = fopen(path.c_str(), "w");
+  if (!file) {
+    REXGPU_WARN("Failed to open shader inventory file: {}", path);
+    return;
+  }
+  fputs("vs_hash,vs_modification,ps_hash,ps_modification\n", file);
+  for (const auto& pipeline_pair : pipelines_) {
+    const PipelineDescription& description = pipeline_pair.first;
+    fprintf(file, "%016llX,%016llX,%016llX,%016llX\n",
+            static_cast<unsigned long long>(description.vertex_shader_hash),
+            static_cast<unsigned long long>(description.vertex_shader_modification),
+            static_cast<unsigned long long>(description.pixel_shader_hash),
+            static_cast<unsigned long long>(description.pixel_shader_modification));
+  }
+  fclose(file);
+  REXGPU_INFO("Wrote shader inventory ({} pipeline variants, {} translated shaders) to {}",
+              pipelines_.size(), shaders_.size(), path);
+}
+
 void VulkanPipelineCache::Shutdown() {
+  WriteShaderInventory();
+
   // Shut down creation threads before destroying any pipelines they may touch.
   if (!creation_threads_.empty()) {
     {

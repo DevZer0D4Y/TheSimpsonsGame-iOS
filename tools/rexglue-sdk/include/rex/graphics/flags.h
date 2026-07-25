@@ -77,6 +77,7 @@ REXCVAR_DECLARE(bool, use_fuzzy_alpha_epsilon);
 
 // GPU Shader Translation / Tracing
 REXCVAR_DECLARE(std::string, dump_shaders);
+REXCVAR_DECLARE(std::string, shader_inventory_csv);
 REXCVAR_DECLARE(bool, dxbc_switch);
 REXCVAR_DECLARE(bool, dxbc_source_map);
 REXCVAR_DECLARE(std::string, trace_gpu_prefix);

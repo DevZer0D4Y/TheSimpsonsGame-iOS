@@ -161,6 +161,44 @@ DERIVED_KEYS = ("vulkan_allow_present_mode_immediate",
 # engine's config parser ignores it. Each migration entry drops a stored value
 # once, but only if it still equals the default it is superseding - a player
 # who picked that value on purpose keeps it.
+# Stage-1 measurement capture. These engine cvars are diagnostic-only, so they
+# are not part of SETTINGS_SCHEMA (they must not persist as user settings) --
+# they are written into the managed block only while a capture is armed, and
+# removed again afterwards. The engine reads them at startup, so arming takes
+# effect on the next launch.
+CAPTURE_MARKER = LAUNCHER_DIR / "capture-armed"
+CAPTURE_DIR = DIAG_DIR / "capture"
+
+
+def capture_armed():
+    return CAPTURE_MARKER.exists()
+
+
+def capture_keys():
+    """Engine cvars for a capture run, or {} when not armed."""
+    if not capture_armed():
+        return {}
+    CAPTURE_DIR.mkdir(parents=True, exist_ok=True)
+    return {
+        "draw_telemetry": "true",
+        "perf_log_csv": f'"{(CAPTURE_DIR / "perf.csv").as_posix()}"',
+        "shader_inventory_csv": f'"{(CAPTURE_DIR / "shader_inventory.csv").as_posix()}"',
+    }
+
+
+def set_capture(enable):
+    if enable:
+        CAPTURE_MARKER.touch()
+    else:
+        CAPTURE_MARKER.unlink(missing_ok=True)
+    write_settings({})  # rewrite the managed block with/without the capture keys
+    if enable:
+        return True, ("Capture armed. Launch the game, play the scene you care about, then "
+                      "quit normally - do not force-kill it, the CSV is finalised on exit. "
+                      "Then use 'Create support bundle' to collect the results.")
+    return True, "Capture disarmed."
+
+
 SETTINGS_VERSION = 1
 SETTINGS_VERSION_MARKER = "# settings_version ="
 SETTINGS_DEFAULT_MIGRATIONS = (
@@ -281,7 +319,9 @@ def write_settings(new_values):
             if in_block:
                 continue
             key = s.partition("=")[0].strip()
-            if "=" in s and not s.startswith("#") and (key in SETTINGS_SCHEMA or key in DERIVED_KEYS):
+            if "=" in s and not s.startswith("#") and (
+                    key in SETTINGS_SCHEMA or key in DERIVED_KEYS
+                    or key in ("draw_telemetry", "perf_log_csv", "shader_inventory_csv")):
                 continue
             lines.append(line)
         while lines and not lines[-1].strip():
@@ -292,6 +332,8 @@ def write_settings(new_values):
     allow_tearing = not values["vsync"]
     for k in DERIVED_KEYS:
         block.append(f"{k} = {_fmt(allow_tearing, 'bool')}")
+    for k, v in capture_keys().items():
+        block.append(f"{k} = {v}")
     block.append(f"{SETTINGS_VERSION_MARKER} {SETTINGS_VERSION}")
     block.append(SETTINGS_END)
     GAME_TOML.write_text("\n".join(lines + ["", *block]) + "\n", encoding="utf-8")
@@ -450,6 +492,7 @@ def status():
         "patches": patches_list(),
         "github_repo": CONFIG.get("github_repo", ""),
         "diagnostics_enabled": diagnostics_enabled(),
+        "capture_armed": capture_armed(),
         "update": update_state,
         "steam_available": bool(shutil.which("steamos-add-to-steam") or shutil.which("steam")),
         "install": {"running": install_state["running"], "ok": install_state["ok"],
@@ -1273,6 +1316,10 @@ def create_support_bundle():
             for elog in engine_logs:
                 z.writestr(f"engine-logs/{elog.name}",
                            "\n".join(_tail_file(elog, 1000, 1 << 20)) + "\n")
+            if CAPTURE_DIR.is_dir():
+                for cap in CAPTURE_DIR.iterdir():
+                    if cap.is_file():
+                        z.write(cap, f"capture/{cap.name}")
             for f in (GAME_TOML, CONFIG_JSON, LAUNCHER_DIR / "last_exit.txt",
                       LAUNCHER_DIR / "last_run_debug.txt",
                       LAUNCHER_DIR / "launcher_native_error.log"):
@@ -1612,6 +1659,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if path == "/api/diagnostics":
             return self._send(200, {"ok": True,
                                     "enabled": set_diagnostics(body.get("enable"))})
+        if path == "/api/capture":
+            ok, msg = set_capture(bool(body.get("enable")))
+            return self._send(200, {"ok": ok, "msg": msg, "armed": capture_armed()})
         if path == "/api/support-bundle":
             ok, msg = create_support_bundle()
             return self._send(200, {"ok": ok, "msg": msg})
