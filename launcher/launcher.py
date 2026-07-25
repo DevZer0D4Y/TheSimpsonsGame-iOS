@@ -157,6 +157,17 @@ SETTINGS_END = "# <<< LAUNCHER SETTINGS <<<"
 DERIVED_KEYS = ("vulkan_allow_present_mode_immediate",
                 "vulkan_allow_present_mode_fifo_relaxed")
 
+# Bumped whenever a shipped default changes; written as a TOML comment so the
+# engine's config parser ignores it. Each migration entry drops a stored value
+# once, but only if it still equals the default it is superseding - a player
+# who picked that value on purpose keeps it.
+SETTINGS_VERSION = 1
+SETTINGS_VERSION_MARKER = "# settings_version ="
+SETTINGS_DEFAULT_MIGRATIONS = (
+    # AA shipped off, which left the game's cel-shaded outlines badly aliased.
+    (1, "swap_post_effect", "none"),
+)
+
 # key -> (type, default, needs_restart)
 SETTINGS_SCHEMA = {
     # display
@@ -171,7 +182,7 @@ SETTINGS_SCHEMA = {
     # quality
     "resolution_scale": ("int", 1, True),
     "anisotropic_override": ("int", 3, False),
-    "swap_post_effect": ("str", "none", True),     # none, fxaa, fxaa_extreme
+    "swap_post_effect": ("str", "fxaa", True),     # none, fxaa, fxaa_extreme
     # fps
     "video_mode_refresh_rate": ("float", 60.0, True),
     # input
@@ -219,16 +230,32 @@ def read_settings():
     values = {k: v[1] for k, v in SETTINGS_SCHEMA.items()}
     if not GAME_TOML.exists():
         return values
+    stored = {}
+    file_version = 0
     for line in GAME_TOML.read_text(encoding="utf-8").splitlines():
         s = line.strip()
+        if s.startswith(SETTINGS_VERSION_MARKER):
+            try:
+                file_version = int(s[len(SETTINGS_VERSION_MARKER):].strip())
+            except ValueError:
+                pass
+            continue
         if "=" in s and not s.startswith("#"):
             key, _, raw = s.partition("=")
             key = key.strip()
             if key in SETTINGS_SCHEMA:
                 try:
-                    values[key] = _parse(raw, SETTINGS_SCHEMA[key][0])
+                    stored[key] = _parse(raw, SETTINGS_SCHEMA[key][0])
                 except ValueError:
                     pass
+    # Settings written before a default changed are pinned to the old value,
+    # so a new default would never reach anyone who has already run the
+    # launcher. Drop only the specific stale keys, once, rather than resetting
+    # anything the player deliberately chose.
+    for version, key, superseded_default in SETTINGS_DEFAULT_MIGRATIONS:
+        if file_version < version and stored.get(key) == superseded_default:
+            stored.pop(key, None)
+    values.update(stored)
     return values
 
 
@@ -265,6 +292,7 @@ def write_settings(new_values):
     allow_tearing = not values["vsync"]
     for k in DERIVED_KEYS:
         block.append(f"{k} = {_fmt(allow_tearing, 'bool')}")
+    block.append(f"{SETTINGS_VERSION_MARKER} {SETTINGS_VERSION}")
     block.append(SETTINGS_END)
     GAME_TOML.write_text("\n".join(lines + ["", *block]) + "\n", encoding="utf-8")
     return values

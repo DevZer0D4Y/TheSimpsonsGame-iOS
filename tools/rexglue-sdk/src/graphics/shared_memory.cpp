@@ -361,6 +361,26 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
     return true;
   }
 
+  // A single range needs no merging, so it skips the heap-allocated, sorted
+  // vector below and goes straight to the validity check on a stack slot.
+  // This is the overwhelmingly common case -- every vertex buffer of every
+  // draw arrives here -- and it matters now that the per-draw residency cache
+  // is gone: that cache used to hide these calls, at the cost of feeding the
+  // GPU stale vertex data.
+  if (count == 1) {
+    if (!ranges[0].second) {
+      return true;
+    }
+    if (ranges[0].first > kBufferSize || (kBufferSize - ranges[0].first) < ranges[0].second) {
+      return false;
+    }
+    SCOPE_profile_cpu_f("gpu");
+    if (!EnsureHostGpuMemoryAllocated(ranges[0].first, ranges[0].second)) {
+      return false;
+    }
+    return RequestValidatedRanges(ranges, 1, count);
+  }
+
   // Some texture or buffer is empty, for example - safe to draw in this case.
   std::vector<std::pair<uint32_t, uint32_t>> merged_ranges;
   merged_ranges.reserve(count);
@@ -408,6 +428,14 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
     }
   }
 
+  return RequestValidatedRanges(merged_ranges.data(), merged_ranges.size(), count);
+}
+
+// Shared tail of RequestRanges: the input ranges are already validated,
+// merged and backed by host GPU memory. Split out so a single-range request
+// can reach it without building and sorting a vector first.
+bool SharedMemory::RequestValidatedRanges(const std::pair<uint32_t, uint32_t>* merged_ranges,
+                                          size_t merged_count, size_t original_count) {
   // Fast path: if everything requested is already valid, nothing has to be
   // uploaded and the global lock can be skipped entirely. Reading the flags
   // without the lock is safe because the storage never moves and every writer
@@ -417,7 +445,8 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
   uint64_t* valid_flags = valid_flags_.load(std::memory_order_acquire);
   if (valid_flags) {
     bool all_valid = true;
-    for (const std::pair<uint32_t, uint32_t>& range : merged_ranges) {
+    for (size_t range_index = 0; range_index < merged_count; ++range_index) {
+      const std::pair<uint32_t, uint32_t>& range = merged_ranges[range_index];
       if (!range.second) {
         continue;
       }
@@ -445,9 +474,9 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
       }
     }
     if (all_valid) {
-      COUNT_profile_set("gpu/shared_memory/request_ranges_count", uint32_t(count));
+      COUNT_profile_set("gpu/shared_memory/request_ranges_count", uint32_t(original_count));
       COUNT_profile_set("gpu/shared_memory/request_ranges_merged_count",
-                        uint32_t(merged_ranges.size()));
+                        uint32_t(merged_count));
       COUNT_profile_set("gpu/shared_memory/request_ranges_upload_count", 0);
       return true;
     }
@@ -469,7 +498,8 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
   };
   {
     auto global_lock = global_critical_region_.Acquire();
-    for (const std::pair<uint32_t, uint32_t>& range : merged_ranges) {
+    for (size_t range_index = 0; range_index < merged_count; ++range_index) {
+      const std::pair<uint32_t, uint32_t>& range = merged_ranges[range_index];
       uint32_t page_first = range.first >> page_size_log2_;
       uint32_t page_last = (range.first + range.second - 1) >> page_size_log2_;
       uint32_t block_first = page_first >> 6;
@@ -519,9 +549,9 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
     }
   }
 
-  COUNT_profile_set("gpu/shared_memory/request_ranges_count", uint32_t(count));
+  COUNT_profile_set("gpu/shared_memory/request_ranges_count", uint32_t(original_count));
   COUNT_profile_set("gpu/shared_memory/request_ranges_merged_count",
-                    uint32_t(merged_ranges.size()));
+                    uint32_t(merged_count));
   COUNT_profile_set("gpu/shared_memory/request_ranges_upload_count",
                     uint32_t(upload_ranges_.size()));
 

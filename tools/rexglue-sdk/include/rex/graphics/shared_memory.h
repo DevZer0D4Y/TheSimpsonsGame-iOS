@@ -164,6 +164,12 @@ class SharedMemory {
   uint32_t page_size_log2_;
 
   bool EnsureHostGpuMemoryAllocated(uint32_t start, uint32_t length);
+
+  // Shared tail of RequestRanges, taking ranges that are already bounds-checked,
+  // merged and backed by host GPU memory. Lets a single-range request skip
+  // building and sorting a vector. original_count is only for the profiler.
+  bool RequestValidatedRanges(const std::pair<uint32_t, uint32_t>* merged_ranges,
+                              size_t merged_count, size_t original_count);
   uint32_t host_gpu_memory_sparse_granularity_log2_ = UINT32_MAX;
   std::vector<uint64_t> host_gpu_memory_sparse_allocated_;
   uint32_t host_gpu_memory_sparse_allocations_ = 0;

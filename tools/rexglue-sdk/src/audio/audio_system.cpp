@@ -157,10 +157,12 @@ void AudioSystem::WorkerThreadMain() {
     if (result.first == rex::thread::WaitResult::kSuccess) {
       auto index = result.second;
 
-      auto global_lock = global_critical_region_.Acquire();
-      uint32_t client_callback = clients_[index].callback;
-      uint32_t client_callback_arg = clients_[index].wrapped_callback_arg;
-      global_lock.unlock();
+      uint32_t client_callback, client_callback_arg;
+      {
+        std::lock_guard<std::mutex> clients_lock(clients_mutex_);
+        client_callback = clients_[index].callback;
+        client_callback_arg = clients_[index].wrapped_callback_arg;
+      }
 
       if (client_callback) {
         if (diag_pump_count < 10) {
@@ -266,7 +268,10 @@ X_STATUS AudioSystem::RegisterClient(uint32_t callback, uint32_t callback_arg, s
   uint32_t ptr = memory()->SystemHeapAlloc(0x4);
   memory::store_and_swap<uint32_t>(memory()->TranslateVirtual(ptr), callback_arg);
 
-  clients_[index] = {driver, callback, callback_arg, ptr, true};
+  {
+    std::lock_guard<std::mutex> clients_lock(clients_mutex_);
+    clients_[index] = {driver, callback, callback_arg, ptr, true};
+  }
 
   if (out_index) {
     *out_index = index;
@@ -285,7 +290,11 @@ void AudioSystem::SubmitFrame(size_t index, uint32_t samples_ptr) {
     submit_count++;
   }
 
-  auto global_lock = global_critical_region_.Acquire();
+  // Deliberately the dedicated mutex, not the global critical region: this
+  // runs 187 times a second and used to block behind whatever the GPU or a
+  // page-fault storm was doing. The lock still has to wrap the driver call so
+  // UnregisterClient cannot free the driver underneath it.
+  std::lock_guard<std::mutex> clients_lock(clients_mutex_);
   assert_true(index < kMaximumClientCount);
   assert_true(clients_[index].driver != NULL);
   (clients_[index].driver)->SubmitFrame(samples_ptr);
@@ -296,9 +305,16 @@ void AudioSystem::UnregisterClient(size_t index) {
 
   auto global_lock = global_critical_region_.Acquire();
   assert_true(index < kMaximumClientCount);
-  DestroyDriver(clients_[index].driver);
-  memory()->SystemHeapFree(clients_[index].wrapped_callback_arg);
+  std::unique_lock<std::mutex> clients_lock(clients_mutex_);
+  AudioDriver* driver = clients_[index].driver;
+  uint32_t wrapped_callback_arg = clients_[index].wrapped_callback_arg;
   clients_[index] = {nullptr, 0, 0, 0, false};
+  clients_lock.unlock();
+  // The table entry is already cleared, so no SubmitFrame can reach this
+  // driver any more; tear it down outside the lock since DestroyDriver blocks
+  // until the device thread quiesces.
+  DestroyDriver(driver);
+  memory()->SystemHeapFree(wrapped_callback_arg);
 
   // Drain the semaphore of its count.
   auto client_semaphore = client_semaphores_[index].get();

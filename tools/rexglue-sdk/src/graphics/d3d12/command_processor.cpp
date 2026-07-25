@@ -104,7 +104,6 @@ void D3D12CommandProcessor::InsertDebugMarker(const char* format, ...) {
 
 void D3D12CommandProcessor::ClearCaches() {
   CommandProcessor::ClearCaches();
-  InvalidateAllVertexBufferResidency();
   cache_clear_requested_ = true;
 }
 
@@ -114,35 +113,6 @@ void D3D12CommandProcessor::InvalidateGpuMemory() {
   }
 }
 
-void D3D12CommandProcessor::InvalidateAllVertexBufferResidency() {
-  vertex_buffers_in_sync_[0] = 0;
-  vertex_buffers_in_sync_[1] = 0;
-  for (VertexBufferState& state : vertex_buffer_states_) {
-    state.address = UINT32_MAX;
-    state.size = UINT32_MAX;
-  }
-}
-
-void D3D12CommandProcessor::InvalidateVertexBufferResidency(uint32_t vfetch_index) {
-  if (vfetch_index >= vertex_buffer_states_.size()) {
-    return;
-  }
-  vertex_buffers_in_sync_[vfetch_index >> 6] &= ~(uint64_t(1) << (vfetch_index & 63));
-}
-
-void D3D12CommandProcessor::InvalidateVertexBufferResidencyRange(uint32_t first_vfetch,
-                                                                 uint32_t last_vfetch) {
-  if (first_vfetch > last_vfetch) {
-    std::swap(first_vfetch, last_vfetch);
-  }
-  if (first_vfetch >= vertex_buffer_states_.size()) {
-    return;
-  }
-  last_vfetch = std::min(last_vfetch, uint32_t(vertex_buffer_states_.size() - 1));
-  for (uint32_t vfetch_index = first_vfetch; vfetch_index <= last_vfetch; ++vfetch_index) {
-    InvalidateVertexBufferResidency(vfetch_index);
-  }
-}
 
 void D3D12CommandProcessor::InitializeShaderStorage(const std::filesystem::path& cache_root,
                                                     uint32_t title_id, bool blocking) {
@@ -881,7 +851,6 @@ bool D3D12CommandProcessor::SetupContext() {
     REXGPU_ERROR("Failed to initialize base command processor context");
     return false;
   }
-  InvalidateAllVertexBufferResidency();
   UpdateDebugMarkersEnabled();
 
   const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
@@ -1440,7 +1409,7 @@ bool D3D12CommandProcessor::SetupContext() {
   *(fxaa_extreme_pipeline_.ReleaseAndGetAddressOf()) = ui::d3d12::util::CreateComputePipeline(
       device, shaders::fxaa_extreme_cs, sizeof(shaders::fxaa_extreme_cs),
       fxaa_root_signature_.Get());
-  if (!fxaa_pipeline_) {
+  if (!fxaa_extreme_pipeline_) {
     REXGPU_ERROR("Failed to create the extreme-quality FXAA compute pipeline");
     return false;
   }
@@ -1652,7 +1621,6 @@ bool D3D12CommandProcessor::SetupContext() {
 
 void D3D12CommandProcessor::ShutdownContext() {
   AwaitAllQueueOperationsCompletion();
-  InvalidateAllVertexBufferResidency();
   ShutdownOcclusionQueryResources();
 
   ui::d3d12::util::ReleaseAndNull(readback_buffer_);
@@ -1821,7 +1789,6 @@ void D3D12CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
       texture_cache_->TextureFetchConstantWritten((index - XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0) /
                                                   6);
     }
-    InvalidateVertexBufferResidency((index - XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0) / 2);
   }
 }
 
@@ -1900,7 +1867,6 @@ void D3D12CommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_t
     if (texture_cache_) {
       texture_cache_->TextureFetchConstantsWritten(first_fetch_dword / 6, last_fetch_dword / 6);
     }
-    InvalidateVertexBufferResidencyRange(first_fetch_dword / 2, last_fetch_dword / 2);
     return;
   }
 
@@ -1918,8 +1884,6 @@ void D3D12CommandProcessor::OnGammaRampPWLValueWritten() {
 void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                                       uint32_t frontbuffer_height) {
   SCOPE_profile_cpu_f("gpu");
-  vertex_buffers_in_sync_[0] = 0;
-  vertex_buffers_in_sync_[1] = 0;
 
   if (!graphics_system_)
     return;
@@ -2518,6 +2482,9 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   // muting those made finished characters invisible.
   bool priming_draw =
       invalid_vfetch_verdict == draw_util::InvalidVertexFetchVerdict::kPrimeWithoutRasterization;
+  // Deduplicated WITHIN this draw only -- see the Vulkan backend for why
+  // caching residency across draws pinned the GPU to stale vertex data.
+  uint64_t vertex_buffers_resident[2] = {};
   const Shader::ConstantRegisterMap& constant_map_vertex = vertex_shader->constant_register_map();
   for (uint32_t i = 0; i < rex::countof(constant_map_vertex.vertex_fetch_bitmap); ++i) {
     uint32_t vfetch_bits_remaining = constant_map_vertex.vertex_fetch_bitmap[i];
@@ -2526,18 +2493,13 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
       vfetch_bits_remaining &= ~(uint32_t(1) << j);
       uint32_t vfetch_index = i * 32 + j;
       uint64_t vfetch_bit = uint64_t(1) << (vfetch_index & 63);
-      if (vertex_buffers_in_sync_[vfetch_index >> 6] & vfetch_bit) {
+      if (vertex_buffers_resident[vfetch_index >> 6] & vfetch_bit) {
         continue;
       }
       xenos::xe_gpu_vertex_fetch_t vfetch_constant = regs.GetVertexFetch(vfetch_index);
       // Invalid-type slots already passed classification above (a kVeto draw
       // never reaches this loop), so both valid and admitted-invalid slots
       // just need their buffer ranges resident.
-      VertexBufferState& state = vertex_buffer_states_[vfetch_index];
-      if (state.address == vfetch_constant.address && state.size == vfetch_constant.size) {
-        vertex_buffers_in_sync_[vfetch_index >> 6] |= vfetch_bit;
-        continue;
-      }
       if (!shared_memory_->RequestRange(vfetch_constant.address << 2, vfetch_constant.size << 2)) {
         REXGPU_ERROR(
             "Failed to request vertex buffer at 0x{:08X} (size {}) in the "
@@ -2545,9 +2507,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
             vfetch_constant.address << 2, vfetch_constant.size << 2);
         return false;
       }
-      state.address = vfetch_constant.address;
-      state.size = vfetch_constant.size;
-      vertex_buffers_in_sync_[vfetch_index >> 6] |= vfetch_bit;
+      vertex_buffers_resident[vfetch_index >> 6] |= vfetch_bit;
     }
   }
 

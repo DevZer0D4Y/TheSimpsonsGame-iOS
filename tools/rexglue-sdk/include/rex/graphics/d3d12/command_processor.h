@@ -420,9 +420,6 @@ class D3D12CommandProcessor : public CommandProcessor {
   uint64_t NormalizeOcclusionSamples(uint64_t samples) const;
   void WriteGuestOcclusionResult(xenos::xe_gpu_depth_sample_counts* sample_counts,
                                  uint64_t samples);
-  void InvalidateAllVertexBufferResidency();
-  void InvalidateVertexBufferResidency(uint32_t vfetch_index);
-  void InvalidateVertexBufferResidencyRange(uint32_t first_vfetch, uint32_t last_vfetch);
 
   void WriteGammaRampSRV(bool is_pwl, D3D12_CPU_DESCRIPTOR_HANDLE handle) const;
 
@@ -667,12 +664,6 @@ class D3D12CommandProcessor : public CommandProcessor {
     uint32_t host_index = UINT32_MAX;
     bool valid = false;
   } active_occlusion_query_;
-  struct VertexBufferState {
-    uint32_t address = UINT32_MAX;
-    uint32_t size = UINT32_MAX;
-  };
-  std::array<VertexBufferState, 96> vertex_buffer_states_{};
-  uint64_t vertex_buffers_in_sync_[2] = {};
 
   std::atomic<bool> pix_capture_requested_ = false;
   bool pix_capturing_;

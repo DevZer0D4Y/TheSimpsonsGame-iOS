@@ -376,8 +376,18 @@ class PosixConditionBase {
         if (now >= end_time) {
           return std::make_pair<WaitResult, size_t>(WaitResult::kTimeout, 0);
         }
-        auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - now);
-        auto sleep_time = std::min(remaining, std::chrono::milliseconds(1));
+        // Keep the remainder in the clock's own resolution. Rounding it down
+        // to whole milliseconds turned every sub-millisecond wait into
+        // sleep_for(0), which returns immediately without yielding -- so this
+        // "poll" became a hot spin burning a core and hammering the
+        // signaller's mutexes. Alertable waits are re-entered with a fresh
+        // ~1 ms slice every time, so they hit that case on every single pass:
+        // the audio worker (a 9-handle WaitAny) span continuously, stealing
+        // CPU from the recompiled game code and the GPU thread, which is
+        // exactly when in-game audio went crunchy.
+        auto remaining = end_time - now;
+        auto sleep_time =
+            std::min<std::chrono::steady_clock::duration>(remaining, std::chrono::milliseconds(1));
         std::this_thread::sleep_for(sleep_time);
       }
     }
