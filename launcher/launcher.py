@@ -104,6 +104,14 @@ def save_config():
 CONFIG = load_config()
 PLAT = platform.system()
 
+# The packaged launcher is a windowed exe on Windows, so every subprocess it
+# spawns pops a visible console unless told not to. Artwork generation alone
+# can spawn hundreds (one ffmpeg per candidate frame) - players saw a storm
+# of cmd windows at every boot. Pass this to every subprocess call whose
+# output we capture.
+POPEN_NO_WINDOW = ({"creationflags": subprocess.CREATE_NO_WINDOW}
+                   if PLAT == "Windows" else {})
+
 
 def _resolve(p):
     p = Path(p)
@@ -431,7 +439,8 @@ def patches_list():
 
 def game_running_pids():
     try:
-        out = subprocess.run(["pgrep", "-f", str(GAME_BIN)], capture_output=True, text=True)
+        out = subprocess.run(["pgrep", "-f", str(GAME_BIN)], capture_output=True, text=True,
+                             **POPEN_NO_WINDOW)
         return [int(p) for p in out.stdout.split()]
     except Exception:
         return []
@@ -555,13 +564,25 @@ def ffmpeg_path():
     return shutil.which("ffmpeg")
 
 
+# The .attempted marker is written after an artwork sweep so a machine where
+# every frame extraction fails (ffmpeg can't decode VP6, unreadable movies)
+# doesn't re-run the whole sweep on every boot - that is what produced the
+# endless window storm and the minute-long startup for players whose art
+# folder stayed empty. The UI's refresh action passes force=True to retry.
 def generate_art(force=False):
     if not gamedata_ok() or not ffmpeg_path():
         return
     ART_DIR.mkdir(parents=True, exist_ok=True)
-    if art_files() and not force:
+    marker = ART_DIR / ".attempted"
+    if not force and (art_files() or marker.exists()):
         return
     movie_dir = GAMEDATA / "movies" / "en"
+    if not movie_dir.is_dir():
+        # Non-English dumps keep their movies under a different language code.
+        language_dirs = sorted(d for d in (GAMEDATA / "movies").glob("*") if d.is_dir())
+        if not language_dirs:
+            return
+        movie_dir = language_dirs[0]
     # prefer HD in-game cutscenes, then any other movies (skip logo bumpers)
     igc = sorted(p for p in movie_dir.glob("*_igc*.vp6") if "_sd" not in p.name)
     rest = sorted(p for p in movie_dir.glob("*.vp6")
@@ -570,22 +591,31 @@ def generate_art(force=False):
     for old_art in ART_DIR.glob("hero*.jpg"):
         old_art.unlink(missing_ok=True)
     made = 0
+    attempts = 0
     for mv in candidates:
-        if made >= 24:
+        # A hard ceiling on ffmpeg invocations, not just on successes: when
+        # every extraction fails, the success counter never advances and the
+        # loop would otherwise walk 3 timestamps x every movie on the disc.
+        if made >= 24 or attempts >= 48:
             break
         for ts in ("2.0", "6.0", "12.0"):
-            if made >= 24:
+            if made >= 24 or attempts >= 48:
                 break
             out = ART_DIR / f"hero{made}.jpg"
+            attempts += 1
             r = subprocess.run(
                 [ffmpeg_path(), "-loglevel", "error", "-y", "-ss", ts, "-i", str(mv),
                  "-frames:v", "1", "-q:v", "3", str(out)],
-                capture_output=True, timeout=60)
+                capture_output=True, timeout=60, **POPEN_NO_WINDOW)
             # size threshold filters black/flat frames
             if r.returncode == 0 and out.exists() and out.stat().st_size > 45000:
                 made += 1
             else:
                 out.unlink(missing_ok=True)
+    try:
+        marker.write_text(f"made={made} attempts={attempts}\n", encoding="utf-8")
+    except OSError:
+        pass
 
 
 # ------------------------------------------------------------------- icon
@@ -674,7 +704,20 @@ def run_install(iso_path):
         if not iso.is_file():
             return fail(f"ISO not found: {iso}")
         if not EXTRACT_XISO.exists():
-            return fail("extract-xiso tool missing")
+            # The most common way this "goes missing" on Windows: the player
+            # double-clicked the exe inside the downloaded ZIP, so Explorer
+            # unpacked just the exe into a temp folder and ran it there - away
+            # from every other file in the archive. Detect that and say so,
+            # instead of leaving them staring at files that "seem to be there".
+            exe = str(Path(sys.executable))
+            if FROZEN and PLAT == "Windows" and ("\\Temp\\" in exe or "/Temp/" in exe):
+                return fail("The launcher is running from a temporary folder - this "
+                            "happens when it is started from inside the ZIP. Extract the "
+                            "whole archive first (right-click the ZIP -> Extract All), "
+                            "then run simpsons-launcher.exe from the extracted folder.")
+            return fail(f"extract-xiso tool missing - expected it at {EXTRACT_XISO}, next to "
+                        "the launcher. If an antivirus quarantined it, restore it or "
+                        "re-extract the release archive.")
         target = ROOT / "gamedata_extracting"
         if target.exists():
             shutil.rmtree(target)
@@ -683,7 +726,8 @@ def run_install(iso_path):
         # Options must precede the positional ISO: the Windows getopt does not
         # permute argv, so "-x <iso> -d <target>" would leave -d unparsed.
         p = subprocess.Popen([str(EXTRACT_XISO), "-x", "-d", str(target), str(iso)],
-                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                             **POPEN_NO_WINDOW)
         for line in p.stdout:
             if line.strip():
                 log.append(line.rstrip())
@@ -902,15 +946,48 @@ def apply_update():
             # overwritten, but Windows does allow renaming an open exe out
             # of the way first -- the currently-running process keeps
             # executing fine from the renamed file.
+            # This must never fail silently: if everything else updates but
+            # the launcher exe stays old, its (stamped) version keeps
+            # comparing below the release it just installed, and the player
+            # gets the "update available" nag again on every start with no
+            # hint anything went wrong.
             if FROZEN and PLAT == "Windows":
                 new_exe = extract_dir / UPDATE_SELF_EXE
-                if new_exe.exists():
-                    current_exe = Path(sys.executable)
+                if not new_exe.exists():
+                    update_state.update(applying=False,
+                                        apply_msg="Launcher exe missing from archive.")
+                    return False, (f"Update installed, but {UPDATE_SELF_EXE} was missing from "
+                                   "the downloaded archive, so the launcher itself is still "
+                                   "the old version. Download the release from GitHub and "
+                                   "extract it over this folder to finish.")
+                current_exe = Path(sys.executable)
+                try:
                     old_exe = current_exe.with_suffix(".exe.old")
                     old_exe.unlink(missing_ok=True)
                     current_exe.rename(old_exe)
                     shutil.copy2(new_exe, current_exe)
                     installed.append(UPDATE_SELF_EXE)
+                except OSError as e:
+                    # Leftover .old locked by a previous instance, antivirus
+                    # holding the new file, exe on read-only media... Fall
+                    # back to dropping the new exe alongside with clear
+                    # instructions rather than pretending the update finished.
+                    try:
+                        side = current_exe.with_name("simpsons-launcher-new.exe")
+                        shutil.copy2(new_exe, side)
+                        update_state.update(applying=False,
+                                            apply_msg="Launcher exe could not be replaced.")
+                        return False, ("Update installed, but the launcher couldn't replace "
+                                       f"its own exe ({e}). The new version was saved as "
+                                       f"{side.name} - close this launcher, delete the old "
+                                       "simpsons-launcher.exe and rename the new one in its "
+                                       "place.")
+                    except OSError:
+                        update_state.update(applying=False,
+                                            apply_msg="Launcher exe could not be replaced.")
+                        return False, ("Update installed, but the launcher couldn't replace "
+                                       f"its own exe ({e}). Download the release from GitHub "
+                                       "and extract it over this folder to finish.")
 
         update_state.update(applying=False, apply_msg="Updated — restart the launcher to finish.",
                             update_available=False, checked=True,
@@ -942,7 +1019,7 @@ def set_diagnostics(enable):
 def _run_quiet(cmd, timeout=6):
     try:
         return subprocess.run(cmd, capture_output=True, text=True,
-                              timeout=timeout).stdout.strip()
+                              timeout=timeout, **POPEN_NO_WINDOW).stdout.strip()
     except Exception:
         return ""
 
@@ -1480,6 +1557,28 @@ def launch_game():
         # Re-sync the managed settings block so default migrations apply on
         # launch, not only when the player next touches a setting.
         write_settings({})
+        if PLAT == "Windows":
+            # The game exe links the Microsoft C++ runtime. Without it, Windows
+            # kills the process at startup with the famously unhelpful
+            # 0xc0000142 dialog - catch that here and say what to install.
+            import ctypes
+            missing = []
+            for dll in ("vcruntime140.dll", "vcruntime140_1.dll", "msvcp140.dll"):
+                try:
+                    ctypes.WinDLL(dll)
+                except OSError:
+                    missing.append(dll)
+            if missing:
+                return False, ("Windows is missing the Microsoft Visual C++ runtime "
+                               f"({', '.join(missing)}), so the game would fail to start "
+                               "with error 0xc0000142. Install the x64 redistributable from "
+                               "https://aka.ms/vs/17/release/vc_redist.x64.exe and press "
+                               "Play again.")
+            runtime_dll = BUILD_DIR / "rexruntimerd.dll"
+            if FROZEN and not runtime_dll.exists():
+                return False, (f"rexruntimerd.dll is missing from {BUILD_DIR} - the game "
+                               "cannot start without it. If an antivirus quarantined it, "
+                               "restore it or re-extract the release archive.")
         env = os.environ.copy()
         env_notes = []
         # Lossless Scaling frame-gen (lsfg-vk) hooks Vulkan via a RenderDoc-style
@@ -1537,7 +1636,8 @@ def launch_game():
             out = subprocess.DEVNULL
         game_proc = subprocess.Popen(cmd, cwd=str(BUILD_DIR), env=env,
                                      stdout=out, stderr=subprocess.STDOUT
-                                     if out is not subprocess.DEVNULL else subprocess.DEVNULL)
+                                     if out is not subprocess.DEVNULL else subprocess.DEVNULL,
+                                     **POPEN_NO_WINDOW)
         if out is not subprocess.DEVNULL:
             out.close()  # the child holds its own duplicate of the fd
         # HAND PATCH: level-load memory spikes were getting the game SIGKILLed
@@ -1749,7 +1849,9 @@ def open_browser(url):
 
 
 def main():
-    generate_art()
+    # In the background: a full artwork sweep can take a minute on a slow
+    # disk, and players were staring at nothing until it finished.
+    threading.Thread(target=generate_art, daemon=True).start()
     install_desktop_entry()
     server = None
     for cand in range(PORT, PORT + 20):
