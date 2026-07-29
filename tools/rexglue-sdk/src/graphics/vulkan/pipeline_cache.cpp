@@ -67,6 +67,16 @@ REXCVAR_DEFINE_STRING(shader_inventory_csv, "", "GPU",
                       "Path to write the (shader, specialization) inventory to at exit "
                       "(empty = disabled). Diagnostic.");
 
+// The full-state companion to shader_inventory_csv: every unique pipeline the
+// session instantiated, with the complete fixed-function state - blending,
+// depth/stencil, rasterization, topology, and the render pass formats. One
+// JSON object per line. This is the ground truth a native (non-emulated)
+// renderer replays its pipelines from, so it captures what the game actually
+// sets rather than what a harness assumes.
+REXCVAR_DEFINE_STRING(pipeline_inventory_json, "", "GPU",
+                      "Path to write the full pipeline state inventory to at exit "
+                      "(empty = disabled). Diagnostic.");
+
 REXCVAR_DEFINE_BOOL(vulkan_tessellation_wireframe, false, "GPU/Vulkan",
                     "Render tessellation as wireframe")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
@@ -827,8 +837,70 @@ void VulkanPipelineCache::WriteShaderInventory() const {
               pipelines_.size(), shaders_.size(), path);
 }
 
+void VulkanPipelineCache::WritePipelineInventory() const {
+  std::string path = REXCVAR_GET(pipeline_inventory_json);
+  if (path.empty()) {
+    return;
+  }
+  FILE* file = fopen(path.c_str(), "w");
+  if (!file) {
+    REXGPU_WARN("Failed to open pipeline inventory file: {}", path);
+    return;
+  }
+  for (const auto& pipeline_pair : pipelines_) {
+    const PipelineDescription& d = pipeline_pair.first;
+    const VulkanRenderTargetCache::RenderPassKey& rp = d.render_pass_key;
+    fprintf(file,
+            "{\"vs\":\"%016llX\",\"vs_mod\":\"%016llX\",\"ps\":\"%016llX\","
+            "\"ps_mod\":\"%016llX\","
+            "\"msaa_samples\":%u,\"depth_and_color_used\":%u,\"depth_format\":%u,"
+            "\"color_formats\":[%u,%u,%u,%u],\"color_transfer_formats\":%u,"
+            "\"geometry_shader\":%u,\"primitive_topology\":%u,\"primitive_restart\":%u,"
+            "\"tessellation_mode\":%u,"
+            "\"depth_clamp\":%u,\"polygon_mode\":%u,\"cull_front\":%u,\"cull_back\":%u,"
+            "\"front_face_cw\":%u,\"rasterizer_discard\":%u,"
+            "\"depth_write\":%u,\"depth_compare\":%u,\"stencil_test\":%u,"
+            "\"stencil_front\":[%u,%u,%u,%u],\"stencil_back\":[%u,%u,%u,%u],"
+            "\"sample_rate_shading\":%u,",
+            static_cast<unsigned long long>(d.vertex_shader_hash),
+            static_cast<unsigned long long>(d.vertex_shader_modification),
+            static_cast<unsigned long long>(d.pixel_shader_hash),
+            static_cast<unsigned long long>(d.pixel_shader_modification),
+            uint32_t(rp.msaa_samples), uint32_t(rp.depth_and_color_used),
+            uint32_t(rp.depth_format), uint32_t(rp.color_0_view_format),
+            uint32_t(rp.color_1_view_format), uint32_t(rp.color_2_view_format),
+            uint32_t(rp.color_3_view_format), uint32_t(rp.color_rts_use_transfer_formats),
+            uint32_t(d.geometry_shader), uint32_t(d.primitive_topology),
+            uint32_t(d.primitive_restart), uint32_t(d.tessellation_mode),
+            uint32_t(d.depth_clamp_enable), uint32_t(d.polygon_mode), uint32_t(d.cull_front),
+            uint32_t(d.cull_back), uint32_t(d.front_face_clockwise),
+            uint32_t(d.rasterizer_discard), uint32_t(d.depth_write_enable),
+            uint32_t(d.depth_compare_op), uint32_t(d.stencil_test_enable),
+            uint32_t(d.stencil_front_fail_op), uint32_t(d.stencil_front_pass_op),
+            uint32_t(d.stencil_front_depth_fail_op), uint32_t(d.stencil_front_compare_op),
+            uint32_t(d.stencil_back_fail_op), uint32_t(d.stencil_back_pass_op),
+            uint32_t(d.stencil_back_depth_fail_op), uint32_t(d.stencil_back_compare_op),
+            uint32_t(d.sample_rate_shading));
+    fputs("\"render_targets\":[", file);
+    for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
+      const PipelineRenderTarget& rt = d.render_targets[i];
+      fprintf(file,
+              "%s{\"src_color\":%u,\"dst_color\":%u,\"color_op\":%u,\"src_alpha\":%u,"
+              "\"dst_alpha\":%u,\"alpha_op\":%u,\"write_mask\":%u}",
+              i ? "," : "", uint32_t(rt.src_color_blend_factor),
+              uint32_t(rt.dst_color_blend_factor), uint32_t(rt.color_blend_op),
+              uint32_t(rt.src_alpha_blend_factor), uint32_t(rt.dst_alpha_blend_factor),
+              uint32_t(rt.alpha_blend_op), uint32_t(rt.color_write_mask));
+    }
+    fputs("]}\n", file);
+  }
+  fclose(file);
+  REXGPU_INFO("Wrote pipeline state inventory ({} pipelines) to {}", pipelines_.size(), path);
+}
+
 void VulkanPipelineCache::Shutdown() {
   WriteShaderInventory();
+  WritePipelineInventory();
 
   // Shut down creation threads before destroying any pipelines they may touch.
   if (!creation_threads_.empty()) {

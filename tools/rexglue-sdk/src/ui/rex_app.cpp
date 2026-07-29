@@ -410,6 +410,21 @@ bool ReXApp::SetupPresentation() {
                 std::make_unique<ui::SettingsDialog>(imgui_drawer_.get(), config_path_);
           }
         });
+        // The frame-trace machinery (TraceWriter, RequestFrameTrace) has been
+        // in the graphics system all along with nothing wired to trigger it.
+        // One trace of one frame is the complete ground truth for a draw --
+        // every PM4 packet, register write and memory read -- which is what
+        // the native renderer work is developed and verified against.
+        // Home rather than an F-key: compact keyboards bury the F-row behind
+        // an Fn chord, but every 75% layout keeps a real Home key.
+        rex::ui::RegisterBind("bind_gpu_frame_trace", "Home", "Capture one GPU frame trace",
+                              [this] {
+          auto* gfx = static_cast<rex::graphics::GraphicsSystem*>(runtime_->graphics_system());
+          if (gfx) {
+            gfx->RequestFrameTrace();
+            REXLOG_INFO("GPU frame trace requested (writes next to trace_gpu_prefix)");
+          }
+        });
 
         OnCreateDialogs(imgui_drawer_.get());
       }

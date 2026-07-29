@@ -10,6 +10,7 @@
  */
 
 #include <cstdarg>
+#include <iterator>
 #include <set>
 #include <string>
 
@@ -341,8 +342,19 @@ void ParsedVertexFetchInstruction::Disassemble(string::StringBuffer* out) const 
     out->AppendFormat(", Offset={}", attributes.offset);
   }
   if (attributes.data_format != xenos::VertexFormat::kUndefined) {
-    out->AppendFormat(", DataFormat={}",
-                      kVertexFetchDataFormats[static_cast<int>(attributes.data_format)].name);
+    // The format field is six bits, so it can hold values that aren't any
+    // defined VertexFormat -- the name table has holes at those indices. Print
+    // the raw value instead of formatting a null pointer, which throws and
+    // takes down the whole process from what is only a disassembly path.
+    uint32_t data_format = static_cast<uint32_t>(attributes.data_format);
+    const char* data_format_name = data_format < std::size(kVertexFetchDataFormats)
+                                       ? kVertexFetchDataFormats[data_format].name
+                                       : nullptr;
+    if (data_format_name) {
+      out->AppendFormat(", DataFormat={}", data_format_name);
+    } else {
+      out->AppendFormat(", DataFormat={}", data_format);
+    }
   }
   if (!is_mini_fetch && attributes.stride) {
     out->AppendFormat(", Stride={}", attributes.stride);
@@ -377,7 +389,10 @@ void ParsedTextureFetchInstruction::Disassemble(string::StringBuffer* out) const
   } else {
     out->Append("      ");
   }
-  out->Append(opcode_name);
+  // ParseTextureFetchInstruction leaves opcode_name null if it doesn't
+  // recognise the opcode, so an unknown fetch would take the process down here
+  // rather than just disassembling badly.
+  out->Append(opcode_name ? opcode_name : "unknownFetch");
   out->Append(' ');
   bool needs_comma = false;
   if (has_result()) {

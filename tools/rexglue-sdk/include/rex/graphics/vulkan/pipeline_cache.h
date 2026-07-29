@@ -425,6 +425,7 @@ class VulkanPipelineCache {
   // Diagnostic: dumps every (shader, specialization) pair instantiated this
   // session, for judging ahead-of-time shader conversion feasibility.
   void WriteShaderInventory() const;
+  void WritePipelineInventory() const;
 
   std::unordered_map<PipelineDescription, Pipeline, PipelineDescription::Hasher> pipelines_;
 
