@@ -37,7 +37,13 @@
 #include <rex/math.h>
 #include <rex/ui/vulkan/util.h>
 
-REXCVAR_DEFINE_STRING(render_target_path_vulkan, "", "GPU/Vulkan",
+// "fsi" by default for this title: A/B tested on hardware 2026-07-29, the
+// host render target path washes character colors out to a bleached yellow
+// (gamma surface handling - storage format made no difference), while the
+// interlock path renders them correctly. Devices without fragment shader
+// interlock fall back to host render targets automatically below. Flip back
+// to "" only after the host path passes the same character-color comparison.
+REXCVAR_DEFINE_STRING(render_target_path_vulkan, "fsi", "GPU/Vulkan",
                       "Vulkan render target implementation path")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
@@ -63,6 +69,13 @@ REXCVAR_DEFINE_STRING(render_target_path_vulkan, "", "GPU/Vulkan",
 //     "GPU");
 
 namespace rex::graphics::vulkan {
+
+// EDRAM-emulation cost probe. These transfer draws and resolves exist only
+// because the Xenos resolved through dedicated EDRAM that this GPU does not
+// have; they are the GPU-side work a native render-target path would delete.
+std::atomic<uint32_t> g_edram_transfer_draws{0};
+std::atomic<uint32_t> g_edram_resolves{0};
+
 
 // Generated with `xb buildshaders`.
 namespace shaders {
@@ -5488,6 +5501,20 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
                   sizeof(uint32_t), &transfer_stencil_bit);
               command_buffer.CmdVkSetStencilWriteMask(VK_STENCIL_FACE_FRONT_AND_BACK,
                                                       transfer_stencil_bit);
+            }
+            g_edram_transfer_draws.fetch_add(1, std::memory_order_relaxed);
+            // NATIVE RT PATH GROUNDWORK: characterise each transfer so the
+            // native path can decide which are genuinely required (real EDRAM
+            // aliasing) and which are redundant re-copies of a range nothing
+            // else touched. Logged sparsely; the pattern repeats every frame.
+            {
+              static std::atomic<uint32_t> xfer_log{0};
+              uint32_t n = xfer_log.fetch_add(1, std::memory_order_relaxed);
+              if (n < 40) {
+                REXGPU_INFO("[edram-xfer] #{} dest_rt=0x{:08X} verts={} rects={}",
+                            n, dest_rt_key.key, transfer_vertex_count,
+                            transfer_vertex_count / 3);
+              }
             }
             command_buffer.CmdVkDraw(transfer_vertex_count, 1, 0, 0);
           }

@@ -1470,26 +1470,6 @@ def repair_saves():
     return repaired
 
 
-def scrub_legacy_render_path():
-    """Old builds' instant pop-in toggle wrote render_target_path_vulkan =
-    "fsi" into the config, and once the toggle stopped managing that key the
-    value was simply never touched again -- so those installs stayed pinned to
-    the interlock render path forever. That path is slower on the Deck and
-    washes character colors out to a bleached yellow. The engine picks the
-    right path by itself when the key is absent, so drop the stale line."""
-    try:
-        if not GAME_TOML.exists():
-            return
-        lines = GAME_TOML.read_text(encoding="utf-8").splitlines()
-        kept = [ln for ln in lines
-                if not (ln.partition("=")[0].strip() == "render_target_path_vulkan"
-                        and "fsi" in ln.partition("=")[2])]
-        if len(kept) != len(lines):
-            GAME_TOML.write_text("\n".join(kept) + "\n", encoding="utf-8")
-    except OSError:
-        pass
-
-
 def auto_backup_saves():
     try:
         if not USER_DATA.exists():
@@ -1553,7 +1533,6 @@ def launch_game():
         if repaired:
             install_state["log"].append("Save self-heal: " + ", ".join(repaired))
         auto_backup_saves()
-        scrub_legacy_render_path()
         # Re-sync the managed settings block so default migrations apply on
         # launch, not only when the player next touches a setting.
         write_settings({})
