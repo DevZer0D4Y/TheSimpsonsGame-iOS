@@ -12,7 +12,6 @@
 #pragma once
 
 #include <atomic>
-#include <mutex>
 #include <queue>
 
 #include <rex/kernel.h>
@@ -78,16 +77,6 @@ class AudioSystem : public system::IAudioSystem {
   system::object_ref<system::XHostThread> worker_thread_;
 
   rex::thread::global_critical_region global_critical_region_;
-  // The clients_ table is pure host bookkeeping - guest code never reads it -
-  // so it does not need the process-wide global critical region. Using a
-  // dedicated mutex keeps the audio thread off a lock shared with the GPU
-  // command processor and the write-watch fault handler, which hold it for
-  // milliseconds at a time during level streaming; audio has only ~43 ms of
-  // buffered slack before that turns into an audible dropout.
-  // It still must be *some* mutex, not atomics: it also keeps
-  // UnregisterClient from destroying a driver that SubmitFrame is calling
-  // into. Lock order is clients_mutex_ -> driver-internal locks; never invert.
-  std::mutex clients_mutex_;
   static const size_t kMaximumClientCount = 8;
   struct {
     AudioDriver* driver;

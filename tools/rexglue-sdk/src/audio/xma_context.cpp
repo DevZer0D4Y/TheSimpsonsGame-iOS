@@ -191,15 +191,6 @@ void XmaContext::ClearLocked(XMA_CONTEXT_DATA* data) {
   current_frame_remaining_subframes_ = 0;
   loop_frame_output_limit_ = 0;
   loop_start_skip_pending_ = false;
-
-  // This context slot is being re-initialized for a different stream, so the
-  // decoder's carried-over state (overlap window, history) belongs to the old
-  // one. PrepareDecoder only rebuilds the codec context when the rate or
-  // channel count changes, so a new stream at the same format inherited that
-  // history and the first frames decoded audibly wrong.
-  if (av_context_) {
-    avcodec_flush_buffers(av_context_);
-  }
 }
 
 void XmaContext::Disable() {
