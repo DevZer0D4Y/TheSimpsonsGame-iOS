@@ -11,21 +11,27 @@
 
 #include <rex/graphics/flags.h>
 #include <rex/logging.h>
+#include <rex/platform.h>
 #include <rex/ui/renderdoc_api.h>
 
 REXCVAR_DEFINE_BOOL(gpu_allow_invalid_fetch_constants, false, "GPU",
                     "Allow invalid fetch constants");
-// HAND PATCH: this game leaves the vertex fetch constants of absent optional
-// streams (blend-shape deltas on morphless meshes, slots 89-94) permanently
-// all-zero with the "invalid" type. The shaders never read those slots at
-// runtime (they branch around them, and the translator zero-clamps size-0
-// fetches anyway), but static shader analysis still flags them, so vetoing
-// on them threw away entire otherwise-valid character draws -- the "eternal
-// pop-in" where characters simply never appeared. Admitting these is safe on
-// every GPU tested and needs none of the risky stale-address admission that
-// gpu_allow_invalid_fetch_constants also turns on, so it gets its own switch
-// and defaults to on.
-REXCVAR_DEFINE_BOOL(gpu_allow_null_optional_streams, true, "GPU",
+// This game leaves the vertex fetch constants of absent optional streams
+// (blend-shape deltas on morphless meshes, slots 89-94) permanently all-zero
+// with the "invalid" type. The shaders never read those slots at runtime, but
+// static analysis still flags them, so vetoing on them threw away entire
+// otherwise-valid character draws -- the "eternal pop-in" where characters
+// simply never appeared. Admitting these fixes that, and holds up on the
+// D3D12 backend.
+//
+// On the Vulkan backend it does not hold up: on Van Gogh (Steam Deck, RADV)
+// admitting these draws wedges the GPU with VK_ERROR_DEVICE_LOST right where
+// gameplay rendering starts -- 0.0.5.x shipped with this on and Deck players
+// crashed at the end of the first cutscene, every time. "Provably safe on
+// paper" did not survive contact with the hardware, so the default is on only
+// where D3D12 is the backend that runs. Do not widen it again without a clean
+// in-game soak on an actual Deck.
+REXCVAR_DEFINE_BOOL(gpu_allow_null_optional_streams, REX_PLATFORM_WIN32 != 0, "GPU",
                     "Draw meshes whose only invalid vertex fetch constants are "
                     "all-zero optional (stride 0) streams the shader never "
                     "actually reads.");

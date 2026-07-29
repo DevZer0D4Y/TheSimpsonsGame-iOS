@@ -35,14 +35,14 @@ REXCVAR_DEFINE_STRING(trace_gpu_prefix, "", "GPU", "GPU trace file prefix");
 
 REXCVAR_DEFINE_BOOL(trace_gpu_stream, false, "GPU", "Enable GPU trace streaming");
 
-// FXAA by default: this game is cel-shaded, so nearly every surface is
-// outlined with high-contrast near-diagonal lines - the worst case for
-// aliasing, and very visible at the guest's native resolution. The pass rides
-// along in the existing swap/gamma compute dispatch, so it costs one dispatch
-// over the swap image rather than a separate full-screen pass. Plain "fxaa"
-// rather than "fxaa_extreme": extreme's lower threshold and longer search
-// span visibly smear the HUD and 2D text, which live in this same image.
-REXCVAR_DEFINE_STRING(swap_post_effect, "fxaa", "GPU", "Swap post effect: none, fxaa, fxaa_extreme")
+// Stays "none" until the FXAA path actually works. Defaulting it to "fxaa"
+// produced a completely black screen on RADV/Van Gogh: the game ran fine
+// (2100+ frames, ~48fps, draws issued normally) but nothing was presented.
+// That path had never been exercised before, because it has always shipped
+// disabled -- so enabling it by default shipped an untested code path as the
+// default experience. Do not flip this again without confirming a real frame
+// reaches the screen on the target hardware.
+REXCVAR_DEFINE_STRING(swap_post_effect, "none", "GPU", "Swap post effect: none, fxaa, fxaa_extreme")
     .allowed({"none", "fxaa", "fxaa_extreme"})
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
