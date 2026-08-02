@@ -130,6 +130,11 @@ if(REXGLUE_USE_VULKAN)
         glslang::SPIRV
         GPUOpen::VulkanMemoryAllocator
     )
+    # The presenter (rexui) uses DXGI for the swapchain/display on Windows
+    # regardless of the graphics backend.
+    if(WIN32)
+        target_link_libraries(rexgraphics PUBLIC dxgi)
+    endif()
     target_link_libraries(rexgraphics PRIVATE
         glslang
         MachineIndependent
