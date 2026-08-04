@@ -22,6 +22,7 @@
 #include <rex/ui/overlay/console_overlay.h>
 #include <rex/ui/overlay/debug_overlay.h>
 #include <rex/ui/overlay/settings_overlay.h>
+#include <rex/graphics/flags.h>
 #include <rex/graphics/graphics_system.h>
 #if REX_HAS_VULKAN
 #include <rex/graphics/vulkan/graphics_system.h>
@@ -338,10 +339,23 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
 }
 
 bool ReXApp::SetupPresentation() {
-#if REX_HAS_D3D12
-  config_.graphics = REX_GRAPHICS_BACKEND(rex::graphics::d3d12::D3D12GraphicsSystem);
+  // Vulkan is the primary backend everywhere it is built: its fragment
+  // shader interlock render path is the one that plays the VP6 FMVs and
+  // matches console colors, while D3D12 only has the host render target
+  // path, which still loses the video render target's dumps (black intro
+  // videos). D3D12 remains available with gpu = "d3d12" and as the
+  // automatic fallback when Vulkan cannot initialize.
+#if REX_HAS_D3D12 && REX_HAS_VULKAN
+  const bool want_d3d12 = REXCVAR_GET(gpu) == "d3d12";
+  if (want_d3d12) {
+    config_.graphics = REX_GRAPHICS_BACKEND(rex::graphics::d3d12::D3D12GraphicsSystem);
+  } else {
+    config_.graphics = REX_GRAPHICS_BACKEND(rex::graphics::vulkan::VulkanGraphicsSystem);
+  }
 #elif REX_HAS_VULKAN
   config_.graphics = REX_GRAPHICS_BACKEND(rex::graphics::vulkan::VulkanGraphicsSystem);
+#elif REX_HAS_D3D12
+  config_.graphics = REX_GRAPHICS_BACKEND(rex::graphics::d3d12::D3D12GraphicsSystem);
 #endif
   config_.audio_factory = REX_AUDIO_BACKEND(rex::audio::sdl::SDLAudioSystem);
   config_.input_factory = REX_INPUT_BACKEND(rex::input::CreateDefaultInputSystem);
@@ -351,6 +365,16 @@ bool ReXApp::SetupPresentation() {
 
   if (config_.graphics) {
     X_STATUS status = config_.graphics->SetupPresentation(&app_context());
+#if REX_HAS_D3D12 && REX_HAS_VULKAN
+    if (XFAILED(status) && !want_d3d12) {
+      REXLOG_WARN(
+          "Vulkan presentation setup failed ({:08X}) - falling back to the "
+          "D3D12 backend",
+          status);
+      config_.graphics = REX_GRAPHICS_BACKEND(rex::graphics::d3d12::D3D12GraphicsSystem);
+      status = config_.graphics->SetupPresentation(&app_context());
+    }
+#endif
     if (XFAILED(status)) {
       REXLOG_ERROR("Graphics presentation setup failed: {:08X}", status);
       return false;

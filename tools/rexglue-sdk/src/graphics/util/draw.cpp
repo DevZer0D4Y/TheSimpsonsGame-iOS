@@ -693,6 +693,7 @@ InvalidVertexFetchVerdict ClassifyInvalidVertexFetch(const RegisterFile& regs,
   // draws just because a slot's buffer state was already cached).
   bool saw_invalid = false;
   bool saw_stale_address = false;
+  bool saw_read_null_optional = false;
   const Shader::ConstantRegisterMap& constant_map = vertex_shader.constant_register_map();
   for (uint32_t i = 0; i < rex::countof(constant_map.vertex_fetch_bitmap); ++i) {
     uint32_t vfetch_bits_remaining = constant_map.vertex_fetch_bitmap[i];
@@ -713,14 +714,20 @@ InvalidVertexFetchVerdict ClassifyInvalidVertexFetch(const RegisterFile& regs,
       }
       saw_invalid = true;
       if (vfetch_constant.address == 0 && vfetch_constant.size == 0) {
-        // All-zero constants: harmless on an optional (stride 0) stream the
-        // shader skips, poison on a main stream (all-zero vertex data makes
-        // (0,0,0,0)-class positions that wedge the scan converter). Tell the
-        // two apart by the binding stride, exactly like the null-stream gate
-        // this classification replaced.
+        // All-zero constants: harmless on a slot the shader references but
+        // never actually fetches through (no vertex binding exists - the
+        // translator only creates one when a fetch result is used), poison
+        // on a main stream (all-zero vertex data makes (0,0,0,0)-class
+        // positions that wedge the scan converter). A stride-0 binding sits
+        // in between: the shader really reads the absent stream, and
+        // rasterizing whatever its zeros produce has hung Van Gogh, RDNA2
+        // Vulkan and D3D12 alike (#13/#16) - so those draws run their vertex
+        // work (streaming still completes) with rasterization disabled.
         bool optional_stream = true;
+        bool stream_is_read = false;
         for (const Shader::VertexBinding& vfetch_binding : vertex_shader.vertex_bindings()) {
           if (vfetch_binding.fetch_constant == vfetch_index) {
+            stream_is_read = true;
             optional_stream = vfetch_binding.stride_words == 0;
             break;
           }
@@ -739,6 +746,9 @@ InvalidVertexFetchVerdict ClassifyInvalidVertexFetch(const RegisterFile& regs,
         if (!REXCVAR_GET(gpu_allow_null_optional_streams) &&
             !REXCVAR_GET(gpu_allow_invalid_fetch_constants)) {
           return InvalidVertexFetchVerdict::kVeto;
+        }
+        if (stream_is_read) {
+          saw_read_null_optional = true;
         }
         continue;
       }
@@ -781,6 +791,16 @@ InvalidVertexFetchVerdict ClassifyInvalidVertexFetch(const RegisterFile& regs,
     if (log_n < 256 || (log_n & 255) == 0) {
       REXGPU_WARN("[INVALID-VFETCH-PRIMING] vs={:016X} admitted without rasterization "
                   "(occurrence {})",
+                  vertex_shader.ucode_data_hash(), log_n + 1);
+    }
+    return InvalidVertexFetchVerdict::kPrimeWithoutRasterization;
+  }
+  if (saw_read_null_optional) {
+    static std::atomic<uint32_t> read_null_logs{0};
+    uint32_t log_n = read_null_logs.fetch_add(1, std::memory_order_relaxed);
+    if (log_n < 256 || (log_n & 255) == 0) {
+      REXGPU_WARN("[NULL-OPTIONAL-READ] vs={:016X} reads an absent optional stream - "
+                  "vertex work only, rasterization disabled (occurrence {})",
                   vertex_shader.ucode_data_hash(), log_n + 1);
     }
     return InvalidVertexFetchVerdict::kPrimeWithoutRasterization;

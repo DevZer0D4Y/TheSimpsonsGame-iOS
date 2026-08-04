@@ -340,17 +340,19 @@ void AddMemExportRanges(const RegisterFile& regs, const Shader& shader,
 enum class InvalidVertexFetchVerdict : uint32_t {
   // No used fetch slot has the invalid type - completely ordinary draw.
   kNone,
-  // Every invalid slot is an all-zero OPTIONAL stream (stride-0 secondary
-  // binding, e.g. this game's absent blend-shape streams). The shader
-  // provably never reads those slots (dynamic branch around them, and the
-  // translator zero-clamps size-0 fetches), so the draw is safe to rasterize
-  // like any valid one. Gated by gpu_allow_null_optional_streams.
+  // Every invalid slot is an all-zero OPTIONAL stream the shader references
+  // but never fetches a used result through (no vertex binding exists for
+  // it - the translator only creates one when a fetch result is consumed),
+  // so the draw is safe to rasterize like any valid one. Gated by
+  // gpu_allow_null_optional_streams.
   kRasterize,
-  // At least one invalid slot carries a plausible stale address/size - a
-  // RenderWare streaming "priming" draw. Its vertex shading + memexport must
-  // run so the CPU readback can finalize the entity, but its rasterized
-  // output is garbage (and has wedged the Van Gogh scan converter), so the
-  // caller must run it with rasterization fully disabled. Gated by
+  // Either a plausible stale address/size (a RenderWare streaming "priming"
+  // draw whose vertex shading + memexport must run so the CPU readback can
+  // finalize the entity), or an all-zero optional stream the shader REALLY
+  // reads through a stride-0 binding - rasterizing what those zeros produce
+  // has hung Van Gogh, RDNA2 Vulkan and D3D12 (#13/#16). In both shapes the
+  // rasterized output is garbage, so the caller must run the draw with
+  // rasterization fully disabled. Stale addresses are gated by
   // gpu_allow_invalid_fetch_constants.
   kPrimeWithoutRasterization,
   // A null MAIN stream (entity genuinely mid-stream: all-zero vertex data

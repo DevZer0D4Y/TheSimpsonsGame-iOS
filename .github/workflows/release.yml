@@ -32,7 +32,7 @@ env:
 jobs:
   # ---------------------------------------------------------------- Windows
   windows:
-    name: Windows x64 (clang / D3D12)
+    name: Windows x64 (clang / Vulkan + D3D12)
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -48,7 +48,7 @@ jobs:
       - name: Install Ninja
         run: choco install ninja -y --no-progress
 
-      - name: Configure (game + SDK, D3D12)
+      - name: Configure (game + SDK, Vulkan + D3D12)
         shell: pwsh
         working-directory: simpsons
         run: |

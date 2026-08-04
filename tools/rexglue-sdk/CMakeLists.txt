@@ -38,10 +38,13 @@ endif()
 
 # Graphics backend selection
 # D3D12: Windows only, ON by default.
-# Vulkan: Cross-platform, ON by default on Linux, OFF by default on Windows.
+# Vulkan: Cross-platform, ON by default everywhere - on Windows it is the
+# primary backend (the fragment shader interlock render path plays the VP6
+# FMVs and matches console colors; D3D12's host render target path does
+# not), with D3D12 kept as the runtime fallback and the gpu="d3d12" choice.
 if(WIN32)
     option(REXGLUE_USE_D3D12  "Enable D3D12 graphics backend" ON)
-    option(REXGLUE_USE_VULKAN "Enable Vulkan graphics backend" OFF)
+    option(REXGLUE_USE_VULKAN "Enable Vulkan graphics backend" ON)
 else()
     set(REXGLUE_USE_D3D12 OFF)
     option(REXGLUE_USE_VULKAN "Enable Vulkan graphics backend" ON)
