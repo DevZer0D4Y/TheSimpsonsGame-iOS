@@ -14,6 +14,7 @@ The Simpsons Game — Recompiled : Launcher  (v3)
 """
 
 import http.server
+import hashlib
 import json
 import os
 import platform
@@ -144,7 +145,16 @@ def _user_data_dir():
             return Path(base) / "simpsons"
         return Path.home() / "AppData" / "Local" / "simpsons"
     xdg = os.environ.get("XDG_DATA_HOME")
-    base = Path(xdg) if xdg else Path.home() / ".local" / "share"
+    # Ignore XDG_DATA_HOME when it points inside a Flatpak sandbox. Launching
+    # from a terminal owned by a Flatpak app (VS Code, for instance) exports
+    # that app's private data dir to children, which silently sends saves to
+    # ~/.var/app/<app>/data/simpsons instead of the real location -- so the
+    # same install shows a different set of saves depending on what happened
+    # to spawn it, which reads to the player as "my save vanished".
+    if xdg and "/.var/app/" not in str(xdg):
+        base = Path(xdg)
+    else:
+        base = Path.home() / ".local" / "share"
     return base / "simpsons"
 
 
@@ -191,6 +201,9 @@ def capture_keys():
         "draw_telemetry": "true",
         "perf_log_csv": f'"{(CAPTURE_DIR / "perf.csv").as_posix()}"',
         "shader_inventory_csv": f'"{(CAPTURE_DIR / "shader_inventory.csv").as_posix()}"',
+        "pipeline_inventory_json": f'"{(CAPTURE_DIR / "pipeline_inventory.jsonl").as_posix()}"',
+        # Frame traces (F10 in-game) land in the capture folder too.
+        "trace_gpu_prefix": f'"{(CAPTURE_DIR / "trace").as_posix()}"',
     }
 
 
@@ -239,6 +252,9 @@ SETTINGS_SCHEMA = {
     "mnk_sensitivity": ("float", 1.0, False),
     # game
     "user_language": ("int", 1, True),
+    # graphics backend: "" = automatic (Vulkan first, D3D12 fallback on
+    # Windows), "vulkan" or "d3d12" to force one. Chosen at startup.
+    "gpu": ("str", "", True),
     # audio
     "audio_mute": ("bool", False, False),
     "audio_maxqframes": ("int", 32, True),
@@ -332,7 +348,8 @@ def write_settings(new_values):
             key = s.partition("=")[0].strip()
             if "=" in s and not s.startswith("#") and (
                     key in SETTINGS_SCHEMA or key in DERIVED_KEYS
-                    or key in ("draw_telemetry", "perf_log_csv", "shader_inventory_csv")):
+                    or key in ("draw_telemetry", "perf_log_csv", "shader_inventory_csv",
+                               "pipeline_inventory_json", "trace_gpu_prefix")):
                 continue
             lines.append(line)
         while lines and not lines[-1].strip():
@@ -478,6 +495,18 @@ def art_files():
     return sorted(p.name for p in ART_DIR.glob("hero*.jpg")) if ART_DIR.is_dir() else []
 
 
+def art_version():
+    """Newest art file mtime — the UI uses this to know when to re-fetch
+    images, since regeneration reuses the same hero*.jpg names."""
+    try:
+        return max(int(p.stat().st_mtime) for p in ART_DIR.glob("hero*.jpg"))
+    except (ValueError, OSError):
+        return 0
+
+
+art_state = {"running": False}
+
+
 def list_mods():
     MODS_DIR.mkdir(exist_ok=True)
     return sorted(p.name for p in MODS_DIR.iterdir() if not p.name.startswith("."))
@@ -498,6 +527,8 @@ def status():
         "engine_date": time.strftime("%Y-%m-%d %H:%M", time.localtime(GAME_BIN.stat().st_mtime)) if GAME_BIN.exists() else None,
         "gamedata_ready": gamedata_ok(),
         "art": art_files(),
+        "art_version": art_version(),
+        "art_running": art_state["running"],
         "running": bool(game_running_pids()),
         "mods": list_mods(),
         "backups": list_backups(),
@@ -572,6 +603,16 @@ def ffmpeg_path():
 def generate_art(force=False):
     if not gamedata_ok() or not ffmpeg_path():
         return
+    if art_state["running"]:
+        return
+    art_state["running"] = True
+    try:
+        _generate_art_locked(force)
+    finally:
+        art_state["running"] = False
+
+
+def _generate_art_locked(force):
     ART_DIR.mkdir(parents=True, exist_ok=True)
     marker = ART_DIR / ".attempted"
     if not force and (art_files() or marker.exists()):
@@ -590,6 +631,8 @@ def generate_art(force=False):
     candidates = igc + rest
     for old_art in ART_DIR.glob("hero*.jpg"):
         old_art.unlink(missing_ok=True)
+    for old_fb in ART_DIR.glob(".fb*.jpg"):
+        old_fb.unlink(missing_ok=True)
     made = 0
     attempts = 0
     for mv in candidates:
@@ -603,15 +646,33 @@ def generate_art(force=False):
                 break
             out = ART_DIR / f"hero{made}.jpg"
             attempts += 1
-            r = subprocess.run(
-                [ffmpeg_path(), "-loglevel", "error", "-y", "-ss", ts, "-i", str(mv),
-                 "-frames:v", "1", "-q:v", "3", str(out)],
-                capture_output=True, timeout=60, **POPEN_NO_WINDOW)
+            try:
+                r = subprocess.run(
+                    [ffmpeg_path(), "-loglevel", "error", "-y", "-ss", ts, "-i", str(mv),
+                     "-frames:v", "1", "-q:v", "3", str(out)],
+                    capture_output=True, timeout=60, **POPEN_NO_WINDOW)
+                rc = r.returncode
+            except (subprocess.TimeoutExpired, OSError):
+                rc = -1
             # size threshold filters black/flat frames
-            if r.returncode == 0 and out.exists() and out.stat().st_size > 45000:
+            if rc == 0 and out.exists() and out.stat().st_size > 45000:
                 made += 1
+            elif rc == 0 and out.exists() and out.stat().st_size > 12000:
+                # Decoded fine but too small for the main cut - keep as a
+                # fallback so a dark-ish set of movies still yields art
+                # instead of a permanently empty folder.
+                out.rename(ART_DIR / f".fb{attempts}.jpg")
             else:
                 out.unlink(missing_ok=True)
+    if made == 0:
+        # Promote the largest decodable frames rather than leaving nothing.
+        fallbacks = sorted(ART_DIR.glob(".fb*.jpg"),
+                           key=lambda p: p.stat().st_size, reverse=True)
+        for fb in fallbacks[:8]:
+            fb.rename(ART_DIR / f"hero{made}.jpg")
+            made += 1
+    for leftover in ART_DIR.glob(".fb*.jpg"):
+        leftover.unlink(missing_ok=True)
     try:
         marker.write_text(f"made={made} attempts={attempts}\n", encoding="utf-8")
     except OSError:
@@ -946,6 +1007,7 @@ def apply_update():
             # overwritten, but Windows does allow renaming an open exe out
             # of the way first -- the currently-running process keeps
             # executing fine from the renamed file.
+            #
             # This must never fail silently: if everything else updates but
             # the launcher exe stays old, its (stamped) version keeps
             # comparing below the release it just installed, and the player
@@ -1433,6 +1495,20 @@ def repair_saves():
                 rel_data = f"{prof.parent.name}/45410809/00000001/{slot_name}/{slot_name}"
                 rel_head = f"{prof.parent.name}/45410809/Headers/00000001/{slot_name}.header"
                 fixed = False
+
+                # Prefer a live snapshot: those are taken while playing, so
+                # they cost at most one save-write, where the launch-time zips
+                # cost the whole session.
+                guard = restore_slot_from_guard(slot_name)
+                if guard is not None and guard.stat().st_size >= 4096:
+                    slot_file.write_bytes(guard.read_bytes())
+                    guard_head = guard.with_suffix(".header")
+                    if guard_head.is_file():
+                        head = prof / "Headers/00000001" / f"{slot_name}.header"
+                        head.parent.mkdir(parents=True, exist_ok=True)
+                        head.write_bytes(guard_head.read_bytes())
+                    repaired.append(f"{slot_name} (from live snapshot)")
+                    continue
                 for zf in backups:
                     try:
                         with zipfile.ZipFile(zf) as z:
@@ -1488,11 +1564,92 @@ def auto_backup_saves():
         pass
 
 
+# ---------------------------------------------------- live save protection
+
+# The engine truncates a save slot to zero bytes the moment it opens it for
+# writing (HostPathEntry::Truncate uses "wb"), and only then writes the new
+# contents. A crash anywhere in that window - a GPU device-lost, a hang, a
+# kill - leaves a 0-byte husk and the save is simply gone. auto_backup_saves()
+# only runs at launch, so everything since launch was lost with it.
+#
+# This watches the slots while the game runs and keeps a copy of every healthy
+# version it sees, so the worst a crash can cost is the single write that was
+# in flight. repair_saves() already knows how to restore from these.
+SAVE_GUARD_DIR = BACKUPS_DIR / "live"
+SAVE_GUARD_KEEP = 12
+SAVE_GUARD_POLL_SEC = 4
+# Below this a slot is a husk, not a save; matches repair_saves' threshold.
+SAVE_MIN_BYTES = 4096
+
+save_guard_stop = threading.Event()
+
+
+def _healthy_slot_files():
+    if not USER_DATA.exists():
+        return []
+    out = []
+    for prof in USER_DATA.glob("*/45410809"):
+        for slot in prof.glob("00000001/*/*"):
+            try:
+                if slot.is_file() and slot.stat().st_size >= SAVE_MIN_BYTES:
+                    out.append(slot)
+            except OSError:
+                pass
+    return out
+
+
+def _save_guard_loop():
+    """Snapshot each slot whenever its contents change to a healthy value."""
+    seen = {}
+    while not save_guard_stop.is_set():
+        try:
+            for slot in _healthy_slot_files():
+                data = slot.read_bytes()
+                digest = hashlib.sha256(data).hexdigest()
+                if seen.get(slot.name) == digest:
+                    continue
+                seen[slot.name] = digest
+                SAVE_GUARD_DIR.mkdir(parents=True, exist_ok=True)
+                stamp = time.strftime("%Y%m%d-%H%M%S")
+                (SAVE_GUARD_DIR / f"{slot.name}-{stamp}.bin").write_bytes(data)
+                header = (slot.parents[2] / "Headers" / "00000001" /
+                          f"{slot.name}.header")
+                if header.is_file():
+                    (SAVE_GUARD_DIR / f"{slot.name}-{stamp}.header").write_bytes(
+                        header.read_bytes())
+                # Keep the newest few per slot; these are ~115 KB each.
+                snaps = sorted(SAVE_GUARD_DIR.glob(f"{slot.name}-*.bin"))
+                for old in snaps[:-SAVE_GUARD_KEEP]:
+                    old.unlink(missing_ok=True)
+                    old.with_suffix(".header").unlink(missing_ok=True)
+        except Exception:
+            pass
+        save_guard_stop.wait(SAVE_GUARD_POLL_SEC)
+
+
+def start_save_guard():
+    save_guard_stop.clear()
+    t = threading.Thread(target=_save_guard_loop, daemon=True)
+    t.start()
+    return t
+
+
+def stop_save_guard():
+    save_guard_stop.set()
+
+
+def restore_slot_from_guard(slot_name):
+    """Newest healthy snapshot for a slot, or None."""
+    snaps = sorted(SAVE_GUARD_DIR.glob(f"{slot_name}-*.bin")) if SAVE_GUARD_DIR.is_dir() else []
+    return snaps[-1] if snaps else None
+
+
 def _watch_game_exit(proc, diag=None):
     """Record how the game ended; a GPU hang / kill mid-load can leave a corrupt
     shader cache behind, which then hangs the GPU on every later load. Purge the
     cache automatically after any abnormal exit."""
     code = proc.wait()
+    stop_save_guard()  # game is gone; nothing left to snapshot
     notes = []
     try:
         (LAUNCHER_DIR / "last_exit.txt").write_text(str(code))
@@ -1529,6 +1686,7 @@ def launch_game():
             return False, ("Game data is incomplete: the movies folder is missing from "
                            f"{GAMEDATA}. Re-run the install from your ISO in the "
                            "Install tab.")
+        start_save_guard()
         repaired = repair_saves()
         if repaired:
             install_state["log"].append("Save self-heal: " + ", ".join(repaired))
@@ -1595,7 +1753,11 @@ def launch_game():
         libs = [str(_resolve(d)) for d in CONFIG["lib_dirs"].get(PLAT, [])]
         if libs:
             env["LD_LIBRARY_PATH"] = ":".join(libs) + ":" + env.get("LD_LIBRARY_PATH", "")
-        cmd = [str(GAME_BIN), "--game_data_root", str(GAMEDATA)]
+        # Pass the user data root explicitly: the engine derives it from
+        # XDG_DATA_HOME independently, so without this the launcher and the
+        # game can disagree about where saves live.
+        cmd = [str(GAME_BIN), "--game_data_root", str(GAMEDATA),
+               "--user_data_root", str(USER_DATA)]
         debug_gdb = LAUNCHER_DIR / "debug_run.gdb"
         crash_log = LAUNCHER_DIR / "last_run_debug.txt"
         if debug_gdb.exists() and shutil.which("gdb"):
@@ -1817,14 +1979,33 @@ def run_native(url):
 
 
 def open_browser(url):
+    # App-mode chromium first (nicest window), then any regular browser,
+    # then flatpak browsers (the Steam Deck ships Firefox as a flatpak and
+    # nothing else), then the OS default handler. Report success so the
+    # caller can tell the player to open the URL by hand as a last resort.
     for browser in ("chromium", "chromium-browser", "google-chrome-stable", "brave"):
         exe = shutil.which(browser)
         if exe:
             subprocess.Popen([exe, f"--app={url}", "--window-size=1180,800"],
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            return
+            return True
+    for browser in ("firefox", "brave-browser", "vivaldi", "epiphany"):
+        exe = shutil.which(browser)
+        if exe:
+            subprocess.Popen([exe, url],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return True
+    if shutil.which("flatpak"):
+        for app_id in ("org.mozilla.firefox", "org.chromium.Chromium",
+                       "com.brave.Browser", "com.google.Chrome"):
+            r = subprocess.run(["flatpak", "info", app_id],
+                               capture_output=True, **POPEN_NO_WINDOW)
+            if r.returncode == 0:
+                subprocess.Popen(["flatpak", "run", app_id, url],
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                return True
     import webbrowser
-    webbrowser.open(url)
+    return webbrowser.open(url)
 
 
 def main():
@@ -1858,12 +2039,22 @@ def main():
     except Exception:       # noqa: BLE001
         import traceback
         tb = traceback.format_exc()
-        print(f"(native window unavailable; falling back to browser)\n{tb}")
+        # The full traceback goes to a log file only: printing it to the
+        # terminal made the graceful fallback look like a crash (issue #9).
         try:
             (LAUNCHER_DIR / "launcher_native_error.log").write_text(tb)
         except Exception:
             pass
-        open_browser(url)
+        print("(native window unavailable; opening in your browser instead — "
+              "details in launcher_native_error.log)")
+        opened = False
+        try:
+            opened = open_browser(url)
+        except Exception:
+            opened = False
+        if not opened:
+            print(f"Could not open a browser automatically.\n"
+                  f"Open this address in any browser to use the launcher: {url}")
         try:
             while True:
                 time.sleep(3600)

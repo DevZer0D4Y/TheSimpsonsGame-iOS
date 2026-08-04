@@ -295,6 +295,15 @@
           <div class="hint">Experimental — changes the game's internal video mode; can crash some scenes. Use Automatic if unstable. Restart needed.</div>
         </div>
         <div class="field">
+          <label>Graphics backend</label>
+          <select id="s-gpu">
+            <option value="">Automatic (Vulkan, D3D12 fallback)</option>
+            <option value="vulkan">Vulkan</option>
+            <option value="d3d12">Direct3D 12 (Windows only)</option>
+          </select>
+          <div class="hint">Vulkan plays the intro videos and matches console colors. Pick Direct3D 12 only if Vulkan fails on your GPU. Restart needed.</div>
+        </div>
+        <div class="field">
           <label class="switch"><input type="checkbox" id="s-vsync"> VSync</label>
         </div>
         <div class="field">
@@ -668,13 +677,13 @@ document.querySelectorAll("nav button").forEach(b => b.onclick = () => {
 });
 
 /* hero art rotation */
-let artList = [], artIdx = 0;
+let artList = [], artIdx = 0, artVersion = 0, shownArtVersion = -1;
 setInterval(() => {
   if (artList.length < 2) return;
   artIdx = (artIdx + 1) % artList.length;
   const img = $("#heroimg");
   img.style.opacity = 0;
-  setTimeout(() => { img.src = "/art/" + artList[artIdx]; img.style.opacity = 1; }, 600);
+  setTimeout(() => { img.src = "/art/" + artList[artIdx] + "?v=" + artVersion; img.style.opacity = 1; }, 600);
 }, 9000);
 
 /* status polling */
@@ -685,8 +694,24 @@ async function refresh(){
     lastStatus = st;
     renderCapture(st.capture_armed);
     artList = st.art || [];
+    artVersion = st.art_version || 0;
     const img = $("#heroimg");
-    if (artList.length && !img.src) img.src = "/art/" + artList[0];
+    // Regeneration reuses the same filenames, so the mtime version has to be
+    // part of the URL or the browser keeps showing the old image (and setting
+    // src to an identical URL is a no-op, which is why regenerated art never
+    // appeared at all before).
+    const wantSrc = artList.length ? "/art/" + artList[0] + "?v=" + artVersion : "";
+    if (wantSrc && img.getAttribute("src") !== wantSrc &&
+        (!img.getAttribute("src") || artVersion !== shownArtVersion)) {
+      img.src = wantSrc;
+      artIdx = 0;
+      shownArtVersion = artVersion;
+    }
+    const regenBtn = $("#regenart");
+    if (regenBtn) {
+      regenBtn.disabled = !!st.art_running;
+      regenBtn.textContent = st.art_running ? "Generating…" : "Regenerate";
+    }
     const ready = st.engine_ready && st.gamedata_ready;
     $("#playbtn").disabled = !ready || st.running;
     $("#playbtn").textContent = st.running ? "RUNNING…" : "PLAY";
@@ -841,7 +866,12 @@ $("#installbtn").onclick = () => {
   if (!iso) { alert("Choose your ISO file first (Browse…)."); return; }
   api.post("/api/install", {iso_path: iso}).then(refresh);
 };
-$("#regenart").onclick = () => api.post("/api/regen-art");
+$("#regenart").onclick = () => {
+  const b = $("#regenart");
+  b.disabled = true;
+  b.textContent = "Generating…";
+  api.post("/api/regen-art").then(refresh);
+};
 function closeBrowse(){ $("#browsemodal").classList.add("hidden"); }
 $("#browsebtn").onclick = () => { $("#browsemodal").classList.remove("hidden"); loadBrowse("").catch(closeBrowse); };
 $("#browseclose").addEventListener("click", closeBrowse);
@@ -1022,6 +1052,7 @@ async function loadSettings(){
   const s = await api.get("/api/settings"); const v = s.values;
   $("#s-fullscreen").value = String(v.fullscreen);
   $("#s-resolution").value = v.resolution || "";
+  $("#s-gpu").value = v.gpu || "";
   $("#s-vsync").checked = v.vsync;
   $("#s-present_letterbox").checked = v.present_letterbox;
   $("#s-resolution_scale").value = String(v.resolution_scale);
@@ -1043,6 +1074,7 @@ $("#savebtn").onclick = async () => {
   await api.post("/api/settings", {values:{
     fullscreen: $("#s-fullscreen").value === "true",
     resolution: $("#s-resolution").value,
+    gpu: $("#s-gpu").value,
     vsync: $("#s-vsync").checked,
     present_letterbox: $("#s-present_letterbox").checked,
     resolution_scale: Number($("#s-resolution_scale").value),
