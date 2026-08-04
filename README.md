@@ -296,6 +296,39 @@ python launcher/launcher.py
 The build stages `rexruntime*.dll` and `TracyClient*.dll` next to `simpsons.exe`
 automatically — Windows has no `LD_LIBRARY_PATH`, so DLLs live beside the exe.
 
+### Building with Vulkan on Windows
+
+Windows defaults to the **D3D12** backend, but the **Vulkan** backend also builds and
+runs on Windows (it is the default on Linux). This is useful if you want the fragment
+shader interlock render path, or if you are hitting a D3D12-only issue — for example,
+FMV playback (`.vp6`) currently shows a black screen on the host render target path
+(D3D12, and Vulkan with `render_target_path_vulkan=""`), while it plays fine on the
+Vulkan interlock path.
+
+Prerequisites are the same as the D3D12 build above. Configure a separate build
+directory so the SDK output does not clobber the D3D12 one:
+
+```powershell
+cmake -S simpsons -B simpsons/out/build/win-vk -G Ninja `
+      -DCMAKE_BUILD_TYPE=RelWithDebInfo `
+      -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ `
+      "-DCMAKE_CXX_FLAGS=-march=x86-64-v3" `
+      -DREXGLUE_USE_D3D12=OFF -DREXGLUE_USE_VULKAN=ON `
+      -DREXSDK_DIR="$PWD/tools/rexglue-sdk"
+cmake --build simpsons/out/build/win-vk --target simpsons
+```
+
+Notes:
+
+- The Vulkan backend links `dxgi` on Windows because the presenter (`rexui`) uses
+  DXGI for the swapchain regardless of the graphics backend (this was only linked in
+  the D3D12 branch).
+- The SDK output directory (`tools/rexglue-sdk/out/win-amd64`) is shared between the
+  D3D12 and Vulkan builds — building the Vulkan variant overwrites
+  `rexruntimerd.dll` there, so back it up before switching back to D3D12.
+- Use a `RelWithDebInfo`/`Release` build type: without `-DNDEBUG`, the render path
+  assertions (`GetPath() == Path::kHostRenderTargets`) fire on the interlock path.
+
 ## Legal & disclaimers
 
 *The Simpsons Game* © 2007 Electronic Arts / Fox. This is an unaffiliated, non-commercial
