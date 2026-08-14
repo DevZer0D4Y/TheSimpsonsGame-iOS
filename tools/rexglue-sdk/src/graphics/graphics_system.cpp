@@ -169,6 +169,13 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
             std::max(uint64_t(1), uint64_t(double(guest_tick_frequency) / refresh_rate_hz));
         uint64_t no_vsync_interval_ticks = std::max(uint64_t(1), guest_tick_frequency / 1000);
         uint64_t last_frame_time = chrono::Clock::QueryGuestTickCount();
+        // File-based frame trace trigger, checked about once a second. A
+        // keybind can be swallowed by whatever sits between the compositor
+        // and the game (and compact keyboards hide the F-row), but touching
+        // a file next to the trace prefix works from any terminal or from
+        // the launcher UI: drop <trace_gpu_prefix>.request and the next
+        // frame is traced.
+        uint32_t trace_trigger_divider = 0;
         while (vsync_worker_running_) {
           uint64_t current_time = chrono::Clock::QueryGuestTickCount();
           uint64_t interval_ticks =
@@ -176,6 +183,19 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
           while (current_time - last_frame_time >= interval_ticks) {
             MarkVblank();
             last_frame_time += interval_ticks;
+          }
+          if (++trace_trigger_divider >= 1000) {
+            trace_trigger_divider = 0;
+            const std::string& trace_prefix = REXCVAR_GET(trace_gpu_prefix);
+            if (!trace_prefix.empty()) {
+              std::filesystem::path request_path(trace_prefix + ".request");
+              std::error_code trace_request_ec;
+              if (std::filesystem::exists(request_path, trace_request_ec)) {
+                std::filesystem::remove(request_path, trace_request_ec);
+                RequestFrameTrace();
+                REXLOG_INFO("Frame trace triggered by {}", request_path.string());
+              }
+            }
           }
           rex::thread::Sleep(std::chrono::milliseconds(1));
         }

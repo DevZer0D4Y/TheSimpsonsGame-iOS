@@ -49,6 +49,20 @@
 #include <rex/ui/vulkan/util.h>
 
 // Legacy backend compatibility aliases for shared readback controls.
+// Native draw path staging. 0 = emulated path only (current behavior).
+// 1 = coverage accounting: every draw is classified for native-path
+// eligibility (AOT shader availability, primitive support) and per-frame
+// coverage is logged, while the emulated path still renders everything.
+// This is the measurement scaffold the incremental takeover builds on.
+// Interval in frames for the consolidated "[native]" telemetry line; 0 is off.
+// 300 is a good value for a play session - roughly one line every five seconds
+// at 60 fps, cheap enough to leave on for a whole bug-report session.
+REXCVAR_DEFINE_INT32(native_telemetry, 0, "GPU/Vulkan",
+                     "Frames between native-path telemetry log lines (0 = off)");
+
+REXCVAR_DEFINE_INT32(native_draw_path, 0, "GPU/Vulkan",
+                     "Native draw path: 0 = off, 1 = coverage accounting");
+
 REXCVAR_DEFINE_BOOL(vulkan_readback_resolve, false, "GPU/Vulkan",
                     "Read render-to-texture results on the CPU")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
@@ -77,6 +91,46 @@ REXCVAR_DEFINE_BOOL(vulkan_dynamic_rendering, true, "GPU/Vulkan",
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 namespace rex::graphics::vulkan {
+
+// Defined in render_target_cache.cpp - the GPU-side EDRAM emulation work a
+// native render-target path would eliminate.
+extern std::atomic<uint32_t> g_edram_transfer_draws;
+extern std::atomic<uint32_t> g_edram_resolves;
+
+namespace {
+// BATCHABILITY PROBE. A batcher can only merge consecutive draws that need no
+// state change between them, so the number that decides whether batching is
+// worth building is "draws per pipeline switch", not "draws per frame".
+// Counted here rather than as a CounterId because perf/counter.h is pulled in
+// by the generated recompilation header -- touching it rebuilds all 82k
+// translated functions for a two-line probe.
+std::atomic<uint32_t> g_probe_draws{0};
+std::atomic<uint32_t> g_probe_pipeline_switches{0};
+std::atomic<uint32_t> g_probe_longest_run{0};
+uint32_t g_probe_current_run = 0;
+
+// Pipeline equality is only an UPPER bound on batchability: two draws can
+// share a pipeline and still differ in bound textures, uniform buffers or
+// scissor, each of which forces its own submission. This tracks the state a
+// merge would actually have to hold constant, so the reported figure is the
+// real merge factor rather than an optimistic one.
+// Texture/sampler descriptor reuse (see UpdateBindings). Holds the hash of
+// the binding values the currently-live texture descriptor sets were written
+// with, so an identical following draw can keep them.
+uint64_t g_texbind_hash = 0;
+bool g_texbind_valid = false;
+// Counts actual texture descriptor-set allocations, which is the thing the
+// reuse above is meant to eliminate. The full-state probe cannot show this:
+// it also hashes the per-draw constants set, which legitimately changes every
+// draw, so it reports "state changed" regardless.
+std::atomic<uint32_t> g_texdesc_allocs{0};
+
+std::atomic<uint32_t> g_probe_full_state_switches{0};
+std::atomic<uint32_t> g_probe_longest_full_run{0};
+uint64_t g_probe_last_state_hash = 0;
+uint32_t g_probe_current_full_run = 0;
+}  // namespace
+
 
 namespace {
 
@@ -2258,6 +2312,78 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
                                        uint32_t frontbuffer_height) {
   SCOPE_profile_cpu_f("gpu");
 
+  {
+    // Rate-limited so the log sink's synchronous flush can't distort the very
+    // frame times being measured.
+    static uint32_t probe_frames = 0;
+    if ((++probe_frames % 60) == 0) {
+      uint32_t draws = g_probe_draws.exchange(0, std::memory_order_relaxed);
+      uint32_t switches = g_probe_pipeline_switches.exchange(0, std::memory_order_relaxed);
+      uint32_t longest = g_probe_longest_run.exchange(0, std::memory_order_relaxed);
+      uint32_t edram_xfer = g_edram_transfer_draws.exchange(0, std::memory_order_relaxed);
+      uint32_t texallocs = g_texdesc_allocs.exchange(0, std::memory_order_relaxed);
+      uint32_t full = g_probe_full_state_switches.exchange(0, std::memory_order_relaxed);
+      uint32_t longest_full = g_probe_longest_full_run.exchange(0, std::memory_order_relaxed);
+      if (draws) {
+        REXGPU_INFO("[batch-probe] 60f: draws={} pipe_switches={} pipe_per_switch={:.2f} "
+                    "pipe_run_max={} | REAL: full_state_switches={} "
+                    "draws_per_mergeable_group={:.2f} real_run_max={} reducible={:.1f}% "
+                    "| tex_desc_allocs={} | EDRAM_transfer_draws={} ({:.1f}/frame)",
+                    draws, switches, switches ? double(draws) / double(switches) : 0.0, longest,
+                    full, full ? double(draws) / double(full) : 0.0, longest_full,
+                    draws ? 100.0 * double(draws - full) / double(draws) : 0.0,
+                    texallocs, edram_xfer, double(edram_xfer) / 60.0);
+      }
+    }
+  }
+
+  // Native-path telemetry. One line that answers "how native is this frame,
+  // and what is it costing" without a profiler attached: which render target
+  // path is live, how much of the shader/pipeline work the ahead-of-time set
+  // and the persistent driver cache absorbed, and the frame rate over the
+  // interval. Off unless asked for - the launcher's diagnostics toggle turns
+  // it on when a player is reporting a problem.
+  {
+    const int32_t telemetry_interval = REXCVAR_GET(native_telemetry);
+    if (telemetry_interval > 0) {
+      static uint32_t native_frames = 0;
+      static std::chrono::steady_clock::time_point native_last =
+          std::chrono::steady_clock::now();
+      static size_t native_last_created = 0;
+      if ((++native_frames % uint32_t(telemetry_interval)) == 0) {
+        auto now = std::chrono::steady_clock::now();
+        double seconds =
+            std::chrono::duration<double>(now - native_last).count();
+        native_last = now;
+        size_t aot_hits = pipeline_cache_ ? pipeline_cache_->aot_hits() : 0;
+        size_t aot_misses = pipeline_cache_ ? pipeline_cache_->aot_misses() : 0;
+        size_t created = pipeline_cache_ ? pipeline_cache_->pipelines_created() : 0;
+        size_t created_delta = created - native_last_created;
+        native_last_created = created;
+        const char* rt_path = "unknown";
+        uint64_t transfers_skipped = 0;
+        if (render_target_cache_) {
+          rt_path = render_target_cache_->GetPath() ==
+                            RenderTargetCache::Path::kPixelShaderInterlock
+                        ? "fsi"
+                        : (render_target_cache_->native_rt_mode() ? "native" : "host");
+          transfers_skipped = render_target_cache_->transfers_skipped();
+        }
+        REXGPU_INFO(
+            "[native] {}f in {:.2f}s ({:.1f} fps) | rt_path={} | aot_shaders={} hit / {} "
+            "translated ({:.1f}% native) | pipelines={} total, {} created this interval | "
+            "edram_transfers_skipped={}",
+            telemetry_interval, seconds, seconds > 0.0 ? telemetry_interval / seconds : 0.0,
+            rt_path, aot_hits, aot_misses,
+            (aot_hits + aot_misses)
+                ? 100.0 * double(aot_hits) / double(aot_hits + aot_misses)
+                : 0.0,
+            pipeline_cache_ ? pipeline_cache_->pipeline_count() : 0, created_delta,
+            transfers_skipped);
+      }
+    }
+  }
+
   if (!graphics_system_)
     return;
   ui::Presenter* presenter = graphics_system_->presenter();
@@ -3640,6 +3766,30 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     draw_util::AddMemExportRanges(regs, *vertex_shader, memexport_ranges_);
   }
 
+  if (REXCVAR_GET(native_draw_path) >= 1) {
+    // Coverage accounting: which of this frame's draws the native path could
+    // fully own today. Criteria mirror what the offline native replayer
+    // proved: plain or GS-expandable primitives and both stages available.
+    static uint32_t native_eligible = 0, native_total = 0;
+    ++native_total;
+    bool prim_ok = prim_type == xenos::PrimitiveType::kTriangleList ||
+                   prim_type == xenos::PrimitiveType::kTriangleStrip ||
+                   prim_type == xenos::PrimitiveType::kTriangleFan ||
+                   prim_type == xenos::PrimitiveType::kLineList ||
+                   prim_type == xenos::PrimitiveType::kLineStrip ||
+                   prim_type == xenos::PrimitiveType::kPointList ||
+                   prim_type == xenos::PrimitiveType::kRectangleList ||
+                   prim_type == xenos::PrimitiveType::kQuadList;
+    if (prim_ok && !memexport_used_vertex) {
+      ++native_eligible;
+    }
+    if (native_total >= 4096) {
+      REXGPU_INFO("[native-path] coverage: {}/{} draws eligible", native_eligible, native_total);
+      native_eligible = 0;
+      native_total = 0;
+    }
+  }
+
   // Pixel shader analysis.
   bool primitive_polygonal = draw_util::IsPrimitivePolygonal(regs);
   bool is_rasterization_done = draw_util::IsRasterizationPotentiallyDone(regs, primitive_polygonal);
@@ -3878,10 +4028,20 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   if (pipeline == VK_NULL_HANDLE || pipeline_layout_provider == nullptr) {
     return draw_fail("pipeline_lookup");
   }
+  g_probe_draws.fetch_add(1, std::memory_order_relaxed);
   if (current_guest_graphics_pipeline_ != pipeline) {
+    g_probe_pipeline_switches.fetch_add(1, std::memory_order_relaxed);
+    uint32_t run = g_probe_current_run;
+    uint32_t longest = g_probe_longest_run.load(std::memory_order_relaxed);
+    if (run > longest) {
+      g_probe_longest_run.store(run, std::memory_order_relaxed);
+    }
+    g_probe_current_run = 1;
     deferred_command_buffer_.CmdVkBindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
     current_guest_graphics_pipeline_ = pipeline;
     current_external_graphics_pipeline_ = VK_NULL_HANDLE;
+  } else {
+    ++g_probe_current_run;
   }
 
   // Update the graphics pipeline, and if the new graphics pipeline has a
@@ -4132,6 +4292,33 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     priming_saved_scissor = dynamic_scissor_;
     VkRect2D priming_scissor = {{0, 0}, {1, 1}};
     SetScissor(priming_scissor);
+  }
+  {
+    // Everything a merged draw would have to keep identical.
+    uint64_t h = 1469598103934665603ULL;
+    auto mix = [&h](uint64_t v) {
+      h ^= v;
+      h *= 1099511628211ULL;
+    };
+    mix(reinterpret_cast<uint64_t>(pipeline));
+    for (uint32_t i = 0; i < SpirvShaderTranslator::kDescriptorSetCount; ++i) {
+      mix(reinterpret_cast<uint64_t>(current_graphics_descriptor_sets_[i]));
+    }
+    mix((uint64_t(uint32_t(dynamic_scissor_.offset.x)) << 32) ^
+        uint32_t(dynamic_scissor_.offset.y));
+    mix((uint64_t(dynamic_scissor_.extent.width) << 32) ^ dynamic_scissor_.extent.height);
+    mix(uint64_t(primitive_processing_result.host_primitive_type));
+    if (h != g_probe_last_state_hash) {
+      g_probe_full_state_switches.fetch_add(1, std::memory_order_relaxed);
+      uint32_t longest = g_probe_longest_full_run.load(std::memory_order_relaxed);
+      if (g_probe_current_full_run > longest) {
+        g_probe_longest_full_run.store(g_probe_current_full_run, std::memory_order_relaxed);
+      }
+      g_probe_current_full_run = 1;
+      g_probe_last_state_hash = h;
+    } else {
+      ++g_probe_current_full_run;
+    }
   }
   if (primitive_processing_result.index_buffer_type ==
           PrimitiveProcessor::ProcessedIndexBufferType::kNone ||
@@ -6728,6 +6915,10 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
     texture_count_pixel = 0;
   }
   // TODO(Triang3l): Reuse texture and sampler bindings if not changed.
+  // (A caching attempt here produced wrong textures on newly-streamed
+  // characters -- bleached/yellow skins -- so the unconditional invalidation
+  // stays until the missing hash input is identified. The measured win was
+  // CPU-side, and this title is GPU-bound, so the trade was bad anyway.)
   current_graphics_descriptor_set_values_up_to_date_ &=
       ~((UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesVertex) |
         (UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesPixel));
@@ -6948,6 +7139,7 @@ uint32_t VulkanCommandProcessor::WriteTransientTextureBindings(
       texture_descriptor_count.descriptorCount = sampler_count;
     }
     assert_not_zero(texture_descriptor_counts_count);
+    g_texdesc_allocs.fetch_add(1, std::memory_order_relaxed);
     texture_descriptor_set = transient_descriptor_allocator_textures_.Allocate(
         descriptor_set_layout, texture_descriptor_counts.data(), texture_descriptor_counts_count);
     if (texture_descriptor_set == VK_NULL_HANDLE) {

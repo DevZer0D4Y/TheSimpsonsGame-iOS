@@ -58,6 +58,24 @@ class SpirvShader : public Shader {
     return sampler_bindings_;
   }
 
+  // Installs bindings gathered when the shader was compiled ahead of time.
+  // A shader whose first translation is served precompiled never runs
+  // PostTranslation, which is what normally fills these - and pipeline
+  // layout construction dereferences them. No-op if bindings were already
+  // set up by a runtime translation.
+  void InstallBindingsFromPrecompiled(std::vector<TextureBinding> textures,
+                                      std::vector<SamplerBinding> samplers) {
+    if (bindings_setup_entered_.test_and_set(std::memory_order_relaxed)) {
+      return;
+    }
+    texture_bindings_ = std::move(textures);
+    sampler_bindings_ = std::move(samplers);
+    used_texture_mask_ = 0;
+    for (const TextureBinding& binding : texture_bindings_) {
+      used_texture_mask_ |= UINT32_C(1) << binding.fetch_constant;
+    }
+  }
+
  protected:
   Translation* CreateTranslationInstance(uint64_t modification) override;
 

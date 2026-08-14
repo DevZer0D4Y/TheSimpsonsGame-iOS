@@ -43,6 +43,16 @@
 // interlock path renders them correctly. Devices without fragment shader
 // interlock fall back to host render targets automatically below. Flip back
 // to "" only after the host path passes the same character-color comparison.
+// Native-direction experiment for the host render target path: skip the
+// EDRAM ownership-transfer draws between render targets. On real hardware
+// those emulate EDRAM tile aliasing; this title was measured issuing a
+// constant 18 of them per frame. Correct only for titles that do not rely on
+// reading another target's tiles through aliasing mid-pass - which is what
+// the native render target model assumes. Resolve clears are unaffected.
+REXCVAR_DEFINE_BOOL(native_rt_skip_transfers, false, "GPU/Vulkan",
+                    "Skip EDRAM ownership transfer draws on the host render "
+                    "target path (native RT experiment)");
+
 REXCVAR_DEFINE_STRING(render_target_path_vulkan, "fsi", "GPU/Vulkan",
                       "Vulkan render target implementation path")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
@@ -222,10 +232,16 @@ bool VulkanRenderTargetCache::Initialize(uint32_t shared_memory_binding_count) {
       device_properties.fragmentStoresAndAtomics && device_properties.sampleRateShading &&
       device_properties.standardSampleLocations &&
       shared_memory_binding_count < device_properties.maxPerStageDescriptorStorageBuffers;
-  if (REXCVAR_GET(render_target_path_vulkan) == "fsi") {
+  const std::string& requested_rt_path = REXCVAR_GET(render_target_path_vulkan);
+  if (requested_rt_path == "fsi") {
     path_ = Path::kPixelShaderInterlock;
   } else {
     path_ = Path::kHostRenderTargets;
+    // "native" is the host render target path with the EDRAM emulation
+    // overhead that this title provably does not need taken out: no ownership
+    // transfer draws. It is a mode of the host path rather than a third Path
+    // so every format/feature fallback below still applies unchanged.
+    native_rt_mode_ = requested_rt_path == "native";
   }
   // Fragment shader interlock is a feature implemented by pretty advanced GPUs,
   // closer to Direct3D 11 / OpenGL ES 3.2 level mainly, not Direct3D 10 /
@@ -414,7 +430,10 @@ bool VulkanRenderTargetCache::Initialize(uint32_t shared_memory_binding_count) {
       color_32bit_transfer_uint_formats_supported_ && integer_transfer_sample_1x_supported &&
       integer_transfer_sample_4x_supported &&
       (!msaa_2x_attachments_supported_ || integer_transfer_sample_2x_supported);
-  if (path_ == Path::kHostRenderTargets && !bit_exact_host_color_transfer_supported) {
+  if (path_ == Path::kHostRenderTargets && !bit_exact_host_color_transfer_supported &&
+      !native_rt_mode_) {
+    // Native mode never issues ownership transfers, so their bit-exactness is
+    // not a reason to abandon the host path for it.
     if (fsi_path_supported) {
       REXGPU_WARN(
           "VulkanRenderTargetCache: Host render target ownership transfers "
@@ -429,6 +448,16 @@ bool VulkanRenderTargetCache::Initialize(uint32_t shared_memory_binding_count) {
       return false;
     }
   }
+
+  // A device-support fallback above may have moved us off the host path after
+  // "native" was requested; native mode is meaningless then, so don't claim it.
+  if (path_ != Path::kHostRenderTargets) {
+    native_rt_mode_ = false;
+  }
+  REXGPU_INFO("VulkanRenderTargetCache: render target path = {}{}",
+              path_ == Path::kPixelShaderInterlock ? "fragment shader interlock"
+                                                   : "host render targets",
+              native_rt_mode_ ? " (native mode: EDRAM ownership transfers elided)" : "");
 
   // Descriptor set layouts.
   VkDescriptorSetLayoutBinding descriptor_set_layout_bindings[2];
@@ -4791,6 +4820,18 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
   DeferredCommandBuffer& command_buffer = command_processor_.deferred_command_buffer();
 
   bool resolve_clear_needed = render_target_resolve_clear_values && resolve_clear_rectangle;
+  if ((native_rt_mode_ || REXCVAR_GET(native_rt_skip_transfers)) && !resolve_clear_needed) {
+    // Native RT mode: ownership transfers dropped entirely. The caller has
+    // already updated ownership bookkeeping, so skipping just the copy draws
+    // keeps state consistent. Counted so a frame's saved transfers show up in
+    // the native-path telemetry rather than being invisible.
+    if (render_target_transfers) {
+      for (uint32_t i = 0; i < render_target_count; ++i) {
+        transfers_skipped_ += uint32_t(render_target_transfers[i].size());
+      }
+    }
+    return;
+  }
   VkClearRect resolve_clear_rect;
   if (resolve_clear_needed) {
     // Assuming the rectangle is already clamped by the setup function from the

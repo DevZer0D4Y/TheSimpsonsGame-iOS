@@ -926,7 +926,12 @@ std::vector<uint8_t> SpirvShaderTranslator::CompleteTranslation() {
         }
         builder_->createBranch(main_loop_continue_);
       }
-      if_not_last_guest_vertex.makeBeginElse();
+      // The "then" block above already terminates with the jump into the main
+      // control-flow loop; letting makeBeginElse add its default jump to the
+      // merge block would emit a second terminator into the same block, which
+      // is invalid SPIR-V ("Branch must appear in a block") - every rectangle
+      // list vertex shader variant was malformed because of it.
+      if_not_last_guest_vertex.makeBeginElse(false);
       {
         spv::Id rectangle_host_vertex_in_primitive = builder_->createBinOp(
             spv::OpBitwiseAnd, type_uint_,

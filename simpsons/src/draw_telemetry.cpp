@@ -48,7 +48,7 @@
 #include <fmt/format.h>
 #include <rex/cvar.h>
 #include <rex/logging.h>
-#include <rex/perf/counter.h>
+#include <rex/perf/frame_index.h>
 #include <rex/ppc.h>
 
 REXCVAR_DEFINE_BOOL(draw_telemetry, false, "GPU",

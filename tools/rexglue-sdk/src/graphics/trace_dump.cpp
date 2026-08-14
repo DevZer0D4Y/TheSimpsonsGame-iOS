@@ -9,6 +9,8 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <cstdlib>
+
 #include <rex/dbg.h>
 #include <rex/filesystem.h>
 #include <rex/graphics/command_processor.h>
@@ -19,19 +21,12 @@
 #include <rex/string.h>
 #include <rex/system/kernel_state.h>
 #include <rex/thread.h>
-#include <rex/ui/file_picker.h>
 #include <rex/ui/presenter.h>
 #include <rex/ui/window.h>
 
-#include <stb_image_write.h"
 
-#define STB_IMAGE_WRITE_IMPLEMENTATION
-#undef _CRT_SECURE_NO_WARNINGS
-#undef _CRT_NONSTDC_NO_DEPRECATE
-#include <stb_image_write.h"
-
-DEFINE_path(target_trace_file, "", "Specifies the trace file to load.", "GPU");
-DEFINE_path(trace_dump_path, "", "Output path for dumped files.", "GPU");
+REXCVAR_DEFINE_STRING(target_trace_file, "", "GPU", "Specifies the trace file to load.");
+REXCVAR_DEFINE_STRING(trace_dump_path, "", "GPU", "Output path for dumped files.");
 
 namespace rex::graphics {
 
@@ -94,15 +89,22 @@ int TraceDump::Main(const std::vector<std::string>& args) {
 }
 
 bool TraceDump::Setup() {
-  // Create the emulator but don't initialize so we can setup the window.
-  emulator_ = std::make_unique<Emulator>("", "", "", "");
-  X_STATUS result = emulator_->Setup(
-      nullptr, nullptr, false, nullptr, [this]() { return CreateGraphicsSystem(); }, nullptr);
+  // Headless runtime with just the graphics backend - no game module. The
+  // offscreen presenter must exist before the runtime marks the guest GPU
+  // headless, so set up presentation first.
+  emulator_ = std::make_unique<Runtime>("", "", "");
+  auto graphics = CreateGraphicsSystem();
+  auto* graphics_raw = static_cast<GraphicsSystem*>(graphics.get());
+  graphics_raw->SetupPresentation(nullptr);
+  RuntimeConfig config;
+  config.graphics = std::move(graphics);
+  config.tool_mode = false;
+  X_STATUS result = emulator_->Setup(std::move(config));
   if (XFAILED(result)) {
     REXGPU_ERROR("Failed to setup emulator: {:08X}", result);
     return false;
   }
-  graphics_system_ = emulator_->graphics_system();
+  graphics_system_ = static_cast<GraphicsSystem*>(emulator_->graphics_system());
   player_ = std::make_unique<TracePlayer>(graphics_system_);
   return true;
 }
@@ -121,7 +123,17 @@ bool TraceDump::Load(const std::filesystem::path& trace_file_path) {
 int TraceDump::Run() {
   BeginHostCapture();
   player_->SeekFrame(0);
-  player_->SeekCommand(static_cast<int>(player_->current_frame()->commands.size() - 1));
+  // TRACE_STOP: stop playback at an arbitrary command index instead of the
+  // end of the frame - lets a reference renderer dump the EDRAM state at any
+  // point mid-frame for divergence bisection against a native replayer.
+  int stop_command = static_cast<int>(player_->current_frame()->commands.size() - 1);
+  if (const char* stop_env = std::getenv("TRACE_STOP")) {
+    int requested = atoi(stop_env);
+    if (requested >= 0 && requested < stop_command) stop_command = requested;
+    REXGPU_INFO("TraceDump: stopping at command {} of {}", stop_command,
+                player_->current_frame()->commands.size());
+  }
+  player_->SeekCommand(stop_command);
   player_->WaitOnPlayback();
   EndHostCapture();
 
@@ -130,15 +142,19 @@ int TraceDump::Run() {
   ui::Presenter* presenter = graphics_system_->presenter();
   ui::RawImage raw_image;
   if (presenter && presenter->CaptureGuestOutput(raw_image)) {
-    // Save framebuffer png.
-    auto png_path = base_output_path_.replace_extension(".png");
-    auto handle = filesystem::OpenFile(png_path, "wb");
-    auto callback = [](void* context, void* data, int size) {
-      fwrite(data, 1, size, (FILE*)context);
-    };
-    stbi_write_png_to_func(callback, handle, static_cast<int>(raw_image.width),
-                           static_cast<int>(raw_image.height), 4, raw_image.data.data(),
-                           static_cast<int>(raw_image.stride));
+    // Save the framebuffer as a PPM - no image library needed, and every
+    // viewer and diff tool reads it.
+    auto ppm_path = base_output_path_.replace_extension(".ppm");
+    auto handle = filesystem::OpenFile(ppm_path, "wb");
+    fprintf(handle, "P6\n%u %u\n255\n", uint32_t(raw_image.width), uint32_t(raw_image.height));
+    for (uint32_t y = 0; y < raw_image.height; ++y) {
+      const uint8_t* row = raw_image.data.data() + y * raw_image.stride;
+      for (uint32_t x = 0; x < raw_image.width; ++x) {
+        fputc(row[x * 4 + 0], handle);
+        fputc(row[x * 4 + 1], handle);
+        fputc(row[x * 4 + 2], handle);
+      }
+    }
     fclose(handle);
   } else {
     result = 1;
