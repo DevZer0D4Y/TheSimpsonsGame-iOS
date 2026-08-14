@@ -94,3 +94,6 @@ launcher/diagnostics/
 
 # codegraph: rebuildable index (tools/codegraph/recomp_index.py build), not source
 tools/codegraph/*.sqlite
+
+# Native renderer offline tool outputs (binaries, SPIR-V sets, frame dumps)
+tools/native-renderer/out/

@@ -17,6 +17,7 @@
 #include <bit>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -27,10 +28,13 @@
 #include <string>
 #include <vector>
 
+#include <rex/cvar.h>
 #include <rex/graphics/pipeline/shader/shader.h>
+#include <rex/graphics/pipeline/shader/spirv.h>
 #include <rex/graphics/pipeline/shader/spirv_translator.h>
 #include <rex/graphics/xenos.h>
 #include <rex/string/buffer.h>
+#include <rex/ui/vulkan/provider.h>
 
 namespace fs = std::filesystem;
 namespace xenos = rex::graphics::xenos;
@@ -174,7 +178,15 @@ void WriteTextureBindings(std::ostream& out, const Shader& shader) {
 
 }  // namespace
 
+REXCVAR_DECLARE(uint32_t, gpu_shader_max_cf_iterations);
+
 int main(int argc, char** argv) {
+  // Translate under the same cvar state the runtime uses - a served module
+  // must be byte-identical to what the runtime would produce, and the
+  // control-flow iteration guard (default on) changes the emitted SPIR-V.
+  // The guard does break the rectangle-list vertex-loop variants, but those
+  // are pruned from the served set anyway (the runtime uses geometry shaders
+  // for rect lists on hardware that has them).
   if (argc < 3) {
     std::fprintf(stderr,
                  "usage: aot_shaders <dump-dir> <out-dir> [shader-inventory.csv]\n"
@@ -205,7 +217,30 @@ int main(int argc, char** argv) {
   //
   // edram_fragment_shader_interlock is false because the host render target
   // path is what we ship (render_target_path_vulkan = "").
-  SpirvShaderTranslator translator(SpirvShaderTranslator::Features(true), false, false, false);
+  // AOT_FSI=1 compiles the fragment-shader-interlock flavor: the shipping
+  // in-game render path is FSI, and its pixel shaders write the EDRAM buffer
+  // directly instead of color attachments - a completely different output
+  // path, so the two sets are not interchangeable.
+  bool fsi = std::getenv("AOT_FSI") != nullptr;
+  if (fsi) std::printf("compiling FSI-flavor modules\n");
+  // Build Features from the real device, exactly like the in-game pipeline
+  // cache does. Features(true) assumed every optional capability; any field
+  // that differs from what the driver reports changes the emitted SPIR-V,
+  // and serving such a module to the runtime hung the RADV pipeline
+  // compiler on the second load.
+  auto vulkan_provider = rex::ui::vulkan::VulkanProvider::Create(true, false);
+  if (!vulkan_provider || !vulkan_provider->vulkan_device()) {
+    std::fprintf(stderr, "no Vulkan device: cannot mirror the runtime's shader features\n");
+    return 1;
+  }
+  SpirvShaderTranslator::Features features(vulkan_provider->vulkan_device());
+  std::printf("device features: spirv=%u ivfs=%d szinp=%d dftz=%d rte=%d fssi=%d\n",
+              features.spirv_version, int(features.image_view_format_swizzle),
+              int(features.signed_zero_inf_nan_preserve_float32),
+              int(features.denorm_flush_to_zero_float32),
+              int(features.rounding_mode_rte_float32),
+              int(features.fragment_shader_sample_interlock));
+  SpirvShaderTranslator translator(features, false, false, fsi);
 
   std::ofstream manifest(out_dir / "manifest.json");
   manifest << "{\n  \"shaders\": [\n";
@@ -227,7 +262,12 @@ int main(int argc, char** argv) {
     // The dumps hold ucode_data(), which is already host endian -- the
     // constructor defaults to swapping from big endian, and double swapping
     // silently produces microcode that analyzes to nothing at all.
-    Shader shader(type, hash, ucode.data(), ucode.size(), std::endian::native);
+    // SpirvShader, not the base class: the translator's PostTranslation only
+    // gathers the Vulkan texture/sampler binding lists into a SpirvShader,
+    // and the runtime needs those to build pipeline layouts for served
+    // modules (a base Shader silently skips the gather).
+    rex::graphics::SpirvShader shader(type, hash, ucode.data(), ucode.size(),
+                                      std::endian::native);
     rex::string::StringBuffer disasm;
     shader.AnalyzeUcode(disasm);
 
@@ -254,6 +294,21 @@ int main(int argc, char** argv) {
                                shader.GetDynamicAddressableRegisterCount(63))
                          : translator.GetDefaultPixelShaderModification(
                                shader.GetDynamicAddressableRegisterCount(63)));
+    }
+    if (type == xenos::ShaderType::kVertex) {
+      // Also emit the rectangle-list-as-triangle-strip variant of every
+      // vertex shader modification: the geometry-shader-free way to draw the
+      // guest's rect lists (sky, HUD, full-screen passes). Host vertex shader
+      // type lives in bits 32..35 of the modification.
+      size_t base_count = mods.size();
+      for (size_t mi = 0; mi < base_count; ++mi) {
+        uint64_t rect_mod = (mods[mi] & ~(0xFull << 32)) |
+                            (uint64_t(Shader::HostVertexShaderType::kRectangleListAsTriangleStrip)
+                             << 32);
+        bool present = false;
+        for (uint64_t existing : mods) present |= existing == rect_mod;
+        if (!present) mods.push_back(rect_mod);
+      }
     }
     for (uint64_t modification : mods) {
       Shader::Translation* translation = shader.GetOrCreateTranslation(modification);
@@ -297,10 +352,54 @@ int main(int argc, char** argv) {
                << "      \"kills_pixels\": " << (shader.kills_pixels() ? "true" : "false") << ",\n"
                << "      \"writes_depth\": " << (shader.writes_depth() ? "true" : "false") << ",\n"
                << "      \"writes_color_targets\": " << shader.writes_color_targets() << ",\n";
+      {
+        // The translator reads float constants through tightly packed indices
+        // (only the registers the shader actually uses, in ascending order),
+        // so whoever fills the constant buffer must pack it with this bitmap.
+        const Shader::ConstantRegisterMap& cmap = shader.constant_register_map();
+        char bitmap_text[80];
+        std::snprintf(bitmap_text, sizeof(bitmap_text),
+                      "\"%016llX\", \"%016llX\", \"%016llX\", \"%016llX\"",
+                      (unsigned long long)cmap.float_bitmap[0],
+                      (unsigned long long)cmap.float_bitmap[1],
+                      (unsigned long long)cmap.float_bitmap[2],
+                      (unsigned long long)cmap.float_bitmap[3]);
+        manifest << "      \"float_bitmap\": [" << bitmap_text << "],\n"
+                 << "      \"float_dynamic\": "
+                 << (cmap.float_dynamic_addressing ? "true" : "false") << ",\n";
+        char interp_text[16];
+        std::snprintf(interp_text, sizeof(interp_text), "%04X",
+                      shader.writes_interpolators());
+        manifest << "      \"writes_interpolators\": \"" << interp_text << "\",\n";
+      }
       WriteVertexBindings(manifest, shader);
       WriteTextureBindings(manifest, shader);
       manifest << "    }";
       ++translated;
+    }
+    {
+      // Binding sidecar: the runtime installs these lists when it serves a
+      // precompiled module for a shader's first translation (PostTranslation
+      // never runs in that case, and pipeline layout construction reads the
+      // lists). Written after all modifications - the lists do not depend on
+      // modification bits.
+      const auto& tex = shader.GetTextureBindingsAfterTranslation();
+      const auto& samp = shader.GetSamplerBindingsAfterTranslation();
+      char bind_name[48];
+      std::snprintf(bind_name, sizeof(bind_name), "%016lX_%s.bind", hash,
+                    type == xenos::ShaderType::kVertex ? "vs" : "ps");
+      std::ofstream bind_out(out_dir / bind_name, std::ios::binary);
+      uint32_t magic = 0x444E4258;  // "XBND"
+      uint32_t tex_count = uint32_t(tex.size()), samp_count = uint32_t(samp.size());
+      bind_out.write(reinterpret_cast<const char*>(&magic), 4);
+      bind_out.write(reinterpret_cast<const char*>(&tex_count), 4);
+      if (tex_count)
+        bind_out.write(reinterpret_cast<const char*>(tex.data()),
+                       std::streamsize(tex_count * sizeof(tex[0])));
+      bind_out.write(reinterpret_cast<const char*>(&samp_count), 4);
+      if (samp_count)
+        bind_out.write(reinterpret_cast<const char*>(samp.data()),
+                       std::streamsize(samp_count * sizeof(samp[0])));
     }
   }
 

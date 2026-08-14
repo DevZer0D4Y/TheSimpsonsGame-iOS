@@ -35,6 +35,7 @@
 #include <rex/graphics/util/draw.h>
 #include <rex/graphics/flags.h>
 #include <rex/graphics/pipeline_util.h>
+#include <rex/graphics/pipeline/shader/spirv.h>
 #include <rex/graphics/pipeline/shader/spirv_builder.h>
 #include <rex/graphics/pipeline/shader/spirv_translator.h>
 #include <rex/graphics/register_file.h>
@@ -73,6 +74,16 @@ REXCVAR_DEFINE_STRING(shader_inventory_csv, "", "GPU",
 // JSON object per line. This is the ground truth a native (non-emulated)
 // renderer replays its pipelines from, so it captures what the game actually
 // sets rather than what a harness assumes.
+// The native renderer's ahead-of-time shader directory: when set, shader
+// translations are loaded as precompiled SPIR-V modules from
+// <dir>/<ucode_hash>_<vs|ps>_<modification>.spv instead of running the
+// microcode translator at draw time. Files are produced by the AOT compiler
+// from a play session's shader dumps; anything missing falls back to the
+// runtime translator transparently.
+REXCVAR_DEFINE_STRING(aot_shader_path, "", "GPU",
+                      "Directory of ahead-of-time compiled shader modules "
+                      "(empty = translate at runtime).");
+
 REXCVAR_DEFINE_STRING(pipeline_inventory_json, "", "GPU",
                       "Path to write the full pipeline state inventory to at exit "
                       "(empty = disabled). Diagnostic.");
@@ -310,6 +321,44 @@ VulkanPipelineCache::~VulkanPipelineCache() {
 bool VulkanPipelineCache::Initialize() {
   const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
 
+  {
+    // Explicit driver pipeline cache with disk persistence (the file lives
+    // next to the shader storage). Loading it makes vkCreateGraphicsPipelines
+    // near-free for every pipeline seen in any earlier session.
+    const ui::vulkan::VulkanDevice::Functions& idfn = vulkan_device->functions();
+    std::vector<uint8_t> initial;
+    if (!vk_pipeline_cache_path_.empty()) {
+      FILE* pc_file = rex::filesystem::OpenFile(vk_pipeline_cache_path_, "rb");
+      if (pc_file) {
+        fseek(pc_file, 0, SEEK_END);
+        long pc_size = ftell(pc_file);
+        fseek(pc_file, 0, SEEK_SET);
+        if (pc_size > 0) {
+          initial.resize(size_t(pc_size));
+          if (fread(initial.data(), 1, initial.size(), pc_file) != initial.size()) {
+            initial.clear();
+          }
+        }
+        fclose(pc_file);
+      }
+    }
+    VkPipelineCacheCreateInfo pc_info = {VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
+    pc_info.initialDataSize = initial.size();
+    pc_info.pInitialData = initial.empty() ? nullptr : initial.data();
+    if (idfn.vkCreatePipelineCache(vulkan_device->device(), &pc_info, nullptr,
+                                   &vk_pipeline_cache_) != VK_SUCCESS) {
+      // Retry without possibly-incompatible initial data (driver update).
+      pc_info.initialDataSize = 0;
+      pc_info.pInitialData = nullptr;
+      if (idfn.vkCreatePipelineCache(vulkan_device->device(), &pc_info, nullptr,
+                                     &vk_pipeline_cache_) != VK_SUCCESS) {
+        vk_pipeline_cache_ = VK_NULL_HANDLE;
+      }
+    } else if (!initial.empty()) {
+      REXGPU_INFO("VulkanPipelineCache: loaded {} bytes of driver pipeline cache", initial.size());
+    }
+  }
+
   bool edram_fragment_shader_interlock =
       render_target_cache_.GetPath() == RenderTargetCache::Path::kPixelShaderInterlock;
 
@@ -441,6 +490,46 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
   auto pipeline_storage_file_path =
       shader_storage_shareable_root /
       fmt::format("{:08X}.{}.vk.xpso", title_id, edram_fragment_shader_interlock ? "fsi" : "fbo");
+  vk_pipeline_cache_path_ =
+      shader_storage_shareable_root /
+      fmt::format("{:08X}.{}.vkpso.bin", title_id, edram_fragment_shader_interlock ? "fsi" : "fbo");
+  {
+    // The driver pipeline cache object is created empty at Initialize because
+    // the storage path (and thus the saved data) is only known here. Recreate
+    // it with the saved data now, before the storage warm-up starts creating
+    // pipelines, so the warm-up compiles hit the cache.
+    FILE* pc_file = rex::filesystem::OpenFile(vk_pipeline_cache_path_, "rb");
+    if (pc_file) {
+      fseek(pc_file, 0, SEEK_END);
+      long pc_size = ftell(pc_file);
+      fseek(pc_file, 0, SEEK_SET);
+      std::vector<uint8_t> pc_initial;
+      if (pc_size > 0) {
+        pc_initial.resize(size_t(pc_size));
+        if (fread(pc_initial.data(), 1, pc_initial.size(), pc_file) != pc_initial.size()) {
+          pc_initial.clear();
+        }
+      }
+      fclose(pc_file);
+      if (!pc_initial.empty()) {
+        const ui::vulkan::VulkanDevice* const pc_device = command_processor_.GetVulkanDevice();
+        const ui::vulkan::VulkanDevice::Functions& pc_dfn = pc_device->functions();
+        VkPipelineCacheCreateInfo pc_info = {VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
+        pc_info.initialDataSize = pc_initial.size();
+        pc_info.pInitialData = pc_initial.data();
+        VkPipelineCache warm_cache = VK_NULL_HANDLE;
+        if (pc_dfn.vkCreatePipelineCache(pc_device->device(), &pc_info, nullptr, &warm_cache) ==
+            VK_SUCCESS) {
+          if (vk_pipeline_cache_ != VK_NULL_HANDLE) {
+            pc_dfn.vkDestroyPipelineCache(pc_device->device(), vk_pipeline_cache_, nullptr);
+          }
+          vk_pipeline_cache_ = warm_cache;
+          REXGPU_INFO("VulkanPipelineCache: loaded {} bytes of driver pipeline cache",
+                      pc_initial.size());
+        }
+      }
+    }
+  }
   pipeline_storage_file_ = rex::filesystem::OpenFile(pipeline_storage_file_path, "a+b");
   if (!pipeline_storage_file_) {
     REXGPU_ERROR(
@@ -899,8 +988,35 @@ void VulkanPipelineCache::WritePipelineInventory() const {
 }
 
 void VulkanPipelineCache::Shutdown() {
+  if (!REXCVAR_GET(aot_shader_path).empty()) {
+    REXGPU_INFO("VulkanPipelineCache: AOT shader loads {} hit / {} translated at runtime",
+                aot_hits_, aot_misses_);
+  }
   WriteShaderInventory();
   WritePipelineInventory();
+  if (vk_pipeline_cache_ != VK_NULL_HANDLE) {
+    const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
+    const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+    if (!vk_pipeline_cache_path_.empty()) {
+      size_t pc_size = 0;
+      if (dfn.vkGetPipelineCacheData(vulkan_device->device(), vk_pipeline_cache_, &pc_size,
+                                     nullptr) == VK_SUCCESS &&
+          pc_size) {
+        std::vector<uint8_t> pc_data(pc_size);
+        if (dfn.vkGetPipelineCacheData(vulkan_device->device(), vk_pipeline_cache_, &pc_size,
+                                       pc_data.data()) == VK_SUCCESS) {
+          FILE* pc_file = rex::filesystem::OpenFile(vk_pipeline_cache_path_, "wb");
+          if (pc_file) {
+            fwrite(pc_data.data(), 1, pc_size, pc_file);
+            fclose(pc_file);
+            REXGPU_INFO("VulkanPipelineCache: saved {} bytes of driver pipeline cache", pc_size);
+          }
+        }
+      }
+    }
+    dfn.vkDestroyPipelineCache(vulkan_device->device(), vk_pipeline_cache_, nullptr);
+    vk_pipeline_cache_ = VK_NULL_HANDLE;
+  }
 
   // Shut down creation threads before destroying any pipelines they may touch.
   if (!creation_threads_.empty()) {
@@ -1128,12 +1244,104 @@ bool VulkanPipelineCache::EnsureShadersTranslated(VulkanShader::VulkanTranslatio
               register_file_.Get<reg::SQ_PROGRAM_CNTL>().vs_export_mode !=
                   xenos::VertexShaderExportMode::kPosition2VectorsEdgeKill);
   assert_false(register_file_.Get<reg::SQ_PROGRAM_CNTL>().gen_index_vtx);
+  auto try_aot = [this](Shader::Translation& translation, const char* stage) {
+    const std::string& aot_dir = REXCVAR_GET(aot_shader_path);
+    if (aot_dir.empty()) {
+      return false;
+    }
+    std::filesystem::path aot_path =
+        std::filesystem::path(aot_dir) /
+        fmt::format("{:016X}_{}_{:016X}.spv", translation.shader().ucode_data_hash(), stage,
+                    translation.modification());
+    FILE* aot_file = rex::filesystem::OpenFile(aot_path, "rb");
+    if (!aot_file) {
+      return false;
+    }
+    fseek(aot_file, 0, SEEK_END);
+    long aot_size = ftell(aot_file);
+    fseek(aot_file, 0, SEEK_SET);
+    std::vector<uint8_t> aot_data;
+    bool ok = false;
+    if (aot_size > 0 && !(aot_size & 3)) {
+      aot_data.resize(size_t(aot_size));
+      ok = fread(aot_data.data(), 1, aot_data.size(), aot_file) == aot_data.size();
+    }
+    fclose(aot_file);
+    if (!ok) {
+      return false;
+    }
+    // The binding sidecar is mandatory: PostTranslation never runs for a
+    // served module, and without the texture/sampler binding lists pipeline
+    // layout construction walks empty structures (which crashed - in a loop,
+    // through the guest exception handler - on the first boot that served
+    // one). Missing sidecar means the set predates it: fall back to runtime
+    // translation for safety.
+    SpirvShader* spirv_shader = dynamic_cast<SpirvShader*>(&translation.shader());
+    if (!spirv_shader) {
+      return false;
+    }
+    std::filesystem::path bind_path =
+        std::filesystem::path(aot_dir) /
+        fmt::format("{:016X}_{}.bind", translation.shader().ucode_data_hash(), stage);
+    FILE* bind_file = rex::filesystem::OpenFile(bind_path, "rb");
+    if (!bind_file) {
+      return false;
+    }
+    std::vector<SpirvShader::TextureBinding> aot_textures;
+    std::vector<SpirvShader::SamplerBinding> aot_samplers;
+    bool bind_ok = false;
+    {
+      uint32_t magic = 0, tex_count = 0, samp_count = 0;
+      if (fread(&magic, 4, 1, bind_file) == 1 && magic == 0x444E4258 &&
+          fread(&tex_count, 4, 1, bind_file) == 1 && tex_count <= 64) {
+        aot_textures.resize(tex_count);
+        if (!tex_count || fread(aot_textures.data(), sizeof(aot_textures[0]), tex_count,
+                                bind_file) == tex_count) {
+          if (fread(&samp_count, 4, 1, bind_file) == 1 && samp_count <= 64) {
+            aot_samplers.resize(samp_count);
+            bind_ok = !samp_count || fread(aot_samplers.data(), sizeof(aot_samplers[0]),
+                                           samp_count, bind_file) == samp_count;
+          }
+        }
+      }
+      fclose(bind_file);
+    }
+    if (!bind_ok) {
+      return false;
+    }
+    spirv_shader->InstallBindingsFromPrecompiled(std::move(aot_textures),
+                                                 std::move(aot_samplers));
+    translation.InstallPrecompiledBinary(std::move(aot_data));
+    ++aot_hits_;
+    return true;
+  };
+  // Modification-aware translated-binary dump (dump_shaders alone only
+  // writes ucode on Vulkan): the ground truth to diff an ahead-of-time
+  // module against when a served pipeline misbehaves.
+  auto dump_translated = [](Shader::Translation& translation, const char* stage) {
+    const std::string& dump_dir = REXCVAR_GET(dump_shaders);
+    if (dump_dir.empty() || !translation.is_valid()) {
+      return;
+    }
+    std::filesystem::path dump_path =
+        std::filesystem::path(dump_dir) /
+        fmt::format("{:016X}_{}_{:016X}.translated.spv",
+                    translation.shader().ucode_data_hash(), stage, translation.modification());
+    FILE* dump_file = rex::filesystem::OpenFile(dump_path, "wb");
+    if (dump_file) {
+      fwrite(translation.translated_binary().data(), 1, translation.translated_binary().size(),
+             dump_file);
+      fclose(dump_file);
+    }
+  };
   if (!vertex_shader->is_translated()) {
     vertex_shader->shader().AnalyzeUcode(ucode_disasm_buffer_);
-    if (!TranslateAnalyzedShader(*shader_translator_, *vertex_shader)) {
+    if (!try_aot(*vertex_shader, "vs") &&
+        (++aot_misses_, !TranslateAnalyzedShader(*shader_translator_, *vertex_shader))) {
       REXGPU_ERROR("Failed to translate the vertex shader!");
       return false;
     }
+    dump_translated(*vertex_shader, "vs");
   }
   if (!vertex_shader->is_valid()) {
     // Translation attempted previously, but not valid.
@@ -1141,11 +1349,15 @@ bool VulkanPipelineCache::EnsureShadersTranslated(VulkanShader::VulkanTranslatio
   }
   if (pixel_shader != nullptr) {
     if (!pixel_shader->is_translated()) {
+      // Analysis must run regardless of the AOT path - modification
+      // derivation and texture binding info read it.
       pixel_shader->shader().AnalyzeUcode(ucode_disasm_buffer_);
-      if (!TranslateAnalyzedShader(*shader_translator_, *pixel_shader)) {
+      if (!try_aot(*pixel_shader, "ps") &&
+          (++aot_misses_, !TranslateAnalyzedShader(*shader_translator_, *pixel_shader))) {
         REXGPU_ERROR("Failed to translate the pixel shader!");
         return false;
       }
+      dump_translated(*pixel_shader, "ps");
     }
     if (!pixel_shader->is_valid()) {
       // Translation attempted previously, but not valid.
@@ -3603,8 +3815,9 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
   VkPipeline pipeline;
-  VkResult create_result = dfn.vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1,
+  VkResult create_result = dfn.vkCreateGraphicsPipelines(device, vk_pipeline_cache_, 1,
                                                          &pipeline_create_info, nullptr, &pipeline);
+  pipelines_created_.fetch_add(1, std::memory_order_relaxed);
   if (create_result != VK_SUCCESS) {
     uint64_t ps_hash = creation_arguments.pixel_shader
                            ? creation_arguments.pixel_shader->shader().ucode_data_hash()

@@ -83,6 +83,11 @@ struct PacketInfo {
 
 class PacketDisassembler {
  public:
+  // Optional guest memory base (512 MB physical space). When set,
+  // memory-indirect packets (PM4_LOAD_ALU_CONSTANT) resolve their register
+  // data from it instead of emitting placeholder values.
+  static void SetMemoryBase(const uint8_t* membase, uint32_t size);
+
   static PacketCategory GetPacketCategory(const uint8_t* base_ptr);
 
   static bool DisasmPacketType0(const uint8_t* base_ptr, uint32_t packet, PacketInfo* out_info);

@@ -99,6 +99,15 @@ class VulkanPipelineCache {
                                     const PipelineLayoutProvider*& pipeline_layout_out,
                                     bool* is_placeholder_out = nullptr) const;
 
+  // Native-path telemetry: how much of this session's shader and pipeline work
+  // the ahead-of-time set and the persistent driver cache actually absorbed.
+  // Everything counted here is work the emulated path would otherwise pay at
+  // runtime, so these are the numbers that say how native the frame is.
+  size_t aot_hits() const { return aot_hits_; }
+  size_t aot_misses() const { return aot_misses_; }
+  size_t pipelines_created() const { return pipelines_created_.load(std::memory_order_relaxed); }
+  size_t pipeline_count() const { return pipelines_.size(); }
+
  private:
   REXPACKEDSTRUCT(ShaderStoredHeader, {
     uint64_t ucode_data_hash;
@@ -426,6 +435,20 @@ class VulkanPipelineCache {
   // session, for judging ahead-of-time shader conversion feasibility.
   void WriteShaderInventory() const;
   void WritePipelineInventory() const;
+  // Driver-level pipeline cache, persisted to disk across runs so every boot
+  // after the first replays compiles from the cache instead of paying the
+  // full compiler (measured: 72 pipelines 1.5 s cold vs under 2 ms warm on
+  // Van Gogh RADV).
+  VkPipelineCache vk_pipeline_cache_ = VK_NULL_HANDLE;
+  std::filesystem::path vk_pipeline_cache_path_;
+  // Ahead-of-time shader serving statistics for the shutdown log.
+  size_t aot_hits_ = 0;
+  size_t aot_misses_ = 0;
+  // vkCreateGraphicsPipelines calls actually issued this session. With a warm
+  // persistent driver cache these are cheap replays rather than full compiles;
+  // a count that keeps climbing during play is what stutter looks like.
+  // Atomic: pipelines are created on the creation worker threads.
+  std::atomic<size_t> pipelines_created_{0};
 
   std::unordered_map<PipelineDescription, Pipeline, PipelineDescription::Hasher> pipelines_;
 

@@ -148,7 +148,6 @@ bool build_dcbtst(BuilderContext& ctx) {
 }
 
 bool build_dcbz(BuilderContext& ctx) {
-  bool build_dcbz(BuilderContext& ctx) {
   // HAND PATCH (reverted to 32): plain dcbz is translated as a 32-byte zero,
   // matching Xenia's proven semantics across the 360 library; the Xenon
   // dcbz128/dcbzl form is the 128-byte variant (build_dcbzl below). An

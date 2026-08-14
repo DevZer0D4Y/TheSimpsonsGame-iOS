@@ -9,12 +9,24 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <cstdio>
+#include <cstdlib>
 #include <rex/graphics/packet_disassembler.h>
 #include <rex/graphics/xenos.h>
 
 namespace rex::graphics {
 
 using namespace rex::graphics::xenos;
+
+namespace {
+const uint8_t* disasm_membase = nullptr;
+uint32_t disasm_memsize = 0;
+}  // namespace
+
+void PacketDisassembler::SetMemoryBase(const uint8_t* membase, uint32_t size) {
+  disasm_membase = membase;
+  disasm_memsize = size;
+}
 
 PacketCategory PacketDisassembler::GetPacketCategory(const uint8_t* base_ptr) {
   const uint32_t packet = memory::load_and_swap<uint32_t>(base_ptr);
@@ -329,10 +341,21 @@ bool PacketDisassembler::DisasmPacketType3(const uint8_t* base_ptr, uint32_t pac
           assert_always();
           return true;
       }
+      if (getenv("REPLAY_ALU_LOG")) {
+        uint32_t first = 0;
+        if (disasm_membase && (address & (disasm_memsize - 1)) + 4 <= disasm_memsize)
+          first = memory::load_and_swap<uint32_t>(disasm_membase +
+                                                  (address & (disasm_memsize - 1)));
+        std::fprintf(stderr, "LOAD_ALU idx=%04X n=%u src=%08X first=%08X\n", index,
+                     size_dwords, address, first);
+      }
       for (uint32_t n = 0; n < size_dwords; n++, index++) {
-        // Hrm, ?
-        // memory::load_and_swap<uint32_t>(membase_ + GpuToCpu(address + n * 4));
         uint32_t data = 0xDEADBEEF;
+        if (disasm_membase) {
+          uint32_t src = (address + n * 4) & (disasm_memsize - 1);
+          if (src + 4 <= disasm_memsize)
+            data = memory::load_and_swap<uint32_t>(disasm_membase + src);
+        }
         out_info->actions.emplace_back(PacketAction::RegisterWrite(index, data));
       }
       break;

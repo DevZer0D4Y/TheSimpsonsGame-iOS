@@ -21,7 +21,7 @@
 #include <rex/memory/mapped_memory.h>
 #include <rex/platform.h>
 
-#include <snappy.h"
+#include <snappy.h>
 
 namespace rex::graphics {
 

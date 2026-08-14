@@ -793,6 +793,16 @@ class Shader {
       host_disassembly_ = std::move(disassembly);
     }
 
+    // Ahead-of-time cache injection: installs an externally compiled binary
+    // as this translation's result, skipping the runtime translator. The
+    // binary must have been produced for exactly this (ucode, modification)
+    // pair by the same translator revision.
+    void InstallPrecompiledBinary(std::vector<uint8_t> binary) {
+      translated_binary_ = std::move(binary);
+      is_translated_ = true;
+      is_valid_ = true;
+    }
+
     // For dumping after translation. Dumps the shader's translated code, and,
     // if available, translated disassembly, to files in the given directory
     // based on ucode hash. Returns {binary path, disassembly path if written}.

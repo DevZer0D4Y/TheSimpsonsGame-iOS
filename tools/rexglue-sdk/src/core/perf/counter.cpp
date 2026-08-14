@@ -9,6 +9,7 @@
  *              See LICENSE file in the project root for full license text.
  */
 #include <rex/perf/counter.h>
+#include <rex/perf/frame_index.h>
 
 #include <rex/cvar.h>
 #include <rex/logging.h>

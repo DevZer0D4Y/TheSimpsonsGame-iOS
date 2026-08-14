@@ -21,7 +21,7 @@
 #include <rex/graphics/pipeline/texture/info.h>
 #include <rex/graphics/video_mode_util.h>
 #include <rex/graphics/xenos.h>
-#include <rex/perf/counter.h>
+#include <rex/perf/frame_index.h>
 #include <rex/kernel/xboxkrnl/private.h>
 #include <rex/kernel/xboxkrnl/rtl.h>
 #include <rex/kernel/xboxkrnl/video.h>
