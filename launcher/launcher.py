@@ -252,6 +252,7 @@ SETTINGS_SCHEMA = {
     "mnk_sensitivity": ("float", 1.0, False),
     # game
     "user_language": ("int", 1, True),
+    "subtitles": ("bool", True, True),
     # graphics backend: "" = automatic (Vulkan first, D3D12 fallback on
     # Windows), "vulkan" or "d3d12" to force one. Chosen at startup.
     "gpu": ("str", "", True),
