@@ -118,11 +118,11 @@ namespace disruptorplus
                 std::unique_lock<std::mutex> lock(m_mutex);
                 m_cv.wait_for(
                     lock,
+                    timeout,
                     [&]() -> bool {
                         result = minimum_sequence_after(sequence, count, sequences);
                         return difference(result, sequence) >= 0;
-                    },
-                    timeout);
+                    });
             }
             return result;
         }
@@ -171,11 +171,11 @@ namespace disruptorplus
                 std::unique_lock<std::mutex> lock(m_mutex);
                 m_cv.wait_until(
                     lock,
+                    timeoutTime,
                     [&]() -> bool {
                         result = minimum_sequence_after(sequence, count, sequences);
                         return difference(result, sequence) >= 0;
-                    },
-                    timeoutTime);
+                    });
             }
             return result;
         }

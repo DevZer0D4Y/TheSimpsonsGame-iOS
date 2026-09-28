@@ -9,6 +9,8 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <algorithm>
+#include <cstring>
 #include <memory>
 
 #include <rex/graphics/command_processor.h>
@@ -78,19 +80,37 @@ void TracePlayer::SeekCommand(int target_command) {
   }
 }
 
+void TracePlayer::ReplayFrame(int target_frame, int target_command, bool skip_unchanged_memory) {
+  current_frame_index_ = target_frame;
+  auto frame = current_frame();
+  if (!frame || frame->commands.empty()) {
+    playback_event_->Set();
+    return;
+  }
+  target_command = std::min(target_command, int(frame->commands.size()) - 1);
+  current_command_index_ = target_command;
+  const auto& command = frame->commands[target_command];
+  assert_true(frame->start_ptr <= command.end_ptr);
+  PlayTrace(frame->start_ptr, command.end_ptr - frame->start_ptr, TracePlaybackMode::kBreakOnSwap,
+            false, skip_unchanged_memory);
+}
+
 void TracePlayer::WaitOnPlayback() {
   rex::thread::Wait(playback_event_.get(), true);
 }
 
 void TracePlayer::PlayTrace(const uint8_t* trace_data, size_t trace_size,
-                            TracePlaybackMode playback_mode, bool clear_caches) {
+                            TracePlaybackMode playback_mode, bool clear_caches,
+                            bool skip_unchanged_memory) {
   playing_trace_ = true;
-  graphics_system_->command_processor()->CallInThread(
-      [=]() { PlayTraceOnThread(trace_data, trace_size, playback_mode, clear_caches); });
+  graphics_system_->command_processor()->CallInThread([=]() {
+    PlayTraceOnThread(trace_data, trace_size, playback_mode, clear_caches, skip_unchanged_memory);
+  });
 }
 
 void TracePlayer::PlayTraceOnThread(const uint8_t* trace_data, size_t trace_size,
-                                    TracePlaybackMode playback_mode, bool clear_caches) {
+                                    TracePlaybackMode playback_mode, bool clear_caches,
+                                    bool skip_unchanged_memory) {
   auto memory = graphics_system_->memory();
   auto command_processor = graphics_system_->command_processor();
 
@@ -152,6 +172,7 @@ void TracePlayer::PlayTraceOnThread(const uint8_t* trace_data, size_t trace_size
         }
         if (pending_break) {
           playing_trace_ = false;
+          playback_event_->Set();
           return;
         }
         break;
@@ -159,10 +180,21 @@ void TracePlayer::PlayTraceOnThread(const uint8_t* trace_data, size_t trace_size
       case TraceCommandType::kMemoryRead: {
         auto cmd = reinterpret_cast<const MemoryCommand*>(trace_ptr);
         trace_ptr += sizeof(*cmd);
-        DecompressMemory(cmd->encoding_format, trace_ptr, cmd->encoded_length,
-                         memory->TranslatePhysical(cmd->base_ptr), cmd->decoded_length);
+        uint8_t* guest_memory = memory->TranslatePhysical(cmd->base_ptr);
+        if (skip_unchanged_memory) {
+          memory_compare_buffer_.resize(cmd->decoded_length);
+          DecompressMemory(cmd->encoding_format, trace_ptr, cmd->encoded_length,
+                           memory_compare_buffer_.data(), cmd->decoded_length);
+          if (std::memcmp(guest_memory, memory_compare_buffer_.data(), cmd->decoded_length)) {
+            std::memcpy(guest_memory, memory_compare_buffer_.data(), cmd->decoded_length);
+            command_processor->TracePlaybackWroteMemory(cmd->base_ptr, cmd->decoded_length);
+          }
+        } else {
+          DecompressMemory(cmd->encoding_format, trace_ptr, cmd->encoded_length, guest_memory,
+                           cmd->decoded_length);
+          command_processor->TracePlaybackWroteMemory(cmd->base_ptr, cmd->decoded_length);
+        }
         trace_ptr += cmd->encoded_length;
-        command_processor->TracePlaybackWroteMemory(cmd->base_ptr, cmd->decoded_length);
         break;
       }
       case TraceCommandType::kMemoryWrite: {
