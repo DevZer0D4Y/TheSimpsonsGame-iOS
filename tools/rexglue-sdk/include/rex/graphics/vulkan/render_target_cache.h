@@ -107,6 +107,7 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   // read another target's tiles mid-pass (this one does not - measured 18
   // pure-overhead transfer draws per frame) render identically without them.
   bool native_rt_mode() const { return native_rt_mode_; }
+  bool native_resolve_enabled() const { return native_resolve_enabled_; }
 
   // Ownership-transfer draws elided since startup by the native mode - the
   // concrete measure of what this mode removes from the frame.
@@ -837,6 +838,56 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   bool DumpRenderTargets(uint32_t dump_base, uint32_t dump_row_length_used, uint32_t dump_rows,
                          uint32_t dump_pitch);
 
+  // Native resolves: the resolved area of a host render target drawn directly
+  // into the textures sampling the resolve destination, with the same result as
+  // loading the texture from the memory written by the resolve.
+  enum class NativeResolveShader : uint32_t {
+    kColorFloat,
+    kColorUint,
+    kDepth,
+    kCount,
+  };
+  enum NativeResolveFlags : uint32_t {
+    kNativeResolveFlagSwapRedBlue = 1u << 0,
+    kNativeResolveFlagDepthFloat24 = 1u << 1,
+    kNativeResolveFlagDepthRoundToNearestEven = 1u << 2,
+  };
+  // How a source texel is packed into the texel bits, the same way as when
+  // dumping the render target to the EDRAM.
+  enum class NativeResolvePacking : uint32_t {
+    k8888,
+    k2101010,
+    kFloat16,
+    kFloat32,
+    kUint16,
+    kUint32,
+  };
+  struct NativeResolveConstants {
+    int32_t source_offset_x;
+    int32_t source_offset_y;
+    uint32_t flags;
+    NativeResolvePacking packing;
+  };
+  struct NativeResolvePlan {
+    VulkanRenderTarget* source = nullptr;
+    NativeResolveShader shader = NativeResolveShader::kColorFloat;
+    NativeResolvePacking packing = NativeResolvePacking::k8888;
+    uint32_t flags = 0;
+    uint32_t x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+    uint32_t target_count = 0;
+    VulkanTextureCache::NativeResolveTarget targets[VulkanTextureCache::kMaxNativeResolveTargets];
+  };
+  bool InitializeNativeResolve();
+  void ShutdownNativeResolve();
+  VkPipeline GetNativeResolvePipeline(NativeResolveShader shader, VkFormat dest_format);
+  // Finds the host render target owning the whole resolve area and the textures
+  // to write. Must be called before the memory range is marked as resolved.
+  bool PrepareNativeResolve(const draw_util::ResolveInfo& resolve_info,
+                            VulkanTextureCache& texture_cache, NativeResolvePlan& plan);
+  // Records the texture writes, and marks the textures as up to date - must be
+  // called after the memory range has been marked as resolved.
+  void PerformNativeResolve(VulkanTextureCache& texture_cache, const NativeResolvePlan& plan);
+
   bool gamma_render_target_as_unorm16_ = false;
 
   bool depth_unorm24_vulkan_format_supported_ = false;
@@ -896,6 +947,20 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   uint64_t direct_resolve_attempt_count_ = 0;
   uint64_t direct_resolve_success_count_ = 0;
   uint64_t direct_resolve_fallback_count_ = 0;
+
+  bool native_resolve_enabled_ = false;
+  VkShaderModule native_resolve_vertex_shader_ = VK_NULL_HANDLE;
+  VkShaderModule native_resolve_fragment_shaders_[size_t(NativeResolveShader::kCount)] = {};
+  VkPipelineLayout native_resolve_pipeline_layout_color_ = VK_NULL_HANDLE;
+  VkPipelineLayout native_resolve_pipeline_layout_depth_ = VK_NULL_HANDLE;
+  // Keyed by (destination format << 8) | shader. VK_NULL_HANDLE if failed to
+  // create.
+  std::unordered_map<uint64_t, VkPipeline> native_resolve_pipelines_;
+  // Only the extent is used - with dynamic rendering, no framebuffer object is
+  // needed for rendering into a texture view.
+  Framebuffer native_resolve_framebuffer_;
+  std::vector<ResolveCopyDumpRectangle> native_resolve_rectangles_;
+  uint64_t native_resolve_texture_write_count_ = 0;
 
   // For traces.
   VkBuffer edram_snapshot_download_buffer_ = VK_NULL_HANDLE;

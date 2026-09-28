@@ -28,6 +28,7 @@
 #include <rex/graphics/registers.h>
 #include <rex/graphics/util/draw.h>
 #include <rex/graphics/vulkan/deferred_command_buffer.h>
+#include <rex/graphics/vulkan/gpu_profiler.h>
 #include <rex/graphics/vulkan/graphics_system.h>
 #include <rex/graphics/vulkan/pipeline_cache.h>
 #include <rex/graphics/vulkan/primitive_processor.h>
@@ -138,6 +139,8 @@ class VulkanCommandProcessor : public CommandProcessor {
   void TracePlaybackWroteMemory(uint32_t base_ptr, uint32_t length) override;
 
   void RestoreEdramSnapshot(const void* snapshot) override;
+
+  VulkanGpuProfiler& gpu_profiler() { return gpu_profiler_; }
 
   ui::vulkan::VulkanDevice* GetVulkanDevice() const {
     return static_cast<const ui::vulkan::VulkanProvider*>(graphics_system_->provider())
@@ -542,6 +545,8 @@ class VulkanCommandProcessor : public CommandProcessor {
 
   static constexpr uint32_t kMaxFramesInFlight = 3;
   bool frame_open_ = false;
+  VulkanGpuProfiler gpu_profiler_;
+  uint64_t gpu_profiler_reported_frame_ = 0;
   // Tracks whether any draw in the current frame used an async placeholder
   // graphics pipeline and may have produced incomplete output.
   bool frame_used_async_placeholder_pipeline_ = false;

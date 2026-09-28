@@ -102,44 +102,8 @@ void SpirvShaderTranslator::ProcessVertexFetchInstruction(
     return;
   }
 
-  // Load the needed words.
-  unsigned int word_composite_indices[4] = {};
-  spv::Id word_composite_constituents[4];
-  uint32_t word_count = 0;
-  uint32_t words_remaining = needed_words;
-  uint32_t word_index;
-  while (rex::bit_scan_forward(words_remaining, &word_index)) {
-    words_remaining &= ~(1 << word_index);
-    spv::Id word_address = address;
-    // Add the word offset from the instruction (signed), plus the offset of the
-    // word within the element.
-    int32_t word_offset = instr.attributes.offset + word_index;
-    if (word_offset) {
-      word_address = builder_->createBinOp(spv::OpIAdd, type_int_, word_address,
-                                           builder_->makeIntConstant(int(word_offset)));
-    }
-    word_composite_indices[word_index] = word_count;
-    // FIXME(Triang3l): Bound checking is not done here, but haven't encountered
-    // any games relying on out-of-bounds access. On Adreno 200 on Android (LG
-    // P705), however, words (not full elements) out of glBufferData bounds
-    // contain 0.
-    word_composite_constituents[word_count++] = LoadUint32FromSharedMemory(word_address);
-  }
-  spv::Id words;
-  if (word_count > 1) {
-    // Copying from the array to id_vector_temp_ now, not in the loop above,
-    // because of the LoadUint32FromSharedMemory call (potentially using
-    // id_vector_temp_ internally).
-    id_vector_temp_.clear();
-    id_vector_temp_.insert(id_vector_temp_.cend(), word_composite_constituents,
-                           word_composite_constituents + word_count);
-    words = builder_->createCompositeConstruct(type_uint_vectors_[word_count - 1], id_vector_temp_);
-  } else {
-    words = word_composite_constituents[0];
-  }
-
-  // Endian swap the words, getting the endianness from bits 0:1 of the second
-  // fetch constant word.
+  // Endianness is in bits 0:1 and the size in dwords in bits 2:25 of the
+  // second fetch constant word.
   uint32_t fetch_constant_word_1_index = fetch_constant_word_0_index + 1;
   id_vector_temp_.clear();
   // The only element of the fetch constant buffer.
@@ -152,43 +116,86 @@ void SpirvShaderTranslator::ProcessVertexFetchInstruction(
       builder_->createLoad(builder_->createAccessChain(spv::StorageClassUniform,
                                                        uniform_fetch_constants_, id_vector_temp_),
                            spv::NoPrecision);
-  words = EndianSwap32Uint(
-      words, builder_->createBinOp(spv::OpBitwiseAnd, type_uint_, fetch_constant_word_1,
-                                   builder_->makeUintConstant(0b11)));
+
+  unsigned int word_composite_indices[4] = {};
+  uint32_t word_count = 0;
+  {
+    uint32_t words_remaining = needed_words;
+    uint32_t word_index;
+    while (rex::bit_scan_forward(words_remaining, &word_index)) {
+      words_remaining &= ~(1 << word_index);
+      word_composite_indices[word_index] = word_count++;
+    }
+  }
+  spv::Id words_type = word_count > 1 ? type_uint_vectors_[word_count - 1] : type_uint_;
+  spv::Id zero_words;
+  if (word_count > 1) {
+    id_vector_temp_.clear();
+    for (uint32_t i = 0; i < word_count; ++i) {
+      id_vector_temp_.push_back(builder_->makeUintConstant(0));
+    }
+    zero_words = builder_->makeCompositeConstant(words_type, id_vector_temp_);
+  } else {
+    zero_words = builder_->makeUintConstant(0);
+  }
 
   // HAND PATCH: Xenos hardware bounded vertex fetches by the fetch constant's
   // size field. The Simpsons Game leaves OPTIONAL vertex streams as all-zero
   // "invalid"-type fetch constants during entity streaming; without a bound,
   // the shader read live guest memory at address 0 instead of zeros, feeding
-  // garbage attributes into draws (wrong colors, degenerate geometry, amdgpu
-  // ring hangs). Emulate the null case of the hardware clamp: when the size
-  // field (bits 2:25 of fetch constant word 1) is zero, the fetched words
-  // become zero. Costs one extract+compare+select per vfetch.
+  // garbage attributes into draws. Emulate the null case of the hardware
+  // clamp: when the size field is zero, the fetched words are zero, and
+  // memory is not accessed at all - address 0 may be in a sparse shared
+  // memory region that has never been backed.
+  spv::Id fetch_size = builder_->createBinOp(
+      spv::OpBitwiseAnd, type_uint_,
+      builder_->createBinOp(spv::OpShiftRightLogical, type_uint_, fetch_constant_word_1,
+                            builder_->makeUintConstant(2)),
+      builder_->makeUintConstant((uint32_t(1) << 24) - 1));
+  spv::Id size_is_nonzero = builder_->createBinOp(spv::OpINotEqual, type_bool_, fetch_size,
+                                                  builder_->makeUintConstant(0));
+  SpirvBuilder::IfBuilder size_if(size_is_nonzero, spv::SelectionControlDontFlattenMask,
+                                  *builder_);
+  spv::Id loaded_words;
   {
-    spv::Id fetch_size = builder_->createBinOp(
-        spv::OpBitwiseAnd, type_uint_,
-        builder_->createBinOp(spv::OpShiftRightLogical, type_uint_, fetch_constant_word_1,
-                              builder_->makeUintConstant(2)),
-        builder_->makeUintConstant((uint32_t(1) << 24) - 1));
-    spv::Id size_is_nonzero = builder_->createBinOp(spv::OpINotEqual, type_bool_, fetch_size,
-                                                    builder_->makeUintConstant(0));
-    spv::Id words_type, zero_words, select_condition;
-    if (word_count > 1) {
-      words_type = type_uint_vectors_[word_count - 1];
-      id_vector_temp_.clear();
-      for (uint32_t i = 0; i < word_count; ++i) {
-        id_vector_temp_.push_back(builder_->makeUintConstant(0));
+    spv::Id word_composite_constituents[4];
+    uint32_t words_remaining = needed_words;
+    uint32_t word_index;
+    uint32_t loaded_count = 0;
+    while (rex::bit_scan_forward(words_remaining, &word_index)) {
+      words_remaining &= ~(1 << word_index);
+      spv::Id word_address = address;
+      // Add the word offset from the instruction (signed), plus the offset of
+      // the word within the element.
+      int32_t word_offset = instr.attributes.offset + word_index;
+      if (word_offset) {
+        word_address = builder_->createBinOp(spv::OpIAdd, type_int_, word_address,
+                                             builder_->makeIntConstant(int(word_offset)));
       }
-      zero_words = builder_->makeCompositeConstant(words_type, id_vector_temp_);
-      select_condition = builder_->smearScalar(spv::NoPrecision, size_is_nonzero,
-                                               type_bool_vectors_[word_count - 1]);
-    } else {
-      words_type = type_uint_;
-      zero_words = builder_->makeUintConstant(0);
-      select_condition = size_is_nonzero;
+      // FIXME(Triang3l): Bound checking is not done here, but haven't
+      // encountered any games relying on out-of-bounds access. On Adreno 200 on
+      // Android (LG P705), however, words (not full elements) out of
+      // glBufferData bounds contain 0.
+      word_composite_constituents[loaded_count++] = LoadUint32FromSharedMemory(word_address);
     }
-    words = builder_->createTriOp(spv::OpSelect, words_type, select_condition, words, zero_words);
+    if (word_count > 1) {
+      // Copying from the array to id_vector_temp_ now, not in the loop above,
+      // because of the LoadUint32FromSharedMemory call (potentially using
+      // id_vector_temp_ internally).
+      id_vector_temp_.clear();
+      id_vector_temp_.insert(id_vector_temp_.cend(), word_composite_constituents,
+                             word_composite_constituents + word_count);
+      loaded_words = builder_->createCompositeConstruct(words_type, id_vector_temp_);
+    } else {
+      loaded_words = word_composite_constituents[0];
+    }
   }
+  size_if.makeEndIf();
+  spv::Id words = size_if.createMergePhi(loaded_words, zero_words);
+
+  words = EndianSwap32Uint(
+      words, builder_->createBinOp(spv::OpBitwiseAnd, type_uint_, fetch_constant_word_1,
+                                   builder_->makeUintConstant(0b11)));
 
   spv::Id result = spv::NoResult;
 

@@ -10,6 +10,8 @@
  */
 
 #include <algorithm>
+#include <cstdlib>
+#include <optional>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -40,9 +42,39 @@
 // Experiment: skip the EDRAM ownership-transfer draws between host render
 // targets. This title issues about 18 per frame and relies on them - skipping
 // them corrupts the character shadow blobs - so it stays off.
+REXCVAR_DEFINE_INT32(rt_debug_log_start_frame, 0, "GPU/Vulkan",
+                     "First frame of the rt_debug_log_frames window (diagnostic)");
+
+REXCVAR_DEFINE_INT32(rt_debug_log_frames, 0, "GPU/Vulkan",
+                     "Log every EDRAM ownership transfer and resolve for this many frames "
+                     "(diagnostic)");
+
 REXCVAR_DEFINE_BOOL(native_rt_skip_transfers, false, "GPU/Vulkan",
                     "Skip EDRAM ownership transfer draws on the host render "
                     "target path (breaks character shadows in this title)");
+
+REXCVAR_DEFINE_BOOL(native_resolve, true, "GPU/Vulkan",
+                    "Native renderer: draw resolved render targets directly into the textures "
+                    "that sample them instead of reloading those textures from guest memory")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+REXCVAR_DEFINE_INT32(native_resolve_mask, 3, "GPU/Vulkan",
+                     "Native resolve sources to write directly: 1 = depth, 2 = color, 3 = both "
+                     "(diagnostic)");
+
+REXCVAR_DEFINE_INT32(native_resolve_only, -1, "GPU/Vulkan",
+                     "Write only the resolve with this index within each frame directly "
+                     "(diagnostic, -1 = all)");
+
+REXCVAR_DEFINE_BOOL(native_resolve_debug_reload, false, "GPU/Vulkan",
+                    "Write resolved textures directly but still reload them from memory "
+                    "(diagnostic)");
+
+REXCVAR_DEFINE_INT32(native_resolve_ab_frames, 0, "GPU/Vulkan",
+                     "Alternate native resolves on and off every this many frames, logging each "
+                     "switch, to compare both in the same scene (diagnostic, 0 = off)");
+
+REXCVAR_DECLARE(bool, vulkan_dynamic_rendering);
 
 // "native" renders into real GPU render targets with fixed-function blending
 // and depth/stencil, the way a PC game does. "fsi" emulates the Xenos EDRAM in
@@ -77,6 +109,50 @@ REXCVAR_DEFINE_STRING(render_target_path_vulkan, "native", "GPU/Vulkan",
 //     "GPU");
 
 namespace rex::graphics::vulkan {
+
+namespace {
+// Frames left to log transfers/resolves for; -1 until the first frame reads the cvar.
+int32_t g_rt_debug_frames_left = -1;
+uint32_t g_rt_debug_frame = 0;
+uint32_t g_rt_debug_start_frame = 0;
+bool g_rt_debug_active = false;
+const char* RtFormatName(bool is_depth, uint32_t format) {
+  if (is_depth) {
+    return format ? "D24FS8" : "D24S8";
+  }
+  static const char* kColor[16] = {"8888", "8888_GAMMA", "2_10_10_10", "2_10_10_10_FLOAT",
+                                   "16_16", "16_16_16_16", "16_16_FLOAT", "16_16_16_16_FLOAT",
+                                   "fmt8", "fmt9", "2_10_10_10_AS_10_10_10_10", "fmt11",
+                                   "2_10_10_10_FLOAT_AS_16_16_16_16", "fmt13", "32_FLOAT",
+                                   "32_32_FLOAT"};
+  return kColor[format & 15];
+}
+}  // namespace
+
+bool RtDebugLogActive() { return g_rt_debug_active; }
+
+void RtDebugLogBeginFrame() {
+  if (g_rt_debug_frames_left < 0) {
+    g_rt_debug_start_frame = uint32_t(std::max(0, int32_t(REXCVAR_GET(rt_debug_log_start_frame))));
+    g_rt_debug_frames_left = REXCVAR_GET(rt_debug_log_frames);
+    // Offline tools (trace_dump) do not run the cvar command line/environment
+    // parsing, so accept the environment variable directly as well.
+    if (const char* env = std::getenv("REX_RT_DEBUG_LOG_FRAMES")) {
+      g_rt_debug_frames_left = std::max(g_rt_debug_frames_left, std::atoi(env));
+    }
+    if (g_rt_debug_frames_left > 0) {
+      REXGPU_WARN("[rt-debug] logging transfers and resolves for {} frames",
+                  g_rt_debug_frames_left);
+    }
+  } else if (g_rt_debug_active && g_rt_debug_frames_left > 0) {
+    --g_rt_debug_frames_left;
+  }
+  g_rt_debug_active = g_rt_debug_frames_left > 0 && g_rt_debug_frame >= g_rt_debug_start_frame;
+  if (g_rt_debug_active) {
+    REXGPU_INFO("[rt-debug] ---- frame {} ----", g_rt_debug_frame);
+  }
+  ++g_rt_debug_frame;
+}
 
 // EDRAM-emulation cost probe. These transfer draws and resolves exist only
 // because the Xenos resolved through dedicated EDRAM that this GPU does not
@@ -1001,6 +1077,10 @@ bool VulkanRenderTargetCache::Initialize(uint32_t shared_memory_binding_count) {
               sizeof(last_update_framebuffer_attachments_));
   last_update_framebuffer_ = VK_NULL_HANDLE;
 
+  if (path_ == Path::kHostRenderTargets && native_rt_mode_ && REXCVAR_GET(native_resolve)) {
+    native_resolve_enabled_ = InitializeNativeResolve();
+  }
+
   InitializeCommon();
   return true;
 }
@@ -1010,6 +1090,7 @@ void VulkanRenderTargetCache::Shutdown(bool from_destructor) {
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
   ResetTraceDownload();
+  ShutdownNativeResolve();
 
   // Destroy all render targets before the descriptor set pool is destroyed -
   // may happen if shutting down the VulkanRenderTargetCache by destroying it,
@@ -1377,6 +1458,33 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
     return false;
   }
 
+  if (RtDebugLogActive()) {
+    const draw_util::ResolveEdramInfo& src =
+        resolve_info.IsCopyingDepth() ? resolve_info.depth_edram_info : resolve_info.color_edram_info;
+    REXGPU_INFO(
+        "[rt-debug] resolve src_select={} src(base={} orig={} pitch={} msaa={} {}) rect "
+        "off=({},{}) {}x{} -> dest {:08X} extent {:08X}+{} fmt={} endian={} swap={} bias={} "
+        "pitch={} height={} sample={} clear(color={} depth={})",
+        uint32_t(resolve_info.rb_copy_control.copy_src_select), uint32_t(src.base_tiles),
+        resolve_info.IsCopyingDepth() ? resolve_info.depth_original_base
+                                      : resolve_info.color_original_base,
+        uint32_t(src.pitch_tiles), 1u << uint32_t(src.msaa_samples),
+        RtFormatName(src.is_depth, src.format),
+        uint32_t(resolve_info.coordinate_info.edram_offset_x_div_8) * 8,
+        uint32_t(resolve_info.coordinate_info.edram_offset_y_div_8) * 8,
+        uint32_t(resolve_info.coordinate_info.width_div_8) * 8, resolve_info.height_div_8 * 8,
+        resolve_info.copy_dest_base, resolve_info.copy_dest_extent_start,
+        resolve_info.copy_dest_extent_length, uint32_t(resolve_info.copy_dest_info.copy_dest_format),
+        uint32_t(resolve_info.copy_dest_info.copy_dest_endian),
+        uint32_t(resolve_info.copy_dest_info.copy_dest_swap),
+        int32_t(resolve_info.copy_dest_info.copy_dest_exp_bias),
+        uint32_t(resolve_info.copy_dest_coordinate_info.pitch_aligned_div_32) * 32,
+        uint32_t(resolve_info.copy_dest_coordinate_info.height_aligned_div_32) * 32,
+        uint32_t(resolve_info.copy_dest_coordinate_info.copy_sample_select),
+        uint32_t(resolve_info.rb_copy_control.color_clear_enable),
+        uint32_t(resolve_info.rb_copy_control.depth_clear_enable));
+  }
+
   // Nothing to copy/clear.
   if (!resolve_info.coordinate_info.width_div_8 || !resolve_info.height_div_8) {
     return true;
@@ -1389,6 +1497,12 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
 
   // Copying.
   bool copied = false;
+  // Textures sampling the destination must be found while their data still
+  // matches memory, before the resolved range is invalidated.
+  NativeResolvePlan native_resolve_plan;
+  bool native_resolve_planned =
+      native_resolve_enabled_ &&
+      PrepareNativeResolve(resolve_info, texture_cache, native_resolve_plan);
   if (resolve_info.copy_dest_extent_length) {
     draw_util::ResolveCopyShaderConstants copy_shader_constants;
     uint32_t copy_group_count_x, copy_group_count_y;
@@ -1528,6 +1642,9 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
           written_address_out = resolve_info.copy_dest_extent_start;
           written_length_out = resolve_info.copy_dest_extent_length;
           copied = true;
+          if (native_resolve_planned) {
+            PerformNativeResolve(texture_cache, native_resolve_plan);
+          }
         }
       }
     }
@@ -4811,6 +4928,48 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
   DeferredCommandBuffer& command_buffer = command_processor_.deferred_command_buffer();
 
   bool resolve_clear_needed = render_target_resolve_clear_values && resolve_clear_rectangle;
+  // GPU time attribution: everything recorded until the function returns is
+  // EDRAM ownership-transfer / resolve-clear work.
+  struct TransferProfileScope {
+    VulkanCommandProcessor& cp;
+    explicit TransferProfileScope(VulkanCommandProcessor& command_processor)
+        : cp(command_processor) {
+      cp.gpu_profiler().Mark(cp.deferred_command_buffer(),
+                             VulkanGpuProfiler::Category::kTransfer);
+    }
+    ~TransferProfileScope() {
+      cp.gpu_profiler().Mark(cp.deferred_command_buffer(), VulkanGpuProfiler::Category::kDraw);
+    }
+  };
+  bool any_transfers = resolve_clear_needed;
+  if (render_target_transfers) {
+    for (uint32_t i = 0; i < render_target_count && !any_transfers; ++i) {
+      any_transfers = !render_target_transfers[i].empty();
+    }
+  }
+  std::optional<TransferProfileScope> transfer_profile_scope;
+  if (any_transfers && command_processor_.gpu_profiler().enabled()) {
+    transfer_profile_scope.emplace(command_processor_);
+  }
+  if (RtDebugLogActive() && render_target_transfers) {
+    for (uint32_t i = 0; i < render_target_count; ++i) {
+      if (!render_targets[i]) {
+        continue;
+      }
+      RenderTargetKey dk = render_targets[i]->key();
+      for (const Transfer& t : render_target_transfers[i]) {
+        RenderTargetKey sk = t.source->key();
+        REXGPU_INFO(
+            "[rt-debug] transfer dst(base={} pitch={} msaa={} {}) <- src(base={} pitch={} "
+            "msaa={} {}) tiles {}..{}{}",
+            uint32_t(dk.base_tiles), uint32_t(dk.pitch_tiles_at_32bpp),
+            1u << uint32_t(dk.msaa_samples), RtFormatName(dk.is_depth, dk.resource_format),
+            uint32_t(sk.base_tiles), uint32_t(sk.pitch_tiles_at_32bpp),
+            1u << uint32_t(sk.msaa_samples), RtFormatName(sk.is_depth, sk.resource_format),
+            t.start_tiles, t.end_tiles, t.host_depth_source ? " +host_depth" : "");
+      }
+    }
+  }
   if (REXCVAR_GET(native_rt_skip_transfers) && !resolve_clear_needed) {
     // Ownership transfers dropped entirely. The caller has already updated
     // ownership bookkeeping, so skipping just the copy draws keeps state
@@ -6428,6 +6587,577 @@ bool VulkanRenderTargetCache::DumpRenderTargets(uint32_t dump_base, uint32_t dum
     MarkEdramBufferModified();
   }
   return all_pipelines_available;
+}
+
+namespace {
+
+constexpr char kNativeResolveVertexShaderSource[] = R"(#version 450
+void main() {
+  vec2 position = vec2(float((gl_VertexIndex << 1) & 2), float(gl_VertexIndex & 2));
+  gl_Position = vec4(position * 2.0 - 1.0, 0.0, 1.0);
+}
+)";
+
+// Destination texel (x, y) is source render target pixel (x, y) plus the offset.
+// The output is the raw texel bits, as the texture would load them from the
+// memory the resolve writes.
+constexpr char kNativeResolveFragmentShaderHeader[] = R"(#version 450
+#extension GL_EXT_samplerless_texture_functions : require
+layout(push_constant) uniform XeNativeResolveConstants {
+  ivec2 xe_native_resolve_source_offset;
+  uint xe_native_resolve_flags;
+  uint xe_native_resolve_packing;
+};
+layout(location = 0) out uvec4 xe_native_resolve_output;
+ivec2 XeNativeResolveSourceCoord() {
+  return ivec2(gl_FragCoord.xy) + xe_native_resolve_source_offset;
+}
+// Red / blue swap requested by the resolve, 8_8_8_8 and 2_10_10_10 only.
+uint XeNativeResolveSwap(uint bits) {
+  if ((xe_native_resolve_flags & 1u) == 0u) {
+    return bits;
+  }
+  if (xe_native_resolve_packing == 0u) {
+    return (bits & 0xFF00FF00u) | ((bits & 0xFFu) << 16u) | ((bits >> 16u) & 0xFFu);
+  }
+  return (bits & 0xC00FFC00u) | ((bits & 0x3FFu) << 20u) | ((bits >> 20u) & 0x3FFu);
+}
+)";
+
+constexpr char kNativeResolveColorFloatBody[] = R"(
+layout(set = 0, binding = 0) uniform texture2D xe_native_resolve_source;
+void main() {
+  vec4 color = texelFetch(xe_native_resolve_source, XeNativeResolveSourceCoord(), 0);
+  uvec2 bits;
+  if (xe_native_resolve_packing == 0u) {
+    uvec4 c = uvec4(color * 255.0 + 0.5);
+    bits = uvec2(c.r | (c.g << 8u) | (c.b << 16u) | (c.a << 24u), 0u);
+  } else if (xe_native_resolve_packing == 1u) {
+    uvec3 rgb = uvec3(color.rgb * 1023.0 + 0.5);
+    uint a = uint(color.a * 3.0 + 0.5);
+    bits = uvec2(rgb.r | (rgb.g << 10u) | (rgb.b << 20u) | (a << 30u), 0u);
+  } else if (xe_native_resolve_packing == 2u) {
+    bits = uvec2(packHalf2x16(color.rg), packHalf2x16(color.ba));
+  } else {
+    bits = floatBitsToUint(color.rg);
+  }
+  xe_native_resolve_output = uvec4(XeNativeResolveSwap(bits.x), bits.y, 0u, 0u);
+}
+)";
+
+// Ownership transfer views of float render targets are integer to keep NaNs.
+constexpr char kNativeResolveColorUintBody[] = R"(
+layout(set = 0, binding = 0) uniform utexture2D xe_native_resolve_source;
+void main() {
+  uvec4 u = texelFetch(xe_native_resolve_source, XeNativeResolveSourceCoord(), 0);
+  uvec2 bits = xe_native_resolve_packing == 4u
+                   ? uvec2((u.x & 0xFFFFu) | (u.y << 16u), (u.z & 0xFFFFu) | (u.w << 16u))
+                   : u.xy;
+  xe_native_resolve_output = uvec4(bits, 0u, 0u);
+}
+)";
+
+// The same conversions as dumping host depth to the EDRAM (float24 from host
+// depth remapped from the guest [0, 2) to [0, 1), or unorm24), followed by
+// loading the resolved k_24_8_FLOAT or k_24_8 texture into R32_SFLOAT.
+constexpr char kNativeResolveDepthBody[] = R"(
+layout(set = 0, binding = 0) uniform texture2D xe_native_resolve_source;
+uint XeHostDepthTo20e4(uint f32, bool round_to_nearest_even) {
+  uint denormal = ((f32 & 0x7FFFFFu) | 0x800000u) >> min(112u - (f32 >> 23u), 24u);
+  uint biased = f32 < 0x38000000u ? denormal : f32 - (111u << 23u);
+  if (round_to_nearest_even) {
+    biased += 3u + ((biased >> 3u) & 1u);
+  }
+  return (biased >> 3u) & 0xFFFFFFu;
+}
+float XeFloat20e4To32(uint f24) {
+  if (f24 == 0u) {
+    return 0.0;
+  }
+  uint mantissa = f24 & 0xFFFFFu;
+  uint exponent = f24 >> 20u;
+  if (exponent == 0u) {
+    uint msb = uint(findMSB(mantissa));
+    exponent = msb - 19u;
+    mantissa = (mantissa << (20u - msb)) & 0xFFFFFu;
+  }
+  return uintBitsToFloat(((exponent + 112u) << 23u) | (mantissa << 3u));
+}
+void main() {
+  float depth = texelFetch(xe_native_resolve_source, XeNativeResolveSourceCoord(), 0).r;
+  float result;
+  if ((xe_native_resolve_flags & 2u) != 0u) {
+    result = XeFloat20e4To32(
+        XeHostDepthTo20e4(floatBitsToUint(depth), (xe_native_resolve_flags & 4u) != 0u));
+  } else {
+    uint depth24 = uint(roundEven(depth * 16777215.0));
+    result = float(depth24 + (depth24 >> 23u)) * 5.96046448e-08;
+  }
+  xe_native_resolve_output = uvec4(floatBitsToUint(result), 0u, 0u, 0u);
+}
+)";
+
+}  // namespace
+
+bool VulkanRenderTargetCache::InitializeNativeResolve() {
+  const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
+  if (!REXCVAR_GET(vulkan_dynamic_rendering) || !vulkan_device->properties().dynamicRendering) {
+    REXGPU_INFO("VulkanRenderTargetCache: native resolves need dynamic rendering, disabled");
+    return false;
+  }
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+
+  auto compile = [&](VkShaderStageFlagBits stage, const std::string& source) -> VkShaderModule {
+    std::vector<uint32_t> spirv;
+    std::string error;
+    if (!command_processor_.CompileGlslToSpirv(stage, source, spirv, error)) {
+      REXGPU_ERROR("VulkanRenderTargetCache: failed to compile a native resolve shader: {}",
+                   error);
+      return VK_NULL_HANDLE;
+    }
+    return ui::vulkan::util::CreateShaderModule(vulkan_device, spirv.data(),
+                                                sizeof(uint32_t) * spirv.size());
+  };
+  native_resolve_vertex_shader_ =
+      compile(VK_SHADER_STAGE_VERTEX_BIT, kNativeResolveVertexShaderSource);
+  const char* const fragment_bodies[size_t(NativeResolveShader::kCount)] = {
+      kNativeResolveColorFloatBody,
+      kNativeResolveColorUintBody,
+      kNativeResolveDepthBody,
+  };
+  bool shaders_created = native_resolve_vertex_shader_ != VK_NULL_HANDLE;
+  for (size_t i = 0; i < size_t(NativeResolveShader::kCount); ++i) {
+    native_resolve_fragment_shaders_[i] =
+        compile(VK_SHADER_STAGE_FRAGMENT_BIT,
+                std::string(kNativeResolveFragmentShaderHeader) + fragment_bodies[i]);
+    shaders_created &= native_resolve_fragment_shaders_[i] != VK_NULL_HANDLE;
+  }
+  if (!shaders_created) {
+    ShutdownNativeResolve();
+    return false;
+  }
+
+  auto create_pipeline_layout = [&](VkDescriptorSetLayout source_layout,
+                                    VkPipelineLayout& pipeline_layout_out) {
+    VkPushConstantRange push_constant_range;
+    push_constant_range.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    push_constant_range.offset = 0;
+    push_constant_range.size = sizeof(NativeResolveConstants);
+    VkPipelineLayoutCreateInfo pipeline_layout_create_info;
+    pipeline_layout_create_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    pipeline_layout_create_info.pNext = nullptr;
+    pipeline_layout_create_info.flags = 0;
+    pipeline_layout_create_info.setLayoutCount = 1;
+    pipeline_layout_create_info.pSetLayouts = &source_layout;
+    pipeline_layout_create_info.pushConstantRangeCount = 1;
+    pipeline_layout_create_info.pPushConstantRanges = &push_constant_range;
+    if (dfn.vkCreatePipelineLayout(device, &pipeline_layout_create_info, nullptr,
+                                   &pipeline_layout_out) != VK_SUCCESS) {
+      pipeline_layout_out = VK_NULL_HANDLE;
+      return false;
+    }
+    return true;
+  };
+  // Depth sources are bound with the depth and stencil transfer descriptor set.
+  if (!create_pipeline_layout(descriptor_set_layout_sampled_image_,
+                              native_resolve_pipeline_layout_color_) ||
+      !create_pipeline_layout(descriptor_set_layout_sampled_image_x2_,
+                              native_resolve_pipeline_layout_depth_)) {
+    REXGPU_ERROR("VulkanRenderTargetCache: failed to create the native resolve pipeline layouts");
+    ShutdownNativeResolve();
+    return false;
+  }
+
+  REXGPU_INFO("VulkanRenderTargetCache: native resolves enabled");
+  return true;
+}
+
+void VulkanRenderTargetCache::ShutdownNativeResolve() {
+  const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  for (const auto& pipeline_pair : native_resolve_pipelines_) {
+    if (pipeline_pair.second != VK_NULL_HANDLE) {
+      dfn.vkDestroyPipeline(device, pipeline_pair.second, nullptr);
+    }
+  }
+  native_resolve_pipelines_.clear();
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipelineLayout, device,
+                                         native_resolve_pipeline_layout_depth_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipelineLayout, device,
+                                         native_resolve_pipeline_layout_color_);
+  for (VkShaderModule& shader : native_resolve_fragment_shaders_) {
+    ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyShaderModule, device, shader);
+  }
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyShaderModule, device,
+                                         native_resolve_vertex_shader_);
+  native_resolve_enabled_ = false;
+}
+
+VkPipeline VulkanRenderTargetCache::GetNativeResolvePipeline(NativeResolveShader shader,
+                                                             VkFormat dest_format) {
+  uint64_t key = (uint64_t(dest_format) << 8) | uint64_t(shader);
+  auto it = native_resolve_pipelines_.find(key);
+  if (it != native_resolve_pipelines_.end()) {
+    return it->second;
+  }
+
+  const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+
+  VkPipelineShaderStageCreateInfo shader_stages[2] = {};
+  shader_stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+  shader_stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+  shader_stages[0].module = native_resolve_vertex_shader_;
+  shader_stages[0].pName = "main";
+  shader_stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+  shader_stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+  shader_stages[1].module = native_resolve_fragment_shaders_[size_t(shader)];
+  shader_stages[1].pName = "main";
+
+  VkPipelineVertexInputStateCreateInfo vertex_input_state = {};
+  vertex_input_state.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+
+  VkPipelineInputAssemblyStateCreateInfo input_assembly_state = {};
+  input_assembly_state.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+  input_assembly_state.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+
+  VkPipelineViewportStateCreateInfo viewport_state = {};
+  viewport_state.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+  viewport_state.viewportCount = 1;
+  viewport_state.scissorCount = 1;
+
+  VkPipelineRasterizationStateCreateInfo rasterization_state = {};
+  rasterization_state.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+  rasterization_state.polygonMode = VK_POLYGON_MODE_FILL;
+  rasterization_state.cullMode = VK_CULL_MODE_NONE;
+  rasterization_state.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+  rasterization_state.lineWidth = 1.0f;
+
+  VkPipelineMultisampleStateCreateInfo multisample_state = {};
+  multisample_state.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+  multisample_state.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+  VkPipelineDepthStencilStateCreateInfo depth_stencil_state = {};
+  depth_stencil_state.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+
+  VkPipelineColorBlendAttachmentState color_blend_attachment = {};
+  color_blend_attachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                                          VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+  VkPipelineColorBlendStateCreateInfo color_blend_state = {};
+  color_blend_state.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+  color_blend_state.attachmentCount = 1;
+  color_blend_state.pAttachments = &color_blend_attachment;
+
+  VkDynamicState dynamic_states[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+  VkPipelineDynamicStateCreateInfo dynamic_state = {};
+  dynamic_state.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+  dynamic_state.dynamicStateCount = uint32_t(rex::countof(dynamic_states));
+  dynamic_state.pDynamicStates = dynamic_states;
+
+  VkPipelineRenderingCreateInfo pipeline_rendering_create_info = {};
+  pipeline_rendering_create_info.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
+  pipeline_rendering_create_info.colorAttachmentCount = 1;
+  pipeline_rendering_create_info.pColorAttachmentFormats = &dest_format;
+
+  VkGraphicsPipelineCreateInfo pipeline_create_info = {};
+  pipeline_create_info.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+  pipeline_create_info.pNext = &pipeline_rendering_create_info;
+  pipeline_create_info.stageCount = uint32_t(rex::countof(shader_stages));
+  pipeline_create_info.pStages = shader_stages;
+  pipeline_create_info.pVertexInputState = &vertex_input_state;
+  pipeline_create_info.pInputAssemblyState = &input_assembly_state;
+  pipeline_create_info.pViewportState = &viewport_state;
+  pipeline_create_info.pRasterizationState = &rasterization_state;
+  pipeline_create_info.pMultisampleState = &multisample_state;
+  pipeline_create_info.pDepthStencilState = &depth_stencil_state;
+  pipeline_create_info.pColorBlendState = &color_blend_state;
+  pipeline_create_info.pDynamicState = &dynamic_state;
+  pipeline_create_info.layout = shader == NativeResolveShader::kDepth
+                                    ? native_resolve_pipeline_layout_depth_
+                                    : native_resolve_pipeline_layout_color_;
+  pipeline_create_info.renderPass = VK_NULL_HANDLE;
+  pipeline_create_info.basePipelineIndex = -1;
+  VkPipeline pipeline;
+  if (dfn.vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &pipeline_create_info, nullptr,
+                                    &pipeline) != VK_SUCCESS) {
+    REXGPU_ERROR(
+        "VulkanRenderTargetCache: failed to create the native resolve pipeline for shader {}, "
+        "format {}",
+        uint32_t(shader), uint32_t(dest_format));
+    pipeline = VK_NULL_HANDLE;
+  }
+  native_resolve_pipelines_.emplace(key, pipeline);
+  return pipeline;
+}
+
+bool VulkanRenderTargetCache::PrepareNativeResolve(const draw_util::ResolveInfo& resolve_info,
+                                                   VulkanTextureCache& texture_cache,
+                                                   NativeResolvePlan& plan) {
+  plan.target_count = 0;
+  plan.source = nullptr;
+  if (!native_resolve_enabled_ || !resolve_info.copy_dest_extent_length ||
+      IsDrawResolutionScaled() || resolve_info.copy_dest_info.copy_dest_array) {
+    return false;
+  }
+  if (int32_t ab_frames = REXCVAR_GET(native_resolve_ab_frames); ab_frames > 0) {
+    uint64_t frame = command_processor_.GetCurrentFrame();
+    bool ab_on = ((frame / uint64_t(ab_frames)) & 1) == 0;
+    static int ab_logged_state = -1;
+    if (int(ab_on) != ab_logged_state) {
+      ab_logged_state = int(ab_on);
+      REXGPU_INFO("[native-resolve-ab] frame {}: {}", frame, ab_on ? "on" : "off");
+    }
+    if (!ab_on) {
+      return false;
+    }
+  }
+  bool is_depth = resolve_info.IsCopyingDepth();
+  if (!(REXCVAR_GET(native_resolve_mask) & (is_depth ? 1 : 2))) {
+    return false;
+  }
+  if (int32_t only = REXCVAR_GET(native_resolve_only); only >= 0) {
+    static uint64_t counted_frame = UINT64_MAX;
+    static int32_t resolve_index = 0;
+    uint64_t frame = command_processor_.GetCurrentFrame();
+    if (frame != counted_frame) {
+      counted_frame = frame;
+      resolve_index = 0;
+    }
+    if (resolve_index++ != only) {
+      return false;
+    }
+  }
+  const draw_util::ResolveEdramInfo& edram_info =
+      is_depth ? resolve_info.depth_edram_info : resolve_info.color_edram_info;
+  if (edram_info.msaa_samples != xenos::MsaaSamples::k1X) {
+    return false;
+  }
+  uint32_t dest_endian = uint32_t(resolve_info.copy_dest_info.copy_dest_endian);
+  if (dest_endian > uint32_t(xenos::Endian::k16in32)) {
+    return false;
+  }
+
+  // The whole resolve area must be owned by one render target with the
+  // surface's origin, so destination texel (x, y) is render target pixel (x, y).
+  uint32_t dump_base, dump_row_length_used, dump_rows, dump_pitch;
+  resolve_info.GetCopyEdramTileSpan(dump_base, dump_row_length_used, dump_rows, dump_pitch);
+  GetResolveCopyRectanglesToDump(dump_base, dump_row_length_used, dump_rows, dump_pitch,
+                                 native_resolve_rectangles_);
+  if (native_resolve_rectangles_.size() != 1) {
+    return false;
+  }
+  const ResolveCopyDumpRectangle& rectangle = native_resolve_rectangles_.front();
+  if (rectangle.row_first || rectangle.rows != dump_rows || rectangle.row_first_start ||
+      rectangle.row_last_end != dump_row_length_used) {
+    return false;
+  }
+  auto* source = static_cast<VulkanRenderTarget*>(rectangle.render_target);
+  RenderTargetKey source_key = source->key();
+  uint32_t original_base =
+      is_depth ? resolve_info.depth_original_base : resolve_info.color_original_base;
+  if (bool(source_key.is_depth) != is_depth || source_key.base_tiles != original_base ||
+      source_key.msaa_samples != xenos::MsaaSamples::k1X ||
+      source_key.GetPitchTiles() != edram_info.pitch_tiles) {
+    return false;
+  }
+
+  NativeResolveShader shader;
+  NativeResolvePacking packing = NativeResolvePacking::kUint32;
+  uint32_t flags = 0;
+  if (is_depth) {
+    shader = NativeResolveShader::kDepth;
+    if (source_key.GetDepthFormat() == xenos::DepthRenderTargetFormat::kD24FS8) {
+      flags |= kNativeResolveFlagDepthFloat24;
+      if (depth_float24_round()) {
+        flags |= kNativeResolveFlagDepthRoundToNearestEven;
+      }
+    }
+  } else {
+    auto guest_format = xenos::ColorRenderTargetFormat(edram_info.format);
+    xenos::ColorRenderTargetFormat source_format = source_key.GetColorFormat();
+    if (resolve_info.copy_dest_info.copy_dest_exp_bias ||
+        guest_format == xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA ||
+        source_format == xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA ||
+        !xenos::IsColorResolveFormatBitwiseEquivalent(
+            guest_format, xenos::ColorFormat(resolve_info.copy_dest_info.copy_dest_format))) {
+      return false;
+    }
+    bool source_is_integer = false;
+    GetColorOwnershipTransferVulkanFormat(source_format, source_key.msaa_samples,
+                                          &source_is_integer);
+    bool swap_supported = false;
+    switch (source_format) {
+      case xenos::ColorRenderTargetFormat::k_8_8_8_8:
+        if (source_is_integer) {
+          return false;
+        }
+        shader = NativeResolveShader::kColorFloat;
+        packing = NativeResolvePacking::k8888;
+        swap_supported = true;
+        break;
+      case xenos::ColorRenderTargetFormat::k_2_10_10_10:
+      case xenos::ColorRenderTargetFormat::k_2_10_10_10_AS_10_10_10_10:
+        if (source_is_integer) {
+          return false;
+        }
+        shader = NativeResolveShader::kColorFloat;
+        packing = NativeResolvePacking::k2101010;
+        swap_supported = true;
+        break;
+      case xenos::ColorRenderTargetFormat::k_16_16_FLOAT:
+      case xenos::ColorRenderTargetFormat::k_16_16_16_16_FLOAT:
+        shader =
+            source_is_integer ? NativeResolveShader::kColorUint : NativeResolveShader::kColorFloat;
+        packing = source_is_integer ? NativeResolvePacking::kUint16 : NativeResolvePacking::kFloat16;
+        break;
+      case xenos::ColorRenderTargetFormat::k_32_FLOAT:
+      case xenos::ColorRenderTargetFormat::k_32_32_FLOAT:
+        shader =
+            source_is_integer ? NativeResolveShader::kColorUint : NativeResolveShader::kColorFloat;
+        packing = source_is_integer ? NativeResolvePacking::kUint32 : NativeResolvePacking::kFloat32;
+        break;
+      default:
+        return false;
+    }
+    if (resolve_info.copy_dest_info.copy_dest_swap) {
+      if (!swap_supported) {
+        return false;
+      }
+      flags |= kNativeResolveFlagSwapRedBlue;
+    }
+  }
+
+  uint32_t x0 = resolve_info.rect_x0;
+  uint32_t y0 = resolve_info.rect_y0;
+  uint32_t x1 = x0 + (uint32_t(resolve_info.coordinate_info.width_div_8)
+                      << xenos::kResolveAlignmentPixelsLog2);
+  uint32_t y1 = y0 + (resolve_info.height_div_8 << xenos::kResolveAlignmentPixelsLog2);
+  uint32_t dest_pitch = uint32_t(resolve_info.copy_dest_coordinate_info.pitch_aligned_div_32)
+                        << xenos::kTextureTileWidthHeightLog2;
+  VulkanTextureCache::NativeResolveTarget found[VulkanTextureCache::kMaxNativeResolveTargets];
+  uint32_t found_count = texture_cache.FindNativeResolveTargets(
+      resolve_info.copy_dest_base_raw, dest_pitch,
+      xenos::TextureFormat(resolve_info.copy_dest_info.copy_dest_format),
+      xenos::Endian(dest_endian), found);
+  for (uint32_t i = 0; i < found_count; ++i) {
+    if (found[i].width > x0 && found[i].height > y0) {
+      plan.targets[plan.target_count++] = found[i];
+    }
+  }
+  if (!plan.target_count) {
+    return false;
+  }
+  plan.source = source;
+  plan.shader = shader;
+  plan.packing = packing;
+  plan.flags = flags;
+  plan.x0 = x0;
+  plan.y0 = y0;
+  plan.x1 = x1;
+  plan.y1 = y1;
+  return true;
+}
+
+void VulkanRenderTargetCache::PerformNativeResolve(VulkanTextureCache& texture_cache,
+                                                   const NativeResolvePlan& plan) {
+  if (!plan.source || !plan.target_count) {
+    return;
+  }
+  VulkanRenderTarget& source = *plan.source;
+  bool is_depth = plan.shader == NativeResolveShader::kDepth;
+
+  VulkanGpuProfiler& gpu_profiler = command_processor_.gpu_profiler();
+  DeferredCommandBuffer& command_buffer = command_processor_.deferred_command_buffer();
+  gpu_profiler.Mark(command_buffer, VulkanGpuProfiler::Category::kNativeResolve);
+
+  // Usually already readable after being dumped for the resolve.
+  VkPipelineStageFlags source_stage_mask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+  if (source.current_layout() == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL &&
+      source.current_access_mask() == VK_ACCESS_SHADER_READ_BIT) {
+    source_stage_mask |= source.current_stage_mask();
+  }
+  command_processor_.PushImageMemoryBarrier(
+      source.image(),
+      ui::vulkan::util::InitializeSubresourceRange(
+          is_depth ? (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)
+                   : VK_IMAGE_ASPECT_COLOR_BIT),
+      source.current_stage_mask(), source_stage_mask, source.current_access_mask(),
+      VK_ACCESS_SHADER_READ_BIT, source.current_layout(),
+      VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+  source.SetUsage(source_stage_mask, VK_ACCESS_SHADER_READ_BIT,
+                  VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+
+  VkPipelineLayout pipeline_layout = is_depth ? native_resolve_pipeline_layout_depth_
+                                              : native_resolve_pipeline_layout_color_;
+  VkDescriptorSet source_descriptor_set = source.GetDescriptorSetTransferSource();
+  NativeResolveConstants constants;
+  constants.source_offset_x = 0;
+  constants.source_offset_y = 0;
+  constants.flags = plan.flags;
+  constants.packing = plan.packing;
+
+  bool written[VulkanTextureCache::kMaxNativeResolveTargets] = {};
+  for (uint32_t i = 0; i < plan.target_count; ++i) {
+    const VulkanTextureCache::NativeResolveTarget& target = plan.targets[i];
+    uint32_t x1 = std::min(plan.x1, target.width);
+    uint32_t y1 = std::min(plan.y1, target.height);
+    if (x1 <= plan.x0 || y1 <= plan.y0) {
+      continue;
+    }
+    VkPipeline pipeline = GetNativeResolvePipeline(plan.shader, target.format);
+    if (pipeline == VK_NULL_HANDLE) {
+      // Stays outdated, and will be reloaded from the resolved memory.
+      continue;
+    }
+    texture_cache.BeginNativeResolveWrite(target);
+    command_processor_.EndRenderPass();
+    native_resolve_framebuffer_.host_extent.width = target.width;
+    native_resolve_framebuffer_.host_extent.height = target.height;
+    command_processor_.SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+        VK_NULL_HANDLE, &native_resolve_framebuffer_, target.view, false);
+    VkViewport viewport;
+    viewport.x = float(plan.x0);
+    viewport.y = float(plan.y0);
+    viewport.width = float(x1 - plan.x0);
+    viewport.height = float(y1 - plan.y0);
+    viewport.minDepth = 0.0f;
+    viewport.maxDepth = 1.0f;
+    command_processor_.SetViewport(viewport);
+    VkRect2D scissor;
+    scissor.offset.x = int32_t(plan.x0);
+    scissor.offset.y = int32_t(plan.y0);
+    scissor.extent.width = x1 - plan.x0;
+    scissor.extent.height = y1 - plan.y0;
+    command_processor_.SetScissor(scissor);
+    command_processor_.BindExternalGraphicsPipeline(pipeline);
+    command_buffer.CmdVkBindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout, 0, 1,
+                                           &source_descriptor_set, 0, nullptr);
+    command_buffer.CmdVkPushConstants(pipeline_layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+                                      sizeof(constants), &constants);
+    command_buffer.CmdVkDraw(3, 1, 0, 0);
+    written[i] = true;
+  }
+  command_processor_.EndRenderPass();
+
+  uint32_t written_count = 0;
+  bool debug_reload = REXCVAR_GET(native_resolve_debug_reload);
+  for (uint32_t i = 0; i < plan.target_count; ++i) {
+    if (written[i]) {
+      if (!debug_reload) {
+        texture_cache.EndNativeResolveWrite(plan.targets[i]);
+      }
+      ++written_count;
+    }
+  }
+  native_resolve_texture_write_count_ += written_count;
+  if (RtDebugLogActive()) {
+    REXGPU_INFO("[rt-debug] native resolve wrote {} of {} textures", written_count,
+                plan.target_count);
+  }
+  gpu_profiler.Mark(command_buffer, VulkanGpuProfiler::Category::kResolve);
 }
 
 }  // namespace rex::graphics::vulkan

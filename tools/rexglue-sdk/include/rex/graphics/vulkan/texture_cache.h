@@ -133,6 +133,32 @@ class VulkanTextureCache final : public TextureCache {
   void UseScaledResolveBufferForWrite(uint64_t written_start_scaled,
                                       uint64_t written_length_scaled);
 
+  // Native resolves: resolved render target data written directly into the
+  // textures that sample it instead of being reloaded from guest memory. Must be
+  // set before textures are created, as it affects image creation.
+  void SetNativeResolveTexturesEnabled(bool enabled) { native_resolve_textures_enabled_ = enabled; }
+  struct NativeResolveTarget {
+    // Opaque texture reference, valid within the resolve it was found for.
+    void* texture = nullptr;
+    VkImageView view = VK_NULL_HANDLE;
+    VkFormat format = VK_FORMAT_UNDEFINED;
+    uint32_t width = 0;
+    uint32_t height = 0;
+  };
+  static constexpr uint32_t kMaxNativeResolveTargets = 4;
+  // Finds existing textures that sample exactly the memory a resolve writes:
+  // the base level starting at dest_base, stored as a single 2D tiled level with
+  // the resolve's row pitch, the same format and endianness, with data that
+  // currently matches guest memory. Returns the number of targets written.
+  uint32_t FindNativeResolveTargets(uint32_t dest_base, uint32_t dest_pitch_texels,
+                                    xenos::TextureFormat format, xenos::Endian endian,
+                                    NativeResolveTarget* targets_out);
+  // Pushes the barrier for writing the target as a color attachment.
+  void BeginNativeResolveWrite(const NativeResolveTarget& target);
+  // To be called once the target's memory range has been marked as resolved and
+  // the texture data has been written, so it matches guest memory again.
+  void EndNativeResolveWrite(const NativeResolveTarget& target);
+
  protected:
   bool IsSignedVersionSeparateForFormat(TextureKey key) const override;
   bool IsScaledResolveSupportedForFormat(TextureKey key) const override;
@@ -193,6 +219,7 @@ class VulkanTextureCache final : public TextureCache {
       kTransferDestination,
       kGuestShaderSampled,
       kSwapSampled,
+      kNativeResolveWrite,
     };
 
     // Takes ownership of the image and its memory.
@@ -211,6 +238,13 @@ class VulkanTextureCache final : public TextureCache {
 
     VkImageView GetView(bool is_signed, uint32_t host_swizzle, bool is_array = true);
     VkImageView GetOrCreate3DAs2DImageView(bool is_signed, uint32_t host_swizzle);
+
+    // Integer view format for writing raw texel bits. VK_FORMAT_UNDEFINED
+    // unless the image was created as a native resolve destination.
+    VkFormat native_resolve_format() const { return native_resolve_format_; }
+    void SetNativeResolveFormat(VkFormat format) { native_resolve_format_ = format; }
+    // Level 0, layer 0 color attachment view.
+    VkImageView GetNativeResolveView();
 
    private:
     union ViewKey {
@@ -269,6 +303,9 @@ class VulkanTextureCache final : public TextureCache {
     std::unique_ptr<VulkanTexture> texture_3d_as_2d_;
     VkImageView image_view_3d_as_2d_unsigned_ = VK_NULL_HANDLE;
     VkImageView image_view_3d_as_2d_signed_ = VK_NULL_HANDLE;
+
+    VkFormat native_resolve_format_ = VK_FORMAT_UNDEFINED;
+    VkImageView native_resolve_view_ = VK_NULL_HANDLE;
   };
 
   struct VulkanTextureBinding {
@@ -327,6 +364,11 @@ class VulkanTextureCache final : public TextureCache {
 
   xenos::ClampMode NormalizeClampMode(xenos::ClampMode clamp_mode) const;
 
+  static bool IsNativeResolveTextureFormat(xenos::TextureFormat format);
+  // Integer format of the same size for writing raw texel bits.
+  static VkFormat GetNativeResolveViewFormat(VkFormat host_format);
+  bool IsColorAttachmentFormatSupported(VkFormat format);
+
   VulkanCommandProcessor& command_processor_;
   VkPipelineStageFlags guest_shader_pipeline_stages_;
 
@@ -370,6 +412,9 @@ class VulkanTextureCache final : public TextureCache {
     kUnsupportedSnormBit = kUnsupportedUnormBit << 1,
   };
   uint8_t unsupported_format_features_used_[64] = {};
+
+  bool native_resolve_textures_enabled_ = false;
+  std::unordered_map<VkFormat, bool> color_attachment_format_support_;
 
   uint32_t sampler_max_count_;
 

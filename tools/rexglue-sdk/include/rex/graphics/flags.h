@@ -51,6 +51,7 @@ REXCVAR_DECLARE(bool, direct_host_resolve);
 // GPU Textures
 REXCVAR_DECLARE(bool, gpu_allow_invalid_fetch_constants);
 REXCVAR_DECLARE(bool, gpu_allow_null_optional_streams);
+REXCVAR_DECLARE(bool, gpu_rasterize_null_optional_reads);
 REXCVAR_DECLARE(bool, gpu_3d_to_2d_texture);
 REXCVAR_DECLARE(int32_t, anisotropic_override);
 REXCVAR_DECLARE(int32_t, texture_cache_memory_limit_render_to_texture);
@@ -91,6 +92,7 @@ REXCVAR_DECLARE(std::string, swap_post_effect);
 REXCVAR_DECLARE(int32_t, gpu_shader_max_cf_iterations);
 REXCVAR_DECLARE(bool, gpu_sanitize_vertex_position);
 REXCVAR_DECLARE(double, gpu_vertex_position_magnitude_limit);
+REXCVAR_DECLARE(double, gpu_vertex_position_min_abs_w);
 
 // Vulkan
 REXCVAR_DECLARE(bool, vulkan_sparse_shared_memory);
