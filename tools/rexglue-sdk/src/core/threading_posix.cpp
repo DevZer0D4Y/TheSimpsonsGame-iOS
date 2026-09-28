@@ -1328,14 +1328,17 @@ void* PosixCondition<Thread>::ThreadStartRoutine(void* parameter) {
   {
     std::unique_lock<std::mutex> lock(thread->handle_.state_mutex_);
     thread->handle_.state_ = create_suspended ? State::kSuspended : State::kRunning;
+    // The suspend count must change together with the state. Resume() may run
+    // as soon as WaitStarted() sees the new state, and with a zero count it
+    // does nothing, which left the thread suspended forever.
+    if (create_suspended) {
+      thread->handle_.suspend_count_ = 1;
+    }
     thread->handle_.state_signal_.notify_all();
-  }
-
-  if (create_suspended) {
-    std::unique_lock<std::mutex> lock(thread->handle_.state_mutex_);
-    thread->handle_.suspend_count_ = 1;
-    thread->handle_.state_signal_.wait(lock,
-                                       [thread] { return thread->handle_.suspend_count_ == 0; });
+    if (create_suspended) {
+      thread->handle_.state_signal_.wait(lock,
+                                         [thread] { return thread->handle_.suspend_count_ == 0; });
+    }
   }
 
   start_routine();
