@@ -258,6 +258,41 @@ class Run:
             time.sleep(0.2)
         self.note(f"shot {label}: no image")
 
+    def shots(self, count, interval, label):
+        """A timed series of screenshots, e.g. to see when things appear."""
+        start = time.time()
+        for i in range(count):
+            if not self.alive():
+                return
+            self.shot(f"{label}_{i:02d}")
+            next_time = start + (i + 1) * interval
+            time.sleep(max(0.0, next_time - time.time()))
+
+    def trace(self, label):
+        """Capture the next frame's GPU trace via the engine's trigger file."""
+        trace_dir = os.path.join(self.run_dir, "trace")
+        before = set(glob.glob(os.path.join(trace_dir, "*.xtr")))
+        open(trace_dir + ".request", "w").close()
+        deadline = time.time() + 60
+        while time.time() < deadline and self.alive():
+            new = set(glob.glob(os.path.join(trace_dir, "*.xtr"))) - before
+            if new:
+                path = new.pop()
+                last_size = -1
+                size = 0
+                while time.time() < deadline:
+                    size = os.path.getsize(path)
+                    if size and size == last_size:
+                        break
+                    last_size = size
+                    time.sleep(0.5)
+                dest = os.path.join(trace_dir, label + ".xtr")
+                os.rename(path, dest)
+                self.note(f"trace {label}: {dest} ({size >> 20} MB)")
+                return
+            time.sleep(0.2)
+        self.note(f"trace {label}: no trace written")
+
     def gpu(self, seconds, label, stats=None):
         """Sample GPU busy %, shader clock and package power at 10 Hz."""
         busy, sclk, power = [], [], []
@@ -426,6 +461,10 @@ def main():
                 run.pad(rest[0], float(rest[1]) if len(rest) > 1 else 0.15)
             elif op == "shot":
                 run.shot(rest[0])
+            elif op == "shots":
+                run.shots(int(rest[0]), float(rest[1]), rest[2])
+            elif op == "trace":
+                run.trace(rest[0])
             elif op == "perf":
                 run.perf(float(rest[0]), rest[1] if len(rest) > 1 else "profile")
             elif op == "audio":

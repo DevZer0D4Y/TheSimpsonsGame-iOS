@@ -15,6 +15,7 @@
 #include <atomic>
 #include <chrono>
 
+#include <rex/cvar.h>
 #include <rex/filesystem/device.h>
 #include <rex/kernel/xboxkrnl/private.h>
 #include <rex/logging.h>
@@ -31,6 +32,10 @@
 #include <rex/system/xthread.h>
 #include <rex/system/xtypes.h>
 #include <rex/thread/mutex.h>
+
+
+REXCVAR_DEFINE_BOOL(log_file_opens, false, "Kernel",
+                    "Log every file the game opens successfully (diagnostic)");
 
 namespace rex::kernel::xboxkrnl {
 using namespace rex::system;
@@ -175,6 +180,9 @@ u32 NtCreateFile_entry(mapped_u32 handle_out, u32 desired_access,
     REXKRNL_IMPORT_FAIL("NtCreateFile", "path='{}' -> {:#x}", target_path, result);
   } else {
     REXKRNL_IMPORT_RESULT("NtCreateFile", "{:#x} handle={:#x}", result, handle);
+    if (REXCVAR_GET(log_file_opens)) {
+      REXKRNL_INFO("[file-open] {}", target_path);
+    }
   }
   return result;
 }
