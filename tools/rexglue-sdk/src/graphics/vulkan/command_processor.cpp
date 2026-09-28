@@ -4348,6 +4348,10 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
       ++g_probe_current_full_run;
     }
   }
+  if (gpu_profiler_.per_draw()) {
+    gpu_profiler_.MarkDraw(deferred_command_buffer_, vertex_shader->ucode_data_hash(),
+                           pixel_shader ? pixel_shader->ucode_data_hash() : 0);
+  }
   if (primitive_processing_result.index_buffer_type ==
           PrimitiveProcessor::ProcessedIndexBufferType::kNone ||
       shader_32bit_index_dma) {

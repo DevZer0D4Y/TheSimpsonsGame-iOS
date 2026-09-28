@@ -18,6 +18,10 @@ REXCVAR_DEFINE_INT32(gpu_profile_frames, 0, "GPU/Vulkan",
                      "Log GPU time per work category averaged over this many frames "
                      "(0 = off; diagnostic, adds timestamp queries)");
 
+REXCVAR_DEFINE_BOOL(gpu_profile_draws, false, "GPU/Vulkan",
+                    "With gpu_profile_frames, also time every draw and log the vertex/pixel "
+                    "shader pairs that take the most GPU time (diagnostic)");
+
 namespace rex::graphics::vulkan {
 
 const char* VulkanGpuProfiler::CategoryName(Category category) {
@@ -83,7 +87,9 @@ bool VulkanGpuProfiler::Initialize(const ui::vulkan::VulkanDevice* vulkan_device
   slots_.assign(frames_in_flight, FrameSlot());
   results_.resize(kMaxMarksPerFrame);
   log_interval_frames_ = uint32_t(interval);
-  REXGPU_INFO("GPU profiler: logging GPU time per category every {} frames", interval);
+  per_draw_ = REXCVAR_GET(gpu_profile_draws) || std::getenv("REX_GPU_PROFILE_DRAWS") != nullptr;
+  REXGPU_INFO("GPU profiler: logging GPU time per category{} every {} frames",
+              per_draw_ ? " and per draw" : "", interval);
   return true;
 }
 
@@ -105,6 +111,7 @@ void VulkanGpuProfiler::BeginFrame(DeferredCommandBuffer& command_buffer, uint64
   current_ = &slots_[current_slot_index_];
   current_->frame_index = frame_index;
   current_->mark_count = 0;
+  current_->draw_count = 0;
   command_buffer.CmdVkResetQueryPool(query_pool_, current_slot_index_ * kMaxMarksPerFrame,
                                      kMaxMarksPerFrame);
   Mark(command_buffer, Category::kOther);
@@ -116,6 +123,20 @@ void VulkanGpuProfiler::Mark(DeferredCommandBuffer& command_buffer, Category nex
   }
   uint32_t mark = current_->mark_count++;
   current_->categories[mark] = next;
+  current_->draw_ordinals[mark] = 0;
+  command_buffer.CmdVkWriteTimestamp(VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, query_pool_,
+                                     current_slot_index_ * kMaxMarksPerFrame + mark);
+}
+
+void VulkanGpuProfiler::MarkDraw(DeferredCommandBuffer& command_buffer,
+                                 uint64_t vertex_shader_hash, uint64_t pixel_shader_hash) {
+  if (!current_ || current_->mark_count >= kMaxMarksPerFrame) {
+    return;
+  }
+  uint32_t mark = current_->mark_count++;
+  current_->categories[mark] = Category::kDraw;
+  current_->draw_shaders[mark] = {vertex_shader_hash, pixel_shader_hash};
+  current_->draw_ordinals[mark] = ++current_->draw_count;
   command_buffer.CmdVkWriteTimestamp(VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, query_pool_,
                                      current_slot_index_ * kMaxMarksPerFrame + mark);
 }
@@ -154,6 +175,13 @@ void VulkanGpuProfiler::FrameCompleted(uint64_t frame_index) {
     size_t category = size_t(slot.categories[i]);
     accumulated_ms_[category] += double(end - begin) * to_ms;
     ++accumulated_marks_[category];
+    if (per_draw_ && slot.draw_ordinals[i]) {
+      DrawStats& stats = draw_stats_[slot.draw_shaders[i]];
+      stats.ms += double(end - begin) * to_ms;
+      if (!stats.count++) {
+        stats.first_ordinal = slot.draw_ordinals[i];
+      }
+    }
   }
   if (results_[slot.mark_count - 1] >= results_[0]) {
     accumulated_total_ms_ += double(results_[slot.mark_count - 1] - results_[0]) * to_ms;
@@ -169,6 +197,21 @@ void VulkanGpuProfiler::FrameCompleted(uint64_t frame_index) {
   }
   REXGPU_INFO("[gpu-profile] {} frames: gpu frame span {:.2f}ms |{} (ms per frame / intervals per frame)",
               accumulated_frames_, accumulated_total_ms_ / frames, breakdown);
+  if (per_draw_ && !draw_stats_.empty()) {
+    std::vector<std::pair<std::pair<uint64_t, uint64_t>, DrawStats>> sorted(draw_stats_.begin(),
+                                                                          draw_stats_.end());
+    std::sort(sorted.begin(), sorted.end(),
+              [](const auto& a, const auto& b) { return a.second.ms > b.second.ms; });
+    size_t shown = std::min(sorted.size(), size_t(30));
+    for (size_t i = 0; i < shown; ++i) {
+      const auto& [shaders, stats] = sorted[i];
+      REXGPU_INFO("[gpu-profile-draw] vs={:016X} ps={:016X} {:.3f}ms {:.1f} draws per frame, "
+                  "first draw #{}",
+                  shaders.first, shaders.second, stats.ms / frames, stats.count / frames,
+                  stats.first_ordinal);
+    }
+    draw_stats_.clear();
+  }
   accumulated_frames_ = 0;
   accumulated_total_ms_ = 0.0;
   accumulated_ms_.fill(0.0);
