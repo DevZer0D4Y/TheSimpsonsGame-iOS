@@ -215,6 +215,14 @@ class VulkanCommandProcessor : public CommandProcessor {
       SingleTransientDescriptorLayout transient_descriptor_layout) const {
     return descriptor_set_layouts_single_transient_[size_t(transient_descriptor_layout)];
   }
+  // All of the shared memory (and the EDRAM with fragment shader interlock),
+  // accessible from guest shader stages. Valid after the context is set up.
+  VkDescriptorSetLayout descriptor_set_layout_shared_memory_and_edram() const {
+    return descriptor_set_layout_shared_memory_and_edram_;
+  }
+  VkDescriptorSet shared_memory_and_edram_descriptor_set() const {
+    return shared_memory_and_edram_descriptor_set_;
+  }
   // A frame must be open.
   VkDescriptorSet AllocateSingleTransientDescriptor(
       SingleTransientDescriptorLayout transient_descriptor_layout);

@@ -58,6 +58,11 @@ REXCVAR_DEFINE_BOOL(native_resolve, true, "GPU/Vulkan",
                     "that sample them instead of reloading those textures from guest memory")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
+REXCVAR_DEFINE_BOOL(native_resolve_single_pass, true, "GPU/Vulkan",
+                    "Native resolves also write the resolved guest memory in the same pass, "
+                    "instead of dumping the render target to the EDRAM buffer and resolving it")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
 REXCVAR_DEFINE_INT32(native_resolve_mask, 3, "GPU/Vulkan",
                      "Native resolve sources to write directly: 1 = depth, 2 = color, 3 = both "
                      "(diagnostic)");
@@ -1078,7 +1083,7 @@ bool VulkanRenderTargetCache::Initialize(uint32_t shared_memory_binding_count) {
   last_update_framebuffer_ = VK_NULL_HANDLE;
 
   if (path_ == Path::kHostRenderTargets && native_rt_mode_ && REXCVAR_GET(native_resolve)) {
-    native_resolve_enabled_ = InitializeNativeResolve();
+    native_resolve_enabled_ = InitializeNativeResolve(shared_memory_binding_count);
   }
 
   InitializeCommon();
@@ -1503,7 +1508,31 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
   bool native_resolve_planned =
       native_resolve_enabled_ &&
       PrepareNativeResolve(resolve_info, texture_cache, native_resolve_plan);
-  if (resolve_info.copy_dest_extent_length) {
+  // The first target's draw can also write the resolved memory, replacing the
+  // EDRAM dump and the resolve dispatch.
+  bool native_resolve_single_pass =
+      native_resolve_planned && native_resolve_plan.can_write_memory &&
+      REXCVAR_GET(native_resolve_single_pass) &&
+      GetNativeResolvePipeline(native_resolve_plan.shader,
+                               native_resolve_plan.targets[0].format) != VK_NULL_HANDLE;
+  if (resolve_info.copy_dest_extent_length && native_resolve_single_pass) {
+    if (shared_memory.RequestRange(resolve_info.copy_dest_extent_start,
+                                   resolve_info.copy_dest_extent_length)) {
+      texture_cache.MarkRangeAsResolved(resolve_info.copy_dest_extent_start,
+                                        resolve_info.copy_dest_extent_length);
+      written_address_out = resolve_info.copy_dest_extent_start;
+      written_length_out = resolve_info.copy_dest_extent_length;
+      shared_memory.Use(VulkanSharedMemory::Usage::kGuestDrawReadWrite,
+                        std::make_pair(resolve_info.copy_dest_extent_start,
+                                       resolve_info.copy_dest_extent_length));
+      PerformNativeResolve(texture_cache, native_resolve_plan, true);
+      copied = true;
+    } else {
+      REXGPU_ERROR(
+          "VulkanRenderTargetCache: Failed to obtain the resolve destination "
+          "memory region");
+    }
+  } else if (resolve_info.copy_dest_extent_length) {
     draw_util::ResolveCopyShaderConstants copy_shader_constants;
     uint32_t copy_group_count_x, copy_group_count_y;
     draw_util::ResolveCopyShaderIndex copy_shader =
@@ -1643,7 +1672,7 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
           written_length_out = resolve_info.copy_dest_extent_length;
           copied = true;
           if (native_resolve_planned) {
-            PerformNativeResolve(texture_cache, native_resolve_plan);
+            PerformNativeResolve(texture_cache, native_resolve_plan, false);
           }
         }
       }
@@ -6601,14 +6630,76 @@ void main() {
 // Destination texel (x, y) is source render target pixel (x, y) plus the offset.
 // The output is the raw texel bits, as the texture would load them from the
 // memory the resolve writes.
-constexpr char kNativeResolveFragmentShaderHeader[] = R"(#version 450
+constexpr char kNativeResolveFragmentShaderHeader[] = R"(
 #extension GL_EXT_samplerless_texture_functions : require
 layout(push_constant) uniform XeNativeResolveConstants {
   ivec2 xe_native_resolve_source_offset;
   uint xe_native_resolve_flags;
   uint xe_native_resolve_packing;
+  uint xe_native_resolve_dest_base_dwords;
+  uint xe_native_resolve_dest_pitch;
 };
 layout(location = 0) out uvec4 xe_native_resolve_output;
+layout(set = 1, binding = 0) buffer XeSharedMemory {
+  uint data[];
+} xe_shared_memory[1 << XE_SHARED_MEMORY_BINDING_COUNT_LOG2];
+void XeSharedMemoryStore(uint address_dwords, uint value) {
+#if XE_SHARED_MEMORY_BINDING_COUNT_LOG2 == 0
+  xe_shared_memory[0].data[address_dwords] = value;
+#else
+  const uint binding_address_bits = 27u - uint(XE_SHARED_MEMORY_BINDING_COUNT_LOG2);
+  uint binding_address = address_dwords & ((1u << binding_address_bits) - 1u);
+  switch (address_dwords >> binding_address_bits) {
+    case 0u:
+      xe_shared_memory[0].data[binding_address] = value;
+      break;
+    case 1u:
+      xe_shared_memory[1].data[binding_address] = value;
+      break;
+#if XE_SHARED_MEMORY_BINDING_COUNT_LOG2 >= 2
+    case 2u:
+      xe_shared_memory[2].data[binding_address] = value;
+      break;
+    case 3u:
+      xe_shared_memory[3].data[binding_address] = value;
+      break;
+#endif
+  }
+#endif
+}
+// Xenos 2D tiled texture addressing, in bytes.
+int XeTiledOffset2D(int x, int y, uint pitch, uint bytes_per_block_log2) {
+  int macro = ((x >> 5) + (y >> 5) * int(pitch >> 5)) << (bytes_per_block_log2 + 7u);
+  int micro = ((x & 7) + ((y & 0xE) << 2)) << bytes_per_block_log2;
+  int offset = macro + ((micro & ~0xF) << 1) + (micro & 0xF) + ((y & 1) << 4);
+  return ((offset & ~0x1FF) << 3) + ((y & 16) << 7) + ((offset & 0x1C0) << 2) +
+         (((((y & 8) >> 2) + (x >> 3)) & 3) << 6) + (offset & 0x3F);
+}
+uint XeEndianSwap32(uint value, uint endian) {
+  if (endian == 1u || endian == 2u) {
+    value = ((value & 0x00FF00FFu) << 8u) | ((value >> 8u) & 0x00FF00FFu);
+  }
+  if (endian == 2u || endian == 3u) {
+    value = (value << 16u) | (value >> 16u);
+  }
+  return value;
+}
+// Stores the texel's words where the EDRAM resolve would write them.
+void XeNativeResolveStoreMemory(uvec2 words) {
+  ivec2 texel = ivec2(gl_FragCoord.xy);
+  bool is_64bpp = (xe_native_resolve_flags & 64u) != 0u;
+  uint endian = (xe_native_resolve_flags >> 4u) & 3u;
+  uint address = xe_native_resolve_dest_base_dwords +
+                 (uint(XeTiledOffset2D(texel.x, texel.y, xe_native_resolve_dest_pitch,
+                                       is_64bpp ? 3u : 2u)) >> 2u);
+  XeSharedMemoryStore(address, XeEndianSwap32(words.x, endian));
+  if (is_64bpp) {
+    XeSharedMemoryStore(address + 1u, XeEndianSwap32(words.y, endian));
+  }
+}
+bool XeNativeResolveWritesMemory() {
+  return (xe_native_resolve_flags & 8u) != 0u;
+}
 ivec2 XeNativeResolveSourceCoord() {
   return ivec2(gl_FragCoord.xy) + xe_native_resolve_source_offset;
 }
@@ -6641,7 +6732,11 @@ void main() {
   } else {
     bits = floatBitsToUint(color.rg);
   }
-  xe_native_resolve_output = uvec4(XeNativeResolveSwap(bits.x), bits.y, 0u, 0u);
+  bits.x = XeNativeResolveSwap(bits.x);
+  xe_native_resolve_output = uvec4(bits, 0u, 0u);
+  if (XeNativeResolveWritesMemory()) {
+    XeNativeResolveStoreMemory(bits);
+  }
 }
 )";
 
@@ -6654,6 +6749,9 @@ void main() {
                    ? uvec2((u.x & 0xFFFFu) | (u.y << 16u), (u.z & 0xFFFFu) | (u.w << 16u))
                    : u.xy;
   xe_native_resolve_output = uvec4(bits, 0u, 0u);
+  if (XeNativeResolveWritesMemory()) {
+    XeNativeResolveStoreMemory(bits);
+  }
 }
 )";
 
@@ -6662,6 +6760,7 @@ void main() {
 // loading the resolved k_24_8_FLOAT or k_24_8 texture into R32_SFLOAT.
 constexpr char kNativeResolveDepthBody[] = R"(
 layout(set = 0, binding = 0) uniform texture2D xe_native_resolve_source;
+layout(set = 0, binding = 1) uniform utexture2D xe_native_resolve_stencil;
 uint XeHostDepthTo20e4(uint f32, bool round_to_nearest_even) {
   uint denormal = ((f32 & 0x7FFFFFu) | 0x800000u) >> min(112u - (f32 >> 23u), 24u);
   uint biased = f32 < 0x38000000u ? denormal : f32 - (111u << 23u);
@@ -6684,22 +6783,28 @@ float XeFloat20e4To32(uint f24) {
   return uintBitsToFloat(((exponent + 112u) << 23u) | (mantissa << 3u));
 }
 void main() {
-  float depth = texelFetch(xe_native_resolve_source, XeNativeResolveSourceCoord(), 0).r;
+  ivec2 source_coord = XeNativeResolveSourceCoord();
+  float depth = texelFetch(xe_native_resolve_source, source_coord, 0).r;
+  uint depth24;
   float result;
   if ((xe_native_resolve_flags & 2u) != 0u) {
-    result = XeFloat20e4To32(
-        XeHostDepthTo20e4(floatBitsToUint(depth), (xe_native_resolve_flags & 4u) != 0u));
+    depth24 = XeHostDepthTo20e4(floatBitsToUint(depth), (xe_native_resolve_flags & 4u) != 0u);
+    result = XeFloat20e4To32(depth24);
   } else {
-    uint depth24 = uint(roundEven(depth * 16777215.0));
+    depth24 = uint(roundEven(depth * 16777215.0));
     result = float(depth24 + (depth24 >> 23u)) * 5.96046448e-08;
   }
   xe_native_resolve_output = uvec4(floatBitsToUint(result), 0u, 0u, 0u);
+  if (XeNativeResolveWritesMemory()) {
+    uint stencil = texelFetch(xe_native_resolve_stencil, source_coord, 0).r & 0xFFu;
+    XeNativeResolveStoreMemory(uvec2((depth24 << 8u) | stencil, 0u));
+  }
 }
 )";
 
 }  // namespace
 
-bool VulkanRenderTargetCache::InitializeNativeResolve() {
+bool VulkanRenderTargetCache::InitializeNativeResolve(uint32_t shared_memory_binding_count) {
   const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
   if (!REXCVAR_GET(vulkan_dynamic_rendering) || !vulkan_device->properties().dynamicRendering) {
     REXGPU_INFO("VulkanRenderTargetCache: native resolves need dynamic rendering, disabled");
@@ -6726,11 +6831,17 @@ bool VulkanRenderTargetCache::InitializeNativeResolve() {
       kNativeResolveColorUintBody,
       kNativeResolveDepthBody,
   };
+  uint32_t shared_memory_binding_count_log2 = 0;
+  rex::bit_scan_forward(std::max(shared_memory_binding_count, uint32_t(1)),
+                        &shared_memory_binding_count_log2);
+  std::string fragment_prefix =
+      fmt::format("#version 450\n#define XE_SHARED_MEMORY_BINDING_COUNT_LOG2 {}\n",
+                  shared_memory_binding_count_log2);
   bool shaders_created = native_resolve_vertex_shader_ != VK_NULL_HANDLE;
   for (size_t i = 0; i < size_t(NativeResolveShader::kCount); ++i) {
     native_resolve_fragment_shaders_[i] =
         compile(VK_SHADER_STAGE_FRAGMENT_BIT,
-                std::string(kNativeResolveFragmentShaderHeader) + fragment_bodies[i]);
+                fragment_prefix + kNativeResolveFragmentShaderHeader + fragment_bodies[i]);
     shaders_created &= native_resolve_fragment_shaders_[i] != VK_NULL_HANDLE;
   }
   if (!shaders_created) {
@@ -6738,8 +6849,26 @@ bool VulkanRenderTargetCache::InitializeNativeResolve() {
     return false;
   }
 
+  REXGPU_INFO("VulkanRenderTargetCache: native resolves enabled");
+  return true;
+}
+
+bool VulkanRenderTargetCache::EnsureNativeResolvePipelineLayouts() {
+  if (native_resolve_pipeline_layout_color_ != VK_NULL_HANDLE) {
+    return true;
+  }
+  VkDescriptorSetLayout shared_memory_layout =
+      command_processor_.descriptor_set_layout_shared_memory_and_edram();
+  if (shared_memory_layout == VK_NULL_HANDLE) {
+    return false;
+  }
+  const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+
   auto create_pipeline_layout = [&](VkDescriptorSetLayout source_layout,
                                     VkPipelineLayout& pipeline_layout_out) {
+    VkDescriptorSetLayout set_layouts[] = {source_layout, shared_memory_layout};
     VkPushConstantRange push_constant_range;
     push_constant_range.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
     push_constant_range.offset = 0;
@@ -6748,8 +6877,8 @@ bool VulkanRenderTargetCache::InitializeNativeResolve() {
     pipeline_layout_create_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
     pipeline_layout_create_info.pNext = nullptr;
     pipeline_layout_create_info.flags = 0;
-    pipeline_layout_create_info.setLayoutCount = 1;
-    pipeline_layout_create_info.pSetLayouts = &source_layout;
+    pipeline_layout_create_info.setLayoutCount = uint32_t(rex::countof(set_layouts));
+    pipeline_layout_create_info.pSetLayouts = set_layouts;
     pipeline_layout_create_info.pushConstantRangeCount = 1;
     pipeline_layout_create_info.pPushConstantRanges = &push_constant_range;
     if (dfn.vkCreatePipelineLayout(device, &pipeline_layout_create_info, nullptr,
@@ -6765,11 +6894,12 @@ bool VulkanRenderTargetCache::InitializeNativeResolve() {
       !create_pipeline_layout(descriptor_set_layout_sampled_image_x2_,
                               native_resolve_pipeline_layout_depth_)) {
     REXGPU_ERROR("VulkanRenderTargetCache: failed to create the native resolve pipeline layouts");
-    ShutdownNativeResolve();
+    ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipelineLayout, device,
+                                           native_resolve_pipeline_layout_depth_);
+    ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipelineLayout, device,
+                                           native_resolve_pipeline_layout_color_);
     return false;
   }
-
-  REXGPU_INFO("VulkanRenderTargetCache: native resolves enabled");
   return true;
 }
 
@@ -6801,6 +6931,9 @@ VkPipeline VulkanRenderTargetCache::GetNativeResolvePipeline(NativeResolveShader
   auto it = native_resolve_pipelines_.find(key);
   if (it != native_resolve_pipelines_.end()) {
     return it->second;
+  }
+  if (!EnsureNativeResolvePipelineLayouts()) {
+    return VK_NULL_HANDLE;
   }
 
   const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
@@ -7058,11 +7191,21 @@ bool VulkanRenderTargetCache::PrepareNativeResolve(const draw_util::ResolveInfo&
   plan.y0 = y0;
   plan.x1 = x1;
   plan.y1 = y1;
+  plan.dest_base = resolve_info.copy_dest_base_raw & 0x1FFFFFFF;
+  plan.dest_pitch_texels = dest_pitch;
+  plan.memory_flags = kNativeResolveFlagWriteMemory |
+                      (dest_endian << kNativeResolveFlagMemoryEndianShift);
+  if (!is_depth && xenos::IsColorRenderTargetFormat64bpp(source_key.GetColorFormat())) {
+    plan.memory_flags |= kNativeResolveFlagMemory64bpp;
+  }
+  plan.can_write_memory =
+      plan.targets[0].width >= x1 && plan.targets[0].height >= y1;
   return true;
 }
 
 void VulkanRenderTargetCache::PerformNativeResolve(VulkanTextureCache& texture_cache,
-                                                   const NativeResolvePlan& plan) {
+                                                   const NativeResolvePlan& plan,
+                                                   bool write_memory) {
   if (!plan.source || !plan.target_count) {
     return;
   }
@@ -7092,12 +7235,16 @@ void VulkanRenderTargetCache::PerformNativeResolve(VulkanTextureCache& texture_c
 
   VkPipelineLayout pipeline_layout = is_depth ? native_resolve_pipeline_layout_depth_
                                               : native_resolve_pipeline_layout_color_;
-  VkDescriptorSet source_descriptor_set = source.GetDescriptorSetTransferSource();
+  VkDescriptorSet descriptor_sets[] = {
+      source.GetDescriptorSetTransferSource(),
+      command_processor_.shared_memory_and_edram_descriptor_set(),
+  };
   NativeResolveConstants constants;
   constants.source_offset_x = 0;
   constants.source_offset_y = 0;
-  constants.flags = plan.flags;
   constants.packing = plan.packing;
+  constants.dest_base_dwords = plan.dest_base >> 2;
+  constants.dest_pitch_texels = plan.dest_pitch_texels;
 
   bool written[VulkanTextureCache::kMaxNativeResolveTargets] = {};
   for (uint32_t i = 0; i < plan.target_count; ++i) {
@@ -7133,8 +7280,13 @@ void VulkanRenderTargetCache::PerformNativeResolve(VulkanTextureCache& texture_c
     scissor.extent.height = y1 - plan.y0;
     command_processor_.SetScissor(scissor);
     command_processor_.BindExternalGraphicsPipeline(pipeline);
-    command_buffer.CmdVkBindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout, 0, 1,
-                                           &source_descriptor_set, 0, nullptr);
+    command_buffer.CmdVkBindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout, 0,
+                                           uint32_t(rex::countof(descriptor_sets)),
+                                           descriptor_sets, 0, nullptr);
+    constants.flags = plan.flags;
+    if (write_memory && i == 0) {
+      constants.flags |= plan.memory_flags;
+    }
     command_buffer.CmdVkPushConstants(pipeline_layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0,
                                       sizeof(constants), &constants);
     command_buffer.CmdVkDraw(3, 1, 0, 0);

@@ -851,6 +851,12 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
     kNativeResolveFlagSwapRedBlue = 1u << 0,
     kNativeResolveFlagDepthFloat24 = 1u << 1,
     kNativeResolveFlagDepthRoundToNearestEven = 1u << 2,
+    // Also store the resolved texels to guest memory, as the EDRAM resolve
+    // would, instead of dumping the render target and running the resolve.
+    kNativeResolveFlagWriteMemory = 1u << 3,
+    // xenos::Endian of the memory, bits 4:5.
+    kNativeResolveFlagMemoryEndianShift = 4,
+    kNativeResolveFlagMemory64bpp = 1u << 6,
   };
   // How a source texel is packed into the texel bits, the same way as when
   // dumping the render target to the EDRAM.
@@ -867,6 +873,9 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
     int32_t source_offset_y;
     uint32_t flags;
     NativeResolvePacking packing;
+    // For kNativeResolveFlagWriteMemory: texel (0, 0) and the tiled pitch.
+    uint32_t dest_base_dwords;
+    uint32_t dest_pitch_texels;
   };
   struct NativeResolvePlan {
     VulkanRenderTarget* source = nullptr;
@@ -874,19 +883,28 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
     NativeResolvePacking packing = NativeResolvePacking::k8888;
     uint32_t flags = 0;
     uint32_t x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+    uint32_t dest_base = 0;
+    uint32_t dest_pitch_texels = 0;
+    uint32_t memory_flags = 0;
+    // Whether the first target contains the whole resolve rectangle, so
+    // drawing it can also write all of the resolved memory.
+    bool can_write_memory = false;
     uint32_t target_count = 0;
     VulkanTextureCache::NativeResolveTarget targets[VulkanTextureCache::kMaxNativeResolveTargets];
   };
-  bool InitializeNativeResolve();
+  bool InitializeNativeResolve(uint32_t shared_memory_binding_count);
+  bool EnsureNativeResolvePipelineLayouts();
   void ShutdownNativeResolve();
   VkPipeline GetNativeResolvePipeline(NativeResolveShader shader, VkFormat dest_format);
   // Finds the host render target owning the whole resolve area and the textures
   // to write. Must be called before the memory range is marked as resolved.
   bool PrepareNativeResolve(const draw_util::ResolveInfo& resolve_info,
                             VulkanTextureCache& texture_cache, NativeResolvePlan& plan);
-  // Records the texture writes, and marks the textures as up to date - must be
+  // Records the texture writes (and with write_memory, the guest memory writes
+  // in the first target's draw), and marks the textures as up to date - must be
   // called after the memory range has been marked as resolved.
-  void PerformNativeResolve(VulkanTextureCache& texture_cache, const NativeResolvePlan& plan);
+  void PerformNativeResolve(VulkanTextureCache& texture_cache, const NativeResolvePlan& plan,
+                            bool write_memory);
 
   bool gamma_render_target_as_unorm16_ = false;
 
