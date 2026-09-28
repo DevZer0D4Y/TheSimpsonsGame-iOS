@@ -84,6 +84,8 @@ class GraphicsSystem : public system::IGraphicsSystem {
                                bool blocking);
 
   void RequestFrameTrace();
+  // Writes the currently presented guest output to <prefix>_shot_N.ppm.
+  void SaveGuestOutputScreenshot(const std::string& prefix);
   void BeginTracing();
   void EndTracing();
 

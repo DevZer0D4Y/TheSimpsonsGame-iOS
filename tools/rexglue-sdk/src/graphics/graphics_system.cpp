@@ -12,12 +12,15 @@
 #include <rex/graphics/graphics_system.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
+#include <cstdio>
 #include <cstdint>
 #include <functional>
 #include <memory>
 #include <mutex>
 #include <utility>
+#include <vector>
 
 #include <rex/cvar.h>
 #include <rex/graphics/command_processor.h>
@@ -34,6 +37,13 @@
 REXCVAR_DEFINE_STRING(trace_gpu_prefix, "", "GPU", "GPU trace file prefix");
 
 REXCVAR_DEFINE_BOOL(trace_gpu_stream, false, "GPU", "Enable GPU trace streaming");
+
+// Guest vblank rate used when vsync is off. 0 = follow the guest video mode's
+// refresh rate (the launcher's FPS target). The old hardcoded 1000 Hz costs a
+// vblank interrupt per guest handler run ~16x per displayed frame and measured
+// as the dominant GPU cost on Van Gogh; only set it high deliberately.
+REXCVAR_DEFINE_INT32(unlocked_vblank_hz, 0, "GPU",
+                     "Guest vblank rate in Hz when vsync is off (0 = follow video mode)");
 
 // Stays "none" until the FXAA path actually works. Defaulting it to "fxaa"
 // produced a completely black screen on RADV/Van Gogh: the game ran fine
@@ -167,7 +177,22 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
         uint64_t guest_tick_frequency = chrono::Clock::guest_tick_frequency();
         uint64_t vsync_interval_ticks =
             std::max(uint64_t(1), uint64_t(double(guest_tick_frequency) / refresh_rate_hz));
-        uint64_t no_vsync_interval_ticks = std::max(uint64_t(1), guest_tick_frequency / 1000);
+        // Unlocked (vsync off) guest vblank rate. This used to be hardcoded to
+        // 1000 Hz, which "unlocks" the frame rate by telling the guest a vblank
+        // is always available - but it costs a vblank interrupt and its guest
+        // handler roughly 16x per displayed frame, and measured on Van Gogh it
+        // pinned the GPU at 99-100% busy even on a menu drawing ~25 draws and
+        // 31 vertices. Dropping to a sane rate freed about half the GPU.
+        // Default 0 follows the guest video mode's own refresh rate, which is
+        // what the launcher's FPS target setting drives, so 60/90/120 there now
+        // actually mean something. Set it explicitly to restore a fixed rate
+        // (1000 reproduces the historical behavior).
+        double unlocked_hz = double(REXCVAR_GET(unlocked_vblank_hz));
+        if (unlocked_hz <= 0.0) {
+          unlocked_hz = refresh_rate_hz;
+        }
+        uint64_t no_vsync_interval_ticks =
+            std::max(uint64_t(1), uint64_t(double(guest_tick_frequency) / unlocked_hz));
         uint64_t last_frame_time = chrono::Clock::QueryGuestTickCount();
         // File-based frame trace trigger, checked about once a second. A
         // keybind can be swallowed by whatever sits between the compositor
@@ -194,6 +219,13 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
                 std::filesystem::remove(request_path, trace_request_ec);
                 RequestFrameTrace();
                 REXLOG_INFO("Frame trace triggered by {}", request_path.string());
+              }
+              // Same mechanism for a screenshot of the presented guest output:
+              // <trace_gpu_prefix>.shot writes <trace_gpu_prefix>_shot_N.ppm.
+              std::filesystem::path shot_request_path(trace_prefix + ".shot");
+              if (std::filesystem::exists(shot_request_path, trace_request_ec)) {
+                std::filesystem::remove(shot_request_path, trace_request_ec);
+                SaveGuestOutputScreenshot(trace_prefix);
               }
             }
           }
@@ -398,6 +430,34 @@ void GraphicsSystem::InitializeShaderStorage(const std::filesystem::path& cache_
       command_processor_->InitializeShaderStorage(cache_root, title_id, false);
     });
   }
+}
+
+void GraphicsSystem::SaveGuestOutputScreenshot(const std::string& prefix) {
+  ui::RawImage image;
+  if (!presenter_ || !presenter_->CaptureGuestOutput(image)) {
+    REXGPU_WARN("Screenshot requested but no guest output is available yet");
+    return;
+  }
+  static std::atomic<uint32_t> screenshot_index{0};
+  std::string path = fmt::format("{}_shot_{}.ppm", prefix, screenshot_index++);
+  FILE* file = std::fopen(path.c_str(), "wb");
+  if (!file) {
+    REXGPU_WARN("Unable to open {} for the screenshot", path);
+    return;
+  }
+  std::fprintf(file, "P6\n%u %u\n255\n", image.width, image.height);
+  std::vector<uint8_t> row(size_t(image.width) * 3);
+  for (uint32_t y = 0; y < image.height; ++y) {
+    const uint8_t* source = image.data.data() + image.stride * y;
+    for (uint32_t x = 0; x < image.width; ++x) {
+      row[x * 3 + 0] = source[x * 4 + 0];
+      row[x * 3 + 1] = source[x * 4 + 1];
+      row[x * 3 + 2] = source[x * 4 + 2];
+    }
+    std::fwrite(row.data(), 1, row.size(), file);
+  }
+  std::fclose(file);
+  REXLOG_INFO("Screenshot saved to {} ({}x{})", path, image.width, image.height);
 }
 
 void GraphicsSystem::RequestFrameTrace() {
