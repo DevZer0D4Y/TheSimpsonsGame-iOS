@@ -660,6 +660,16 @@ TextureCache::Texture::Texture(TextureCache& texture_cache, const TextureKey& ke
 }
 
 TextureCache::Texture::~Texture() {
+  if (key_.base_page) {
+    auto range = texture_cache_.textures_by_base_page_.equal_range(uint32_t(key_.base_page));
+    for (auto it = range.first; it != range.second; ++it) {
+      if (it->second == this) {
+        texture_cache_.textures_by_base_page_.erase(it);
+        break;
+      }
+    }
+  }
+
   if (mips_watch_handle_) {
     texture_cache().shared_memory().UnwatchMemoryRange(mips_watch_handle_);
   }
@@ -874,9 +884,16 @@ TextureCache::Texture* TextureCache::FindOrCreateTexture(TextureKey key) {
     assert_true(new_texture->key() == key);
     texture = textures_.emplace(key, std::move(new_texture)).first->second.get();
   }
+  if (key.base_page) {
+    textures_by_base_page_.emplace(uint32_t(key.base_page), texture);
+  }
   COUNT_profile_set("gpu/texture_cache/textures", textures_.size());
   texture->LogAction("Created");
   return texture;
+}
+
+void TextureCache::MarkTextureBaseWrittenByGpu(Texture& texture) {
+  texture.MakeUpToDateAndWatch(global_critical_region_.Acquire());
 }
 
 bool TextureCache::LoadTextureData(Texture& texture) {

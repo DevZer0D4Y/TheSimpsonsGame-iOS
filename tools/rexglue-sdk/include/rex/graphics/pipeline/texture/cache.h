@@ -514,6 +514,21 @@ class TextureCache {
   // should be made.
   Texture* FindOrCreateTexture(TextureKey key);
 
+  // Calls function(Texture&) for every existing texture whose base level starts
+  // at the 4 KB page.
+  template <typename Function>
+  void ForEachTextureWithBasePage(uint32_t base_page, Function&& function) const {
+    auto range = textures_by_base_page_.equal_range(base_page);
+    for (auto it = range.first; it != range.second; ++it) {
+      function(*it->second);
+    }
+  }
+
+  // For a texture whose base level data has been written directly on the GPU
+  // after the memory range it's sourced from was marked as written by the GPU:
+  // marks the data as matching the memory again and re-arms the memory watches.
+  void MarkTextureBaseWrittenByGpu(Texture& texture);
+
   static const LoadShaderInfo& GetLoadShaderInfo(LoadShaderIndex load_shader_index) {
     assert_true(load_shader_index < kLoadShaderCount);
     return load_shader_info_[load_shader_index];
@@ -602,6 +617,8 @@ class TextureCache {
   uint64_t current_submission_time_ = 0;
 
   std::unordered_map<TextureKey, std::unique_ptr<Texture>, TextureKey::Hasher> textures_;
+  // Non-owning, maintained by texture creation and destruction.
+  std::unordered_multimap<uint32_t, Texture*> textures_by_base_page_;
 
   uint64_t textures_total_host_memory_usage_ = 0;
 

@@ -546,6 +546,13 @@ struct ResolveInfo {
   uint32_t rb_color_clear;
   uint32_t rb_color_clear_lo;
 
+  // Top-left corner of the resolve rectangle in pixels relative to the
+  // surface origin, which is also the destination texel relative to
+  // copy_dest_base_raw (unadjusted RB_COPY_DEST_BASE).
+  uint32_t rect_x0;
+  uint32_t rect_y0;
+  uint32_t copy_dest_base_raw;
+
   bool IsCopyingDepth() const {
     return rb_copy_control.copy_src_select >= xenos::kMaxColorRenderTargets;
   }

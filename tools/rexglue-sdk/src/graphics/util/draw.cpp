@@ -745,6 +745,15 @@ InvalidVertexFetchVerdict ClassifyInvalidVertexFetch(const RegisterFile& regs,
         }
         if (!REXCVAR_GET(gpu_allow_null_optional_streams) &&
             !REXCVAR_GET(gpu_allow_invalid_fetch_constants)) {
+          static std::atomic<uint32_t> null_optional_logs{0};
+          uint32_t null_optional_n = null_optional_logs.fetch_add(1, std::memory_order_relaxed);
+          if (null_optional_n < 64 || (null_optional_n & 4095) == 0) {
+            REXGPU_WARN(
+                "[NULL-OPTIONAL-VETO] draw vetoed: slot={} read={} memexport={} vs={:016X} "
+                "(occurrence {})",
+                vfetch_index, stream_is_read, vertex_shader.memexport_eM_written() != 0,
+                vertex_shader.ucode_data_hash(), null_optional_n + 1);
+          }
           return InvalidVertexFetchVerdict::kVeto;
         }
         if (stream_is_read) {
@@ -796,6 +805,9 @@ InvalidVertexFetchVerdict ClassifyInvalidVertexFetch(const RegisterFile& regs,
     return InvalidVertexFetchVerdict::kPrimeWithoutRasterization;
   }
   if (saw_read_null_optional) {
+    if (REXCVAR_GET(gpu_rasterize_null_optional_reads)) {
+      return InvalidVertexFetchVerdict::kRasterize;
+    }
     static std::atomic<uint32_t> read_null_logs{0};
     uint32_t log_n = read_null_logs.fetch_add(1, std::memory_order_relaxed);
     if (log_n < 256 || (log_n & 255) == 0) {
@@ -895,6 +907,9 @@ bool GetResolveInfo(const RegisterFile& regs, const memory::Memory& memory,
   // captures. Also initialize an invalid resolve to empty.
   info_out.coordinate_info.packed = 0;
   info_out.height_div_8 = 0;
+  info_out.rect_x0 = 0;
+  info_out.rect_y0 = 0;
+  info_out.copy_dest_base_raw = 0;
 
   auto rb_copy_control = regs.Get<reg::RB_COPY_CONTROL>();
   info_out.rb_copy_control = rb_copy_control;
@@ -1134,6 +1149,9 @@ bool GetResolveInfo(const RegisterFile& regs, const memory::Memory& memory,
   info_out.copy_dest_base = copy_dest_base_adjusted;
   info_out.copy_dest_extent_start = copy_dest_extent_start;
   info_out.copy_dest_extent_length = copy_dest_extent_end - copy_dest_extent_start;
+  info_out.rect_x0 = uint32_t(x0);
+  info_out.rect_y0 = uint32_t(y0);
+  info_out.copy_dest_base_raw = rb_copy_dest_base;
 
   // Offset relative to the beginning of the tile to put it in fewer bits.
   uint32_t sample_count_log2_x = uint32_t(rb_surface_info.msaa_samples >= xenos::MsaaSamples::k4X);

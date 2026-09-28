@@ -35,6 +35,10 @@ REXCVAR_DEFINE_BOOL(gpu_allow_null_optional_streams, REX_PLATFORM_WIN32 != 0, "G
                     "Draw meshes whose only invalid vertex fetch constants are "
                     "all-zero optional (stride 0) streams the shader never "
                     "actually reads.");
+REXCVAR_DEFINE_BOOL(gpu_rasterize_null_optional_reads, false, "GPU",
+                    "Rasterize draws that read an absent (all-zero) optional vertex stream, "
+                    "which fetches zeros like the hardware, instead of running only their "
+                    "vertex work (diagnostic)");
 REXCVAR_DEFINE_BOOL(native_2x_msaa, true, "GPU", "Enable native 2x MSAA");
 REXCVAR_DEFINE_BOOL(depth_float24_round, false, "GPU", "Round float24 depth values");
 REXCVAR_DEFINE_BOOL(depth_float24_convert_in_pixel_shader, false, "GPU",
@@ -93,6 +97,11 @@ REXCVAR_DEFINE_BOOL(gpu_sanitize_vertex_position, true, "GPU",
 // triangle. No legitimate camera-space vertex in this game's content ever
 // needs a clip-space component anywhere near this bound. 0 disables the
 // check.
+REXCVAR_DEFINE_DOUBLE(gpu_vertex_position_min_abs_w, 0.0, "GPU",
+                      "Treat vertex positions with |w| below this as poison (diagnostic, 0 "
+                      "disables).")
+    .range(0.0, 1.0e30);
+
 REXCVAR_DEFINE_DOUBLE(gpu_vertex_position_magnitude_limit, 1.0e6, "GPU",
                     "Clip-space vertex position component magnitude past which the position is "
                     "treated as poison and replaced (0 disables).")

@@ -92,6 +92,8 @@ REXCVAR_DEFINE_BOOL(vulkan_dynamic_rendering, true, "GPU/Vulkan",
 
 namespace rex::graphics::vulkan {
 
+void RtDebugLogBeginFrame();
+
 // Defined in render_target_cache.cpp - the GPU-side EDRAM emulation work a
 // native render-target path would eliminate.
 extern std::atomic<uint32_t> g_edram_transfer_draws;
@@ -1065,6 +1067,7 @@ bool VulkanCommandProcessor::SetupContext() {
     REXGPU_ERROR("Failed to initialize the texture cache");
     return false;
   }
+  texture_cache_->SetNativeResolveTexturesEnabled(render_target_cache_->native_resolve_enabled());
 
   // Shared memory and EDRAM common bindings.
   VkDescriptorPoolSize descriptor_pool_sizes[1];
@@ -1931,6 +1934,7 @@ bool VulkanCommandProcessor::SetupContext() {
   }
 
   occlusion_query_resources_available_ = InitializeOcclusionQueryResources();
+  gpu_profiler_.Initialize(vulkan_device, kMaxFramesInFlight);
 
   // Just not to expose uninitialized memory.
   std::memset(&system_constants_, 0, sizeof(system_constants_));
@@ -1940,6 +1944,10 @@ bool VulkanCommandProcessor::SetupContext() {
 
 void VulkanCommandProcessor::ShutdownContext() {
   AwaitAllQueueOperationsCompletion();
+  for (uint64_t frame = gpu_profiler_reported_frame_ + 1; frame < frame_current_; ++frame) {
+    gpu_profiler_.FrameCompleted(frame);
+  }
+  gpu_profiler_.Shutdown();
   ShutdownOcclusionQueryResources();
 
   const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
@@ -2541,6 +2549,7 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
   uint32_t display_width = std::max(uint32_t(1), uint32_t(video_mode.display_width));
   uint32_t display_height = std::max(uint32_t(1), uint32_t(video_mode.display_height));
 
+  gpu_profiler_.Mark(deferred_command_buffer_, VulkanGpuProfiler::Category::kSwap);
   presenter->RefreshGuestOutput(
       guest_output_width, guest_output_height, display_width, display_height,
       [this, guest_output_width, guest_output_height, frontbuffer_format, swap_texture_view,
@@ -4740,8 +4749,11 @@ bool VulkanCommandProcessor::IssueCopy() {
   ReadbackResolveMode readback_mode = GetReadbackResolveMode(REXCVAR_GET(vulkan_readback_resolve));
   if (readback_mode == ReadbackResolveMode::kDisabled) {
     uint32_t written_address, written_length;
-    return render_target_cache_->Resolve(*memory_, *shared_memory_, *texture_cache_,
-                                         written_address, written_length);
+    gpu_profiler_.Mark(deferred_command_buffer_, VulkanGpuProfiler::Category::kResolve);
+    bool resolved = render_target_cache_->Resolve(*memory_, *shared_memory_, *texture_cache_,
+                                                  written_address, written_length);
+    gpu_profiler_.Mark(deferred_command_buffer_, VulkanGpuProfiler::Category::kDraw);
+    return resolved;
   }
 
   return IssueCopy_ReadbackResolvePath();
@@ -5501,6 +5513,10 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
       }
       frame_completed_ = frame;
     }
+    for (uint64_t frame = gpu_profiler_reported_frame_ + 1; frame <= frame_completed_; ++frame) {
+      gpu_profiler_.FrameCompleted(frame);
+    }
+    gpu_profiler_reported_frame_ = std::max(gpu_profiler_reported_frame_, frame_completed_);
   }
 
   if (!submission_open_) {
@@ -5539,6 +5555,7 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
   if (is_opening_frame) {
     frame_open_ = true;
     frame_used_async_placeholder_pipeline_ = false;
+    gpu_profiler_.BeginFrame(deferred_command_buffer_, frame_current_);
 
     // Reset bindings that depend on transient data.
     std::memset(current_float_constant_map_vertex_, 0, sizeof(current_float_constant_map_vertex_));
@@ -5598,6 +5615,8 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
     primitive_processor_->BeginFrame();
 
     texture_cache_->BeginFrame();
+
+    RtDebugLogBeginFrame();
   }
 
   return true;
@@ -5607,6 +5626,10 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
   const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
+
+  if (is_swap && submission_open_ && frame_open_) {
+    gpu_profiler_.EndFrame(deferred_command_buffer_);
+  }
 
   // Make sure everything needed for submitting exist.
   if (submission_open_) {

@@ -2876,6 +2876,14 @@ spv::Id SpirvShaderTranslator::SanitizeVertexPosition(spv::Id position) {
     spv::Id too_large = builder_->createUnaryOp(spv::OpAny, type_bool_, too_large_per_component);
     poison = builder_->createBinOp(spv::OpLogicalOr, type_bool_, poison, too_large);
   }
+  double min_abs_w = REXCVAR_GET(gpu_vertex_position_min_abs_w);
+  if (min_abs_w > 0.0) {
+    spv::Id abs_w = builder_->createUnaryBuiltinCall(type_float_, ext_inst_glsl_std_450_,
+                                                     GLSLstd450FAbs, position_w);
+    spv::Id w_too_small = builder_->createBinOp(spv::OpFOrdLessThan, type_bool_, abs_w,
+                                                builder_->makeFloatConstant(float(min_abs_w)));
+    poison = builder_->createBinOp(spv::OpLogicalOr, type_bool_, poison, w_too_small);
+  }
   // Replacement: a point past the far plane (z > w), guaranteed to be clipped
   // away entirely rather than rasterized as a degenerate.
   id_vector_temp_.clear();

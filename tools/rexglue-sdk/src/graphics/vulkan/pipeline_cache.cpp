@@ -51,6 +51,9 @@
 #include <rex/types.h>
 #include <rex/ui/vulkan/util.h>
 
+REXCVAR_DEFINE_BOOL(gpu_log_pipeline_state, false, "GPU/Vulkan",
+                    "Log the state of every graphics pipeline created (diagnostic)");
+
 REXCVAR_DEFINE_INT32(
     vulkan_pipeline_creation_threads, -1, "GPU/Vulkan",
     "Number of pipeline creation threads for Vulkan async pipeline creation (-1 for auto)")
@@ -3368,6 +3371,24 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
   }
 
   const PipelineDescription& description = creation_arguments.pipeline->first;
+  if (REXCVAR_GET(gpu_log_pipeline_state)) {
+    REXGPU_INFO(
+        "[pipeline-state] vs={:016X}/{:016X} ps={:016X}/{:016X} gs={} topo={} restart={} "
+        "tess={} depth_clamp={} poly={} cull_front={} cull_back={} cw={} discard={} "
+        "depth_write={} depth_op={} stencil={} rt_used={:#x} msaa={} sample_rate={}",
+        description.vertex_shader_hash, description.vertex_shader_modification,
+        description.pixel_shader_hash, description.pixel_shader_modification,
+        uint32_t(description.geometry_shader), uint32_t(description.primitive_topology),
+        uint32_t(description.primitive_restart), uint32_t(description.tessellation_mode),
+        uint32_t(description.depth_clamp_enable), uint32_t(description.polygon_mode),
+        uint32_t(description.cull_front), uint32_t(description.cull_back),
+        uint32_t(description.front_face_clockwise), uint32_t(description.rasterizer_discard),
+        uint32_t(description.depth_write_enable), uint32_t(description.depth_compare_op),
+        uint32_t(description.stencil_test_enable),
+        uint32_t(description.render_pass_key.depth_and_color_used),
+        uint32_t(description.render_pass_key.msaa_samples),
+        uint32_t(description.sample_rate_shading));
+  }
   if (!ArePipelineRequirementsMet(description)) {
     assert_always(
         "When creating a new pipeline, the description must not require "

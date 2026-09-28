@@ -276,6 +276,13 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
             reinterpret_cast<const uint8_t*>(stream) + sizeof(ArgsVkPushConstants));
       } break;
 
+      case Command::kVkWriteTimestamp: {
+        auto& args = *reinterpret_cast<const ArgsVkWriteTimestamp*>(stream);
+        if (cmd_write_timestamp_) {
+          cmd_write_timestamp_(command_buffer, args.pipeline_stage, args.query_pool, args.query);
+        }
+      } break;
+
       case Command::kVkResetQueryPool: {
         auto& args = *reinterpret_cast<const ArgsVkResetQueryPool*>(stream);
         dfn.vkCmdResetQueryPool(command_buffer, args.query_pool, args.first_query,
