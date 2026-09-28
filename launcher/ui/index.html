@@ -304,6 +304,14 @@
           <div class="hint">Vulkan plays the intro videos and matches console colors. Pick Direct3D 12 only if Vulkan fails on your GPU. Restart needed.</div>
         </div>
         <div class="field">
+          <label>Renderer</label>
+          <select id="s-render_target_path_vulkan">
+            <option value="native">Native (GPU render targets)</option>
+            <option value="fsi">Legacy (Xbox EDRAM emulation)</option>
+          </select>
+          <div class="hint">Native draws with your GPU's own render targets. Legacy emulates the Xbox 360's video memory in shaders, a fallback if something looks wrong on Native. Vulkan only. Restart needed.</div>
+        </div>
+        <div class="field">
           <label>Vulkan Device (Multi-GPU / Laptop)</label>
           <select id="s-vulkan_device">
             <option value="">Automatic (Recommended)</option>
@@ -1062,6 +1070,7 @@ async function loadSettings(){
   $("#s-fullscreen").value = String(v.fullscreen);
   $("#s-resolution").value = v.resolution || "";
   $("#s-gpu").value = v.gpu || "";
+  $("#s-render_target_path_vulkan").value = v.render_target_path_vulkan || "native";
   $("#s-vulkan_device").value = v.vulkan_device || "";
   $("#s-vsync").checked = v.vsync;
   $("#s-present_letterbox").checked = v.present_letterbox;
@@ -1085,6 +1094,7 @@ $("#savebtn").onclick = async () => {
     fullscreen: $("#s-fullscreen").value === "true",
     resolution: $("#s-resolution").value,
     gpu: $("#s-gpu").value,
+    render_target_path_vulkan: $("#s-render_target_path_vulkan").value,
     vulkan_device: $("#s-vulkan_device").value,
     vsync: $("#s-vsync").checked,
     present_letterbox: $("#s-present_letterbox").checked,
