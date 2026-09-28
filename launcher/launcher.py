@@ -220,7 +220,7 @@ def set_capture(enable):
     return True, "Capture disarmed."
 
 
-SETTINGS_VERSION = 2
+SETTINGS_VERSION = 3
 SETTINGS_VERSION_MARKER = "# settings_version ="
 SETTINGS_DEFAULT_MIGRATIONS = (
     # The v1 migration moved everyone from "none" to the then-new FXAA default.
@@ -228,6 +228,10 @@ SETTINGS_DEFAULT_MIGRATIONS = (
     # walks anyone still on the stamped default back to "none". A player who
     # picked fxaa_extreme on purpose keeps it.
     (2, "swap_post_effect", "fxaa"),
+    # v3 made the native renderer the default. Configs from before it pin the
+    # old "fsi" hand patch; move them over once, and the Renderer setting can
+    # still pick "fsi" deliberately afterwards.
+    (3, "render_target_path_vulkan", "fsi"),
 )
 
 # key -> (type, default, needs_restart)
@@ -256,6 +260,9 @@ SETTINGS_SCHEMA = {
     # Windows), "vulkan" or "d3d12" to force one. Chosen at startup.
     "gpu": ("str", "", True),
     "vulkan_device": ("str", "", True),
+    # renderer: "native" = GPU render targets; "fsi" = Xbox EDRAM emulated in
+    # the pixel shader (accurate fallback). Vulkan only; chosen at startup.
+    "render_target_path_vulkan": ("str", "native", True),
     # audio
     "audio_mute": ("bool", False, False),
     "audio_maxqframes": ("int", 32, True),
