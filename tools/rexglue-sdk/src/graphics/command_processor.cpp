@@ -11,6 +11,7 @@
 
 #include <atomic>
 #include <algorithm>
+#include <bitset>
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
@@ -99,6 +100,19 @@ ReadbackResolveMode ParseReadbackResolveMode(std::string_view value) {
   }
   return ReadbackResolveMode::kDisabled;
 }
+
+// Documented registers, for the unknown-register diagnostic in WriteRegister.
+// A table instead of RegisterFile::GetRegisterInfo's switch because that check
+// runs on every register write.
+std::bitset<RegisterFile::kRegisterCount> BuildKnownRegisterSet() {
+  std::bitset<RegisterFile::kRegisterCount> known;
+#define XE_GPU_REGISTER(index, type, name) known.set(index);
+#include <rex/graphics/register_table.inc>
+#undef XE_GPU_REGISTER
+  return known;
+}
+
+const std::bitset<RegisterFile::kRegisterCount> kKnownRegisters = BuildKnownRegisterSet();
 
 }  // namespace
 
@@ -436,7 +450,7 @@ void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
 
   // Volatile for the WAIT_REG_MEM loop.
   const_cast<volatile uint32_t&>(regs.values[index]) = value;
-  if (!regs.GetRegisterInfo(index)) {
+  if (!kKnownRegisters[index]) {
     REXGPU_DEBUG("GPU: Write to unknown register ({:04X} = {:08X})", index, value);
   }
 

@@ -2282,6 +2282,15 @@ void VulkanCommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_
     return;
   }
 
+  // Context registers (render state) have no write side effects here or in
+  // the base WriteRegister, whose special cases all sit below 0x2000, so a run
+  // of them is a plain copy.
+  constexpr uint32_t kFirstContextRegister = 0x2000;
+  if (start_index >= kFirstContextRegister && end_index < XE_GPU_REG_SHADER_CONSTANT_000_X) {
+    memory::copy_and_swap(register_file_->values + start_index, base, num_registers);
+    return;
+  }
+
   CommandProcessor::WriteRegistersFromMem(start_index, base, num_registers);
 }
 
@@ -2360,6 +2369,16 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
         size_t created = pipeline_cache_ ? pipeline_cache_->pipelines_created() : 0;
         size_t created_delta = created - native_last_created;
         native_last_created = created;
+        // Submissions per frame separates "the shading is expensive" from "the
+        // frame is chopped into many small GPU submissions". Each submission is
+        // a queue submit with its own fence; a frame split into hundreds of them
+        // serializes CPU and GPU and pins the GPU busy metric while doing very
+        // little actual work.
+        static uint64_t native_last_submission = 0;
+        uint64_t submission_now = GetCurrentSubmission();
+        double submits_per_frame = double(submission_now - native_last_submission) /
+                                   double(telemetry_interval);
+        native_last_submission = submission_now;
         const char* rt_path = "unknown";
         uint64_t transfers_skipped = 0;
         if (render_target_cache_) {
@@ -2370,11 +2389,11 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
           transfers_skipped = render_target_cache_->transfers_skipped();
         }
         REXGPU_INFO(
-            "[native] {}f in {:.2f}s ({:.1f} fps) | rt_path={} | aot_shaders={} hit / {} "
-            "translated ({:.1f}% native) | pipelines={} total, {} created this interval | "
-            "edram_transfers_skipped={}",
+            "[native] {}f in {:.2f}s ({:.1f} fps) | rt_path={} | submits/frame={:.1f} | "
+            "aot_shaders={} hit / {} translated ({:.1f}% native) | pipelines={} total, {} "
+            "created this interval | edram_transfers_skipped={}",
             telemetry_interval, seconds, seconds > 0.0 ? telemetry_interval / seconds : 0.0,
-            rt_path, aot_hits, aot_misses,
+            rt_path, submits_per_frame, aot_hits, aot_misses,
             (aot_hits + aot_misses)
                 ? 100.0 * double(aot_hits) / double(aot_hits + aot_misses)
                 : 0.0,
