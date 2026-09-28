@@ -10,7 +10,12 @@
  */
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <cstdio>
+#include <cstring>
+#include <mutex>
+#include <string>
 
 #include <rex/dbg.h>
 #include <rex/input/flags.h>
@@ -26,7 +31,155 @@ REXCVAR_DEFINE_STRING(input_backend, "sdl", "Input", "Input backend: sdl, xinput
     .allowed({"sdl", "xinput"});
 
 REXCVAR_DEFINE_BOOL(guide_button, false, "Input", "Enable guide button pass-through");
+REXCVAR_DEFINE_STRING(input_inject_file, "", "Input",
+                      "Test automation: file polled for injected player 1 controller input, "
+                      "one command per write: '<control> <hold_seconds>'");
 namespace rex::input {
+
+namespace {
+
+// Injected controller input for unattended test runs. The harness writes a
+// command such as "A 0.15" to the file; it is consumed on the next poll and
+// the control is held for that long.
+class InputInjector {
+ public:
+  bool enabled() const { return !REXCVAR_GET(input_inject_file).empty(); }
+
+  // Adds the active injected control to the state; returns true if enabled.
+  bool Apply(X_INPUT_STATE& state) {
+    if (!enabled()) {
+      return false;
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto now = std::chrono::steady_clock::now();
+    if (now >= next_poll_) {
+      next_poll_ = now + std::chrono::milliseconds(20);
+      Poll(now);
+    }
+    uint16_t buttons = 0;
+    int16_t lx = 0, ly = 0, rx = 0, ry = 0;
+    uint8_t lt = 0, rt = 0;
+    if (now < release_at_) {
+      buttons = buttons_;
+      lx = lx_;
+      ly = ly_;
+      rx = rx_;
+      ry = ry_;
+      lt = lt_;
+      rt = rt_;
+    }
+    if (buttons != last_buttons_ || lx != last_lx_ || ly != last_ly_) {
+      ++packet_;
+      last_buttons_ = buttons;
+      last_lx_ = lx;
+      last_ly_ = ly;
+    }
+    state.packet_number = uint32_t(state.packet_number) + packet_;
+    state.gamepad.buttons = uint16_t(state.gamepad.buttons) | buttons;
+    state.gamepad.left_trigger = std::max(state.gamepad.left_trigger, lt);
+    state.gamepad.right_trigger = std::max(state.gamepad.right_trigger, rt);
+    if (lx || ly) {
+      state.gamepad.thumb_lx = lx;
+      state.gamepad.thumb_ly = ly;
+    }
+    if (rx || ry) {
+      state.gamepad.thumb_rx = rx;
+      state.gamepad.thumb_ry = ry;
+    }
+    return true;
+  }
+
+ private:
+  void Poll(std::chrono::steady_clock::time_point now) {
+    const std::string& path = REXCVAR_GET(input_inject_file);
+    FILE* file = std::fopen(path.c_str(), "r");
+    if (!file) {
+      return;
+    }
+    char control[32] = {};
+    double hold = 0.15;
+    int fields = std::fscanf(file, "%31s %lf", control, &hold);
+    std::fclose(file);
+    std::remove(path.c_str());
+    if (fields < 1) {
+      return;
+    }
+    buttons_ = 0;
+    lx_ = ly_ = rx_ = ry_ = 0;
+    lt_ = rt_ = 0;
+    std::string name(control);
+    static const std::pair<const char*, uint16_t> kButtons[] = {
+        {"A", X_INPUT_GAMEPAD_A},
+        {"B", X_INPUT_GAMEPAD_B},
+        {"X", X_INPUT_GAMEPAD_X},
+        {"Y", X_INPUT_GAMEPAD_Y},
+        {"START", X_INPUT_GAMEPAD_START},
+        {"BACK", X_INPUT_GAMEPAD_BACK},
+        {"LB", X_INPUT_GAMEPAD_LEFT_SHOULDER},
+        {"RB", X_INPUT_GAMEPAD_RIGHT_SHOULDER},
+        {"LS", X_INPUT_GAMEPAD_LEFT_THUMB},
+        {"RS", X_INPUT_GAMEPAD_RIGHT_THUMB},
+        {"UP", X_INPUT_GAMEPAD_DPAD_UP},
+        {"DOWN", X_INPUT_GAMEPAD_DPAD_DOWN},
+        {"LEFT", X_INPUT_GAMEPAD_DPAD_LEFT},
+        {"RIGHT", X_INPUT_GAMEPAD_DPAD_RIGHT},
+    };
+    bool known = false;
+    for (const auto& [button_name, mask] : kButtons) {
+      if (name == button_name) {
+        buttons_ = mask;
+        known = true;
+      }
+    }
+    constexpr int16_t kFull = 32767;
+    if (name == "LT") { lt_ = 0xFF; known = true; }
+    if (name == "RT") { rt_ = 0xFF; known = true; }
+    if (name == "L_UP") { ly_ = kFull; known = true; }
+    if (name == "L_DOWN") { ly_ = -kFull; known = true; }
+    if (name == "L_LEFT") { lx_ = -kFull; known = true; }
+    if (name == "L_RIGHT") { lx_ = kFull; known = true; }
+    if (name == "R_UP") { ry_ = kFull; known = true; }
+    if (name == "R_DOWN") { ry_ = -kFull; known = true; }
+    if (name == "R_LEFT") { rx_ = -kFull; known = true; }
+    if (name == "R_RIGHT") { rx_ = kFull; known = true; }
+    if (!known) {
+      REXLOG_WARN("input_inject_file: unknown control '{}'", name);
+      return;
+    }
+    release_at_ = now + std::chrono::microseconds(int64_t(hold * 1e6));
+    REXLOG_INFO("input_inject_file: {} for {:.2f}s", name, hold);
+  }
+
+  std::mutex mutex_;
+  std::chrono::steady_clock::time_point next_poll_{};
+  std::chrono::steady_clock::time_point release_at_{};
+  uint16_t buttons_ = 0;
+  int16_t lx_ = 0, ly_ = 0, rx_ = 0, ry_ = 0;
+  uint8_t lt_ = 0, rt_ = 0;
+  uint16_t last_buttons_ = 0;
+  int16_t last_lx_ = 0, last_ly_ = 0;
+  uint32_t packet_ = 0;
+};
+
+InputInjector g_input_injector;
+
+void FillInjectedCapabilities(X_INPUT_CAPABILITIES* out_caps) {
+  if (!out_caps) {
+    return;
+  }
+  std::memset(out_caps, 0, sizeof(*out_caps));
+  out_caps->type = 0x01;
+  out_caps->sub_type = 0x01;
+  out_caps->gamepad.buttons = 0xFFFF;
+  out_caps->gamepad.left_trigger = 0xFF;
+  out_caps->gamepad.right_trigger = 0xFF;
+  out_caps->gamepad.thumb_lx = static_cast<int16_t>(0x7FFF);
+  out_caps->gamepad.thumb_ly = static_cast<int16_t>(0x7FFF);
+  out_caps->gamepad.thumb_rx = static_cast<int16_t>(0x7FFF);
+  out_caps->gamepad.thumb_ry = static_cast<int16_t>(0x7FFF);
+}
+
+}  // namespace
 
 InputSystem::InputSystem(rex::ui::Window* window) : window_(window) {}
 
@@ -71,6 +224,10 @@ X_RESULT InputSystem::GetCapabilities(uint32_t user_index, uint32_t flags,
       return result;
     }
   }
+  if (user_index == 0 && g_input_injector.enabled()) {
+    FillInjectedCapabilities(out_caps);
+    return X_ERROR_SUCCESS;
+  }
   return any_connected ? X_ERROR_EMPTY : X_ERROR_DEVICE_NOT_CONNECTED;
 }
 
@@ -114,6 +271,10 @@ X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
         }
       }
     }
+  }
+
+  if (user_index == 0 && g_input_injector.Apply(merged)) {
+    first_result = false;
   }
 
   if (first_result) {
