@@ -24,7 +24,10 @@
 #include <rex/memory.h>
 #include <rex/ui/graphics_util.h>
 
-REXCVAR_DEFINE_BOOL(execute_unclipped_draw_vs_on_cpu, false, "GPU",
+// On as in Xenia. Without it, every XDK clear (clipping disabled, 8192
+// scissor) was treated as covering the whole EDRAM, which in this game cost
+// about 2 ms of ownership transfer round trips per frame on the Deck.
+REXCVAR_DEFINE_BOOL(execute_unclipped_draw_vs_on_cpu, true, "GPU",
                     "Execute unclipped draw vertex shader on CPU");
 
 REXCVAR_DEFINE_BOOL(execute_unclipped_draw_vs_on_cpu_with_scissor, false, "GPU",

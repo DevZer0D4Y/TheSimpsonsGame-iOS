@@ -264,6 +264,7 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
           EdramBufferModificationStatus::kViaFragmentShaderInterlock);
 
   VulkanCommandProcessor& command_processor_;
+  const memory::Memory& memory_;
   TraceWriter& trace_writer_;
 
   Path path_ = Path::kHostRenderTargets;
@@ -893,6 +894,13 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
     VulkanTextureCache::NativeResolveTarget targets[VulkanTextureCache::kMaxNativeResolveTargets];
   };
   bool InitializeNativeResolve(uint32_t shared_memory_binding_count);
+  // For a draw clearing a rectangle with the XDK clear shader: the render
+  // targets (bit 0 depth, bits 1-4 color) it overwrites entirely inside the
+  // rectangle, so ownership transfers of their old contents there are dead.
+  uint32_t GetDrawOverwrittenRenderTargets(reg::RB_DEPTHCONTROL normalized_depth_control,
+                                           uint32_t normalized_color_mask,
+                                           const Shader& vertex_shader,
+                                           Transfer::Rectangle& rectangle_out) const;
   bool EnsureNativeResolvePipelineLayouts();
   void ShutdownNativeResolve();
   VkPipeline GetNativeResolvePipeline(NativeResolveShader shader, VkFormat dest_format);

@@ -10,6 +10,7 @@
  */
 
 #include <algorithm>
+#include <cmath>
 #include <cstdlib>
 #include <optional>
 #include <array>
@@ -37,6 +38,7 @@
 #include <rex/graphics/xenos.h>
 #include <rex/logging.h>
 #include <rex/math.h>
+#include <rex/ui/graphics_util.h>
 #include <rex/ui/vulkan/util.h>
 
 // Experiment: skip the EDRAM ownership-transfer draws between host render
@@ -52,6 +54,10 @@ REXCVAR_DEFINE_INT32(rt_debug_log_frames, 0, "GPU/Vulkan",
 REXCVAR_DEFINE_BOOL(native_rt_skip_transfers, false, "GPU/Vulkan",
                     "Skip EDRAM ownership transfer draws on the host render "
                     "target path (breaks character shadows in this title)");
+
+REXCVAR_DEFINE_BOOL(native_rt_skip_overwritten_transfers, true, "GPU/Vulkan",
+                    "Native renderer: skip EDRAM ownership transfers into the parts of render "
+                    "targets that the current draw (a clear) overwrites entirely");
 
 REXCVAR_DEFINE_BOOL(native_resolve, true, "GPU/Vulkan",
                     "Native renderer: draw resolved render targets directly into the textures "
@@ -291,6 +297,7 @@ VulkanRenderTargetCache::VulkanRenderTargetCache(const RegisterFile& register_fi
     : RenderTargetCache(register_file, memory, &trace_writer, draw_resolution_scale_x,
                         draw_resolution_scale_y),
       command_processor_(command_processor),
+      memory_(memory),
       trace_writer_(trace_writer) {}
 
 VulkanRenderTargetCache::~VulkanRenderTargetCache() {
@@ -1780,8 +1787,66 @@ bool VulkanRenderTargetCache::Update(bool is_rasterization_done,
       RenderTarget* const* depth_and_color_render_targets =
           last_update_accumulated_render_targets();
 
-      PerformTransfersAndResolveClears(1 + xenos::kMaxColorRenderTargets,
-                                       depth_and_color_render_targets, last_update_transfers());
+      const std::vector<Transfer>* transfers = last_update_transfers();
+      Transfer::Rectangle overwrite_rectangle;
+      uint32_t overwritten_render_targets = 0;
+      if (native_rt_mode_ && REXCVAR_GET(native_rt_skip_overwritten_transfers)) {
+        bool any_transfers = false;
+        for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets && !any_transfers; ++i) {
+          any_transfers = !transfers[i].empty();
+        }
+        if (any_transfers) {
+          overwritten_render_targets = GetDrawOverwrittenRenderTargets(
+              normalized_depth_control, normalized_color_mask, vertex_shader, overwrite_rectangle);
+        }
+      }
+      if (overwritten_render_targets) {
+        // What this draw overwrites doesn't need the previous owner's data.
+        // Transfers entirely inside the rectangle are dropped, the rest are
+        // performed around it.
+        std::array<std::vector<Transfer>, 1 + xenos::kMaxColorRenderTargets> kept_transfers;
+        std::array<std::vector<Transfer>, 1 + xenos::kMaxColorRenderTargets> cut_transfers;
+        RenderTarget* kept_render_targets[1 + xenos::kMaxColorRenderTargets] = {};
+        RenderTarget* cut_render_targets[1 + xenos::kMaxColorRenderTargets] = {};
+        uint32_t dropped_count = 0;
+        for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
+          RenderTarget* render_target = depth_and_color_render_targets[i];
+          if (!render_target || transfers[i].empty()) {
+            continue;
+          }
+          if (!(overwritten_render_targets & (uint32_t(1) << i))) {
+            kept_render_targets[i] = render_target;
+            kept_transfers[i] = transfers[i];
+            continue;
+          }
+          RenderTargetKey key = render_target->key();
+          for (const Transfer& transfer : transfers[i]) {
+            Transfer::Rectangle rectangles[Transfer::kMaxRectanglesWithCutout];
+            if (transfer.GetRectangles(key.base_tiles, key.GetPitchTiles(), key.msaa_samples,
+                                       key.Is64bpp(), rectangles, &overwrite_rectangle)) {
+              cut_transfers[i].push_back(transfer);
+            } else {
+              ++dropped_count;
+            }
+          }
+          if (!cut_transfers[i].empty()) {
+            cut_render_targets[i] = render_target;
+          }
+        }
+        if (RtDebugLogActive()) {
+          REXGPU_INFO(
+              "[rt-debug] draw overwrites rts {:#x} in ({},{}) {}x{}: {} transfers dropped",
+              overwritten_render_targets, overwrite_rectangle.x_pixels, overwrite_rectangle.y_pixels,
+              overwrite_rectangle.width_pixels, overwrite_rectangle.height_pixels, dropped_count);
+        }
+        PerformTransfersAndResolveClears(1 + xenos::kMaxColorRenderTargets, kept_render_targets,
+                                         kept_transfers.data());
+        PerformTransfersAndResolveClears(1 + xenos::kMaxColorRenderTargets, cut_render_targets,
+                                         cut_transfers.data(), nullptr, &overwrite_rectangle);
+      } else {
+        PerformTransfersAndResolveClears(1 + xenos::kMaxColorRenderTargets,
+                                         depth_and_color_render_targets, transfers);
+      }
 
       if (depth_and_color_render_targets[0]) {
         render_pass_key.depth_and_color_used |= 1 << 0;
@@ -6616,6 +6681,196 @@ bool VulkanRenderTargetCache::DumpRenderTargets(uint32_t dump_base, uint32_t dum
     MarkEdramBufferModified();
   }
   return all_pipelines_available;
+}
+
+namespace {
+// The XDK's internal clear vertex shader (D3DDevice_Clear): screen-space xyz
+// from its only vertex stream straight to the position, and the clear color.
+constexpr uint64_t kXdkClearVertexShaderHash = 0x0A6D1DD7767FDF27;
+}  // namespace
+
+uint32_t VulkanRenderTargetCache::GetDrawOverwrittenRenderTargets(
+    reg::RB_DEPTHCONTROL normalized_depth_control, uint32_t normalized_color_mask,
+    const Shader& vertex_shader, Transfer::Rectangle& rectangle_out) const {
+  const RegisterFile& regs = register_file();
+  if (vertex_shader.ucode_data_hash() != kXdkClearVertexShaderHash) {
+    return 0;
+  }
+  auto draw_initiator = regs.Get<reg::VGT_DRAW_INITIATOR>();
+  if (draw_initiator.prim_type != xenos::PrimitiveType::kRectangleList ||
+      draw_initiator.num_indices != 3 ||
+      draw_initiator.source_select != xenos::SourceSelect::kAutoIndex) {
+    return 0;
+  }
+  const std::vector<Shader::VertexBinding>& bindings = vertex_shader.vertex_bindings();
+  if (bindings.size() != 1 || bindings[0].stride_words < 3) {
+    return 0;
+  }
+  uint32_t stride = bindings[0].stride_words;
+  xenos::xe_gpu_vertex_fetch_t fetch = regs.GetVertexFetch(bindings[0].fetch_constant);
+  if (fetch.type != xenos::FetchConstantType::kVertex || fetch.size < stride * 2 + 3) {
+    return 0;
+  }
+  const float* vertices =
+      memory_.TranslatePhysical<const float*>(fetch.address * sizeof(uint32_t));
+  if (!vertices) {
+    return 0;
+  }
+
+  auto sc_mode_cntl = regs.Get<reg::PA_SU_SC_MODE_CNTL>();
+  if (sc_mode_cntl.cull_front || sc_mode_cntl.cull_back ||
+      sc_mode_cntl.poly_mode != xenos::PolygonModeEnable::kDisabled) {
+    return 0;
+  }
+  auto surface_info = regs.Get<reg::RB_SURFACE_INFO>();
+  if (surface_info.msaa_samples != xenos::MsaaSamples::k1X) {
+    uint32_t sample_mask = (uint32_t(1) << (uint32_t(1) << uint32_t(surface_info.msaa_samples))) - 1;
+    if ((regs[XE_GPU_REG_PA_SC_AA_MASK] & sample_mask) != sample_mask) {
+      return 0;
+    }
+  }
+  const Shader* pixel_shader = command_processor_.active_pixel_shader();
+  if (pixel_shader && (pixel_shader->kills_pixels() || pixel_shader->writes_depth())) {
+    return 0;
+  }
+  auto color_control = regs.Get<reg::RB_COLORCONTROL>();
+  if (color_control.alpha_to_mask_enable ||
+      (color_control.alpha_test_enable &&
+       color_control.alpha_func != xenos::CompareFunction::kAlways)) {
+    return 0;
+  }
+
+  auto vte_cntl = regs.Get<reg::PA_CL_VTE_CNTL>();
+  auto reg_float = [&regs](uint32_t index) {
+    float value;
+    std::memcpy(&value, &regs[index], sizeof(value));
+    return value;
+  };
+  bool clip_disable = regs.Get<reg::PA_CL_CLIP_CNTL>().clip_disable;
+  float half_pixel_offset =
+      regs.Get<reg::PA_SU_VTX_CNTL>().pix_center == xenos::PixelCenter::kD3DZero ? 0.5f : 0.0f;
+  int32_t x_fixed[3], y_fixed[3];
+  for (uint32_t i = 0; i < 3; ++i) {
+    const float* vertex = vertices + stride * i;
+    float x = xenos::GpuSwap(vertex[0], fetch.endian);
+    float y = xenos::GpuSwap(vertex[1], fetch.endian);
+    float z = xenos::GpuSwap(vertex[2], fetch.endian);
+    // w is 1. Anything that could be clipped makes the coverage unknown.
+    if (!clip_disable && !(z >= 0.0f && z <= 1.0f)) {
+      return 0;
+    }
+    if (vte_cntl.vport_x_scale_ena) {
+      x *= reg_float(XE_GPU_REG_PA_CL_VPORT_XSCALE);
+    }
+    if (vte_cntl.vport_x_offset_ena) {
+      x += reg_float(XE_GPU_REG_PA_CL_VPORT_XOFFSET);
+    }
+    if (vte_cntl.vport_y_scale_ena) {
+      y *= reg_float(XE_GPU_REG_PA_CL_VPORT_YSCALE);
+    }
+    if (vte_cntl.vport_y_offset_ena) {
+      y += reg_float(XE_GPU_REG_PA_CL_VPORT_YOFFSET);
+    }
+    if (!std::isfinite(x) || !std::isfinite(y)) {
+      return 0;
+    }
+    x_fixed[i] = ui::FloatToD3D11Fixed16p8(x + half_pixel_offset);
+    y_fixed[i] = ui::FloatToD3D11Fixed16p8(y + half_pixel_offset);
+  }
+  if (RtDebugLogActive()) {
+    REXGPU_INFO("[rt-debug] clear vertices (1/256 px): ({},{}) ({},{}) ({},{}) msaa={}",
+                x_fixed[0], y_fixed[0], x_fixed[1], y_fixed[1], x_fixed[2], y_fixed[2],
+                1u << uint32_t(surface_info.msaa_samples));
+  }
+  // The rectangle covers the bounding box of the vertices only if they are
+  // three distinct corners of an axis-aligned rectangle.
+  int32_t x0 = std::min({x_fixed[0], x_fixed[1], x_fixed[2]});
+  int32_t x1 = std::max({x_fixed[0], x_fixed[1], x_fixed[2]});
+  int32_t y0 = std::min({y_fixed[0], y_fixed[1], y_fixed[2]});
+  int32_t y1 = std::max({y_fixed[0], y_fixed[1], y_fixed[2]});
+  for (uint32_t i = 0; i < 3; ++i) {
+    if ((x_fixed[i] != x0 && x_fixed[i] != x1) || (y_fixed[i] != y0 && y_fixed[i] != y1)) {
+      return 0;
+    }
+    for (uint32_t j = 0; j < i; ++j) {
+      if (x_fixed[i] == x_fixed[j] && y_fixed[i] == y_fixed[j]) {
+        return 0;
+      }
+    }
+  }
+  if (surface_info.msaa_samples == xenos::MsaaSamples::k1X) {
+    // Pixel centers inside according to the top-left rule.
+    x0 = (x0 + 127) >> 8;
+    y0 = (y0 + 127) >> 8;
+    x1 = (x1 + 127) >> 8;
+    y1 = (y1 + 127) >> 8;
+  } else {
+    // Only pixels entirely inside have all their samples covered.
+    x0 = (x0 + 255) >> 8;
+    y0 = (y0 + 255) >> 8;
+    x1 >>= 8;
+    y1 >>= 8;
+  }
+  if (sc_mode_cntl.vtx_window_offset_enable) {
+    auto window_offset = regs.Get<reg::PA_SC_WINDOW_OFFSET>();
+    x0 += window_offset.window_x_offset;
+    y0 += window_offset.window_y_offset;
+    x1 += window_offset.window_x_offset;
+    y1 += window_offset.window_y_offset;
+  }
+  draw_util::Scissor scissor;
+  draw_util::GetScissor(regs, scissor, false);
+  x0 = std::clamp(x0, int32_t(scissor.offset[0]), int32_t(scissor.offset[0] + scissor.extent[0]));
+  x1 = std::clamp(x1, int32_t(scissor.offset[0]), int32_t(scissor.offset[0] + scissor.extent[0]));
+  y0 = std::clamp(y0, int32_t(scissor.offset[1]), int32_t(scissor.offset[1] + scissor.extent[1]));
+  y1 = std::clamp(y1, int32_t(scissor.offset[1]), int32_t(scissor.offset[1] + scissor.extent[1]));
+  if (x0 < 0 || y0 < 0 || x0 >= x1 || y0 >= y1) {
+    return 0;
+  }
+
+  uint32_t overwritten = 0;
+  // Depth and stencil both fully replaced.
+  if (normalized_depth_control.z_enable && normalized_depth_control.z_write_enable &&
+      normalized_depth_control.zfunc == xenos::CompareFunction::kAlways &&
+      normalized_depth_control.stencil_enable &&
+      normalized_depth_control.stencilfunc == xenos::CompareFunction::kAlways &&
+      normalized_depth_control.stencilzpass == xenos::StencilOp::kReplace &&
+      regs.Get<reg::RB_STENCILREFMASK>().stencilwritemask == 0xFF) {
+    bool back_replaced = true;
+    if (normalized_depth_control.backface_enable) {
+      reg::RB_STENCILREFMASK stencil_ref_mask_bf;
+      stencil_ref_mask_bf.value = regs[XE_GPU_REG_RB_STENCILREFMASK_BF];
+      back_replaced = normalized_depth_control.stencilfunc_bf == xenos::CompareFunction::kAlways &&
+                      normalized_depth_control.stencilzpass_bf == xenos::StencilOp::kReplace &&
+                      stencil_ref_mask_bf.stencilwritemask == 0xFF;
+    }
+    if (back_replaced) {
+      overwritten |= 1;
+    }
+  }
+  for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
+    // The normalized mask has components the format doesn't have set too.
+    if (((normalized_color_mask >> (4 * i)) & 0b1111) != 0b1111) {
+      continue;
+    }
+    auto blend_control = regs.Get<reg::RB_BLENDCONTROL>(reg::RB_BLENDCONTROL::rt_register_indices[i]);
+    if (blend_control.color_srcblend != xenos::BlendFactor::kOne ||
+        blend_control.color_destblend != xenos::BlendFactor::kZero ||
+        blend_control.color_comb_fcn != xenos::BlendOp::kAdd ||
+        blend_control.alpha_srcblend != xenos::BlendFactor::kOne ||
+        blend_control.alpha_destblend != xenos::BlendFactor::kZero ||
+        blend_control.alpha_comb_fcn != xenos::BlendOp::kAdd) {
+      continue;
+    }
+    overwritten |= uint32_t(1) << (1 + i);
+  }
+  if (overwritten) {
+    rectangle_out.x_pixels = uint32_t(x0);
+    rectangle_out.y_pixels = uint32_t(y0);
+    rectangle_out.width_pixels = uint32_t(x1 - x0);
+    rectangle_out.height_pixels = uint32_t(y1 - y0);
+  }
+  return overwritten;
 }
 
 namespace {
