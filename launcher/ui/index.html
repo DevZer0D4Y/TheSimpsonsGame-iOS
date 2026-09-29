@@ -341,8 +341,8 @@
           <label>Anti-aliasing</label>
           <select id="s-swap_post_effect">
             <option value="none">Off</option>
-            <option value="fxaa">FXAA (Windows only — black screen on Steam Deck)</option>
-            <option value="fxaa_extreme">FXAA Extreme (Windows only; can smear HUD text)</option>
+            <option value="fxaa">FXAA (recommended on Steam Deck)</option>
+            <option value="fxaa_extreme">FXAA Extreme (smoother, can smear HUD text)</option>
           </select>
         </div>
         <div class="field">
@@ -363,12 +363,13 @@
           <select id="s-video_mode_refresh_rate">
             <option value="30">30 FPS — original console behavior</option>
             <option value="60">60 FPS — smooth (default)</option>
-            <option value="90">90 FPS — experimental</option>
-            <option value="120">120 FPS — experimental</option>
+            <option value="90">90 FPS — not recommended</option>
+            <option value="120">120 FPS — not recommended</option>
           </select>
           <div class="hint">The game shipped at 30 FPS, and some sections misbehave above it —
             known: random deaths at the dam in "Lisa the Tree Hugger" at 60. Switch to 30 for
-            that part if it bites. Restart needed.</div>
+            that part if it bites. The game cannot run faster than 60, so 90 and 120 only make
+            frame pacing less even. Menus always run at 30, as on the console. Restart needed.</div>
         </div>
       </div>
     </div>
@@ -401,6 +402,11 @@
             <option value="6">Italiano (Italian)</option>
           </select>
           <div class="hint">Only languages present on your disc will have translated assets.</div>
+        </div>
+        <div class="field">
+          <label class="switch"><input type="checkbox" id="s-subtitles"> Always show subtitles</label>
+          <div class="hint">Shows subtitles from the very first cutscene of a new game, before the
+            in-game option can be reached. While on, the in-game subtitle option has no effect.</div>
         </div>
       </div>
     </div>
@@ -1082,6 +1088,7 @@ async function loadSettings(){
   $("#s-mnk_sensitivity").value = v.mnk_sensitivity;
   $("#senslabel").textContent = Number(v.mnk_sensitivity).toFixed(1);
   $("#s-user_language").value = String(v.user_language);
+  $("#s-subtitles").checked = !!v.subtitles;
   $("#s-audio_mute").checked = v.audio_mute;
   $("#s-audio_maxqframes").value = String(v.audio_maxqframes);
   updateBanner(v.mnk_mode);
@@ -1105,6 +1112,7 @@ $("#savebtn").onclick = async () => {
     mnk_mode: $("#s-mnk_mode").checked,
     mnk_sensitivity: Number($("#s-mnk_sensitivity").value),
     user_language: Number($("#s-user_language").value),
+    subtitles: $("#s-subtitles").checked,
     audio_mute: $("#s-audio_mute").checked,
     audio_maxqframes: Number($("#s-audio_maxqframes").value),
   }});
