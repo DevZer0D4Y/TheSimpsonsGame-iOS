@@ -45,8 +45,16 @@
 #include <imgui.h>
 
 #include <algorithm>
+#include <chrono>
+#include <cstdlib>
 #include <filesystem>
+#include <thread>
 #include <string_view>
+
+REXCVAR_DEFINE_INT32(shutdown_watchdog_seconds, 10, "UI",
+                     "Seconds after the window closes before the process exits even if "
+                     "shutdown is stuck (0 = wait forever)")
+    .range(0, 3600);
 
 namespace rex {
 
@@ -514,6 +522,20 @@ void ReXApp::OnClosing(ui::UIEvent& e) {
   (void)e;
   REXLOG_INFO("Window closing, shutting down...");
   shutting_down_.store(true, std::memory_order_release);
+  // Shutdown runs guest callbacks (graphics interrupts, audio) that can wait
+  // forever on guest threads the title termination already stopped, leaving an
+  // invisible process behind. Nothing is saved at exit (the game saves while
+  // playing, the pipeline cache is written first), so if shutdown has not
+  // finished in time, end the process.
+  int32_t watchdog_seconds = REXCVAR_GET(shutdown_watchdog_seconds);
+  if (watchdog_seconds > 0) {
+    std::thread([watchdog_seconds]() {
+      std::this_thread::sleep_for(std::chrono::seconds(watchdog_seconds));
+      REXLOG_WARN("Shutdown did not finish within {} s, exiting (last step logged above)",
+                  watchdog_seconds);
+      std::_Exit(0);
+    }).detach();
+  }
   if (runtime_ && runtime_->kernel_state()) {
     runtime_->kernel_state()->TerminateTitle();
   }
