@@ -22,6 +22,8 @@ include(generated/rexglue.cmake)
 set(SIMPSONS_SOURCES
     src/main.cpp
     src/draw_telemetry.cpp
+    src/frame_pacing.cpp
+    src/subtitles.cpp
 )
 
 if(WIN32)
@@ -46,12 +48,15 @@ endif()
 # the target so every build gets them: target_compile_options land after the
 # per-config flags on the compile line, so -O3 wins over the default -O2.
 # x86-64-v3 (AVX2/BMI2/FMA, Haswell/Zen1+) matches what releases already
-# require, so this adds no new hardware exposure.
+# require, so this adds no new hardware exposure. Releases also ship an
+# x86-64-v2 build for older CPUs (release.yml sets SIMPSONS_X86_MARCH).
+set(SIMPSONS_X86_MARCH "x86-64-v3" CACHE STRING
+    "x86-64 microarchitecture level to compile the game for (x86-64-v3 or x86-64-v2)")
 if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU"
    AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
     target_compile_options(simpsons PRIVATE
         $<$<CONFIG:RelWithDebInfo,Release>:-O3>
-        -march=x86-64-v3
+        -march=${SIMPSONS_X86_MARCH}
     )
 endif()
 
