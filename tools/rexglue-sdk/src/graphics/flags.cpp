@@ -18,27 +18,31 @@ REXCVAR_DEFINE_BOOL(gpu_allow_invalid_fetch_constants, false, "GPU",
                     "Allow invalid fetch constants");
 // This game leaves the vertex fetch constants of absent optional streams
 // (blend-shape deltas on morphless meshes, slots 89-94) permanently all-zero
-// with the "invalid" type. The shaders never read those slots at runtime, but
-// static analysis still flags them, so vetoing on them threw away entire
-// otherwise-valid character draws -- the "eternal pop-in" where characters
-// simply never appeared. Admitting these fixes that, and holds up on the
-// D3D12 backend.
+// with the "invalid" type. Vetoing on them threw away entire otherwise-valid
+// character draws -- the pop-in where characters were missing until their
+// meshes changed. Admitting these fixes that.
 //
-// On the Vulkan backend it does not hold up: on Van Gogh (Steam Deck, RADV)
-// admitting these draws wedges the GPU with VK_ERROR_DEVICE_LOST right where
-// gameplay rendering starts -- 0.0.5.x shipped with this on and Deck players
-// crashed at the end of the first cutscene, every time. "Provably safe on
-// paper" did not survive contact with the hardware, so the default is on only
-// where D3D12 is the backend that runs. Do not widen it again without a clean
-// in-game soak on an actual Deck.
-REXCVAR_DEFINE_BOOL(gpu_allow_null_optional_streams, REX_PLATFORM_WIN32 != 0, "GPU",
+// On Van Gogh (Steam Deck, RADV) admitting these draws used to wedge the GPU
+// with VK_ERROR_DEVICE_LOST right where gameplay rendering starts (0.0.5.x
+// crashed at the end of the first cutscene). The cause: their shaders do read
+// the absent streams, whose all-zero fetch constants point at guest address 0,
+// and the sparse shared-memory buffer has no memory there - the only draws in
+// the game touching unbacked sparse memory. Translated shaders now skip
+// fetches from zero-size fetch constants (SpirvShaderTranslator module version
+// 1) and such draws request memory behind the address, and the draws run clean
+// on a Deck (2026-09-28: level start, all of them, then in game). Rasterizing
+// them is what makes characters visible from the first frame of a level.
+REXCVAR_DEFINE_BOOL(gpu_allow_null_optional_streams, true, "GPU",
                     "Draw meshes whose only invalid vertex fetch constants are "
-                    "all-zero optional (stride 0) streams the shader never "
-                    "actually reads.");
-REXCVAR_DEFINE_BOOL(gpu_rasterize_null_optional_reads, false, "GPU",
+                    "all-zero optional (stride 0) streams.");
+REXCVAR_DEFINE_BOOL(gpu_rasterize_null_optional_reads, true, "GPU",
                     "Rasterize draws that read an absent (all-zero) optional vertex stream, "
                     "which fetches zeros like the hardware, instead of running only their "
-                    "vertex work (diagnostic)");
+                    "vertex work (without it, such characters stay invisible)");
+REXCVAR_DEFINE_INT32(gpu_null_optional_draw_limit, -1, "GPU",
+                     "Draw at most this many draws reading absent optional vertex streams per "
+                     "frame, vetoing the rest (-1 = no limit; for testing them one at a time)")
+    .range(-1, INT32_MAX);
 REXCVAR_DEFINE_BOOL(native_2x_msaa, true, "GPU", "Enable native 2x MSAA");
 REXCVAR_DEFINE_BOOL(depth_float24_round, false, "GPU", "Round float24 depth values");
 REXCVAR_DEFINE_BOOL(depth_float24_convert_in_pixel_shader, false, "GPU",

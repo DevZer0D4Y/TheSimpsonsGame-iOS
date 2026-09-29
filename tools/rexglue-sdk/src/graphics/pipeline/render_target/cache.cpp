@@ -432,7 +432,8 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
       xenos::kEdramTileWidthSamples;
   if (!interlock_barrier_only) {
     uint32_t pitch_pixels_tile_aligned_scaled =
-        pitch_tiles_at_32bpp * (xenos::kEdramTileWidthSamples >> msaa_samples_x_log2) *
+        pitch_tiles_at_32bpp *
+        (xenos::kEdramTileWidthSamples >> (msaa_as_single_sample_ ? 0 : msaa_samples_x_log2)) *
         draw_resolution_scale_x();
     uint32_t max_render_target_width = GetMaxRenderTargetWidth();
     if (pitch_pixels_tile_aligned_scaled > max_render_target_width) {
@@ -551,7 +552,7 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
         }
         RenderTargetKey rt_key = render_target->key();
         if (rt_key.pitch_tiles_at_32bpp != pitch_tiles_at_32bpp ||
-            rt_key.msaa_samples != msaa_samples) {
+            rt_key.msaa_samples != GetKeyMsaaSamples(msaa_samples)) {
           are_accumulated_render_targets_valid_ = false;
           break;
         }
@@ -636,7 +637,7 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
     RenderTargetKey& rt_key = rt_keys[rt_bit_index];
     rt_key.base_tiles = rt_base;
     rt_key.pitch_tiles_at_32bpp = pitch_tiles_at_32bpp;
-    rt_key.msaa_samples = msaa_samples;
+    rt_key.msaa_samples = GetKeyMsaaSamples(msaa_samples);
     rt_key.is_depth = rt_bit_index == 0;
     rt_key.resource_format = resource_formats[rt_bit_index];
     if (!interlock_barrier_only) {
@@ -728,7 +729,7 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
       } else {
         RenderTargetKey accumulated_rt_key = accumulated_rt->key();
         if (accumulated_rt_key.pitch_tiles_at_32bpp != pitch_tiles_at_32bpp ||
-            accumulated_rt_key.msaa_samples != msaa_samples) {
+            accumulated_rt_key.msaa_samples != GetKeyMsaaSamples(msaa_samples)) {
           // The previously bound render target is incompatible with the
           // current surface info.
           are_accumulated_render_targets_valid_ = false;
@@ -1013,6 +1014,16 @@ bool RenderTargetCache::PrepareHostRenderTargetsResolveClear(
     return false;
   }
 
+  // The area in the pixels of the render target that will be cleared, which
+  // are samples when multisampled surfaces are single-sampled on the host.
+  Transfer::Rectangle clear_rectangle_rt = clear_rectangle;
+  if (msaa_as_single_sample_) {
+    clear_rectangle_rt.x_pixels <<= msaa_samples_x_log2;
+    clear_rectangle_rt.width_pixels <<= msaa_samples_x_log2;
+    clear_rectangle_rt.y_pixels <<= msaa_samples_y_log2;
+    clear_rectangle_rt.height_pixels <<= msaa_samples_y_log2;
+  }
+
   // Change ownership of the tiles containing the area to be cleared, so the
   // up-to-date host render target for the cleared range will be the cleared
   // one.
@@ -1077,7 +1088,7 @@ bool RenderTargetCache::PrepareHostRenderTargetsResolveClear(
   if (depth_clear_length_tiles) {
     depth_render_target_key.base_tiles = resolve_info.depth_original_base;
     depth_render_target_key.pitch_tiles_at_32bpp = pitch_tiles_at_32bpp;
-    depth_render_target_key.msaa_samples = msaa_samples;
+    depth_render_target_key.msaa_samples = GetKeyMsaaSamples(msaa_samples);
     depth_render_target_key.is_depth = 1;
     depth_render_target_key.resource_format = resolve_info.depth_edram_info.format;
     depth_render_target = GetOrCreateRenderTarget(depth_render_target_key);
@@ -1092,7 +1103,7 @@ bool RenderTargetCache::PrepareHostRenderTargetsResolveClear(
   if (color_clear_length_tiles) {
     color_render_target_key.base_tiles = resolve_info.color_original_base;
     color_render_target_key.pitch_tiles_at_32bpp = pitch_tiles_at_32bpp;
-    color_render_target_key.msaa_samples = msaa_samples;
+    color_render_target_key.msaa_samples = GetKeyMsaaSamples(msaa_samples);
     color_render_target_key.is_depth = 0;
     color_render_target_key.resource_format = uint32_t(GetColorResourceFormat(
         xenos::ColorRenderTargetFormat(resolve_info.color_edram_info.format)));
@@ -1108,18 +1119,18 @@ bool RenderTargetCache::PrepareHostRenderTargetsResolveClear(
     return false;
   }
 
-  clear_rectangle_out = clear_rectangle;
+  clear_rectangle_out = clear_rectangle_rt;
   depth_render_target_out = depth_render_target;
   depth_transfers_out.clear();
   if (depth_render_target) {
     ChangeOwnership(depth_render_target_key, depth_clear_start_tiles_base_relative,
-                    depth_clear_length_tiles, &depth_transfers_out, &clear_rectangle);
+                    depth_clear_length_tiles, &depth_transfers_out, &clear_rectangle_rt);
   }
   color_render_target_out = color_render_target;
   color_transfers_out.clear();
   if (color_render_target) {
     ChangeOwnership(color_render_target_key, color_clear_start_tiles_base_relative,
-                    color_clear_length_tiles, &color_transfers_out, &clear_rectangle);
+                    color_clear_length_tiles, &color_transfers_out, &clear_rectangle_rt);
   }
   return true;
 }

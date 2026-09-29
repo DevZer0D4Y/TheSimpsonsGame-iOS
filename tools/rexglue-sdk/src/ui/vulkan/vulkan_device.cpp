@@ -843,6 +843,14 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
       device->memory_types_.host_cached |= memory_type_bit;
     }
   }
+  if (!device->memory_types_.device_local && memory_properties.memoryTypeCount) {
+    // Only compile-only devices without real memory (such as RADV's null
+    // device used to inspect shader compilation) have no device-local type.
+    // Treat all memory as device-local there so the renderer can start.
+    REXLOG_WARN("Vulkan device has no device-local memory type, using all {} memory types",
+                memory_properties.memoryTypeCount);
+    device->memory_types_.device_local = (uint32_t(1) << memory_properties.memoryTypeCount) - 1;
+  }
 
   return device;
 }

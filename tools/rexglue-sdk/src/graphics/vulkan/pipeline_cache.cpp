@@ -1252,6 +1252,29 @@ bool VulkanPipelineCache::EnsureShadersTranslated(VulkanShader::VulkanTranslatio
     if (aot_dir.empty()) {
       return false;
     }
+    if (aot_version_matches_ < 0) {
+      // A set made by an older translator can still contain fixed bugs, so it
+      // is only used when made by this translator version.
+      uint32_t aot_version = 0;
+      FILE* version_file = rex::filesystem::OpenFile(
+          std::filesystem::path(aot_dir) / "translator_version.txt", "rb");
+      if (version_file) {
+        if (fscanf(version_file, "%u", &aot_version) != 1) {
+          aot_version = 0;
+        }
+        fclose(version_file);
+      }
+      aot_version_matches_ = aot_version == SpirvShaderTranslator::kTranslatedModuleVersion;
+      if (!aot_version_matches_) {
+        REXGPU_WARN(
+            "VulkanPipelineCache: ignoring the ahead-of-time shader set in {}: made by "
+            "translator version {}, current is {}; shaders are translated at runtime",
+            aot_dir, aot_version, SpirvShaderTranslator::kTranslatedModuleVersion);
+      }
+    }
+    if (!aot_version_matches_) {
+      return false;
+    }
     std::filesystem::path aot_path =
         std::filesystem::path(aot_dir) /
         fmt::format("{:016X}_{}_{:016X}.spv", translation.shader().ucode_data_hash(), stage,

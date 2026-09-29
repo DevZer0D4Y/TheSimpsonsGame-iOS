@@ -3783,6 +3783,19 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     // classification already logged why.
     return false;
   }
+  if (invalid_vfetch_verdict == draw_util::InvalidVertexFetchVerdict::kRasterize) {
+    int32_t null_optional_limit = REXCVAR_GET(gpu_null_optional_draw_limit);
+    if (null_optional_limit >= 0) {
+      if (null_optional_draw_frame_ != frame_current_) {
+        null_optional_draw_frame_ = frame_current_;
+        null_optional_draws_this_frame_ = 0;
+      }
+      if (null_optional_draws_this_frame_ >= uint32_t(null_optional_limit)) {
+        return false;
+      }
+      ++null_optional_draws_this_frame_;
+    }
+  }
   bool memexport_used_vertex = vertex_shader->memexport_eM_written() != 0;
   if (memexport_used_vertex) {
     if (!device_properties.vertexPipelineStoresAndAtomics) {
@@ -4102,8 +4115,21 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
 
   bool host_render_targets_used =
       render_target_cache_->GetPath() == RenderTargetCache::Path::kHostRenderTargets;
-  uint32_t draw_resolution_scale_x = texture_cache_->draw_resolution_scale_x();
-  uint32_t draw_resolution_scale_y = texture_cache_->draw_resolution_scale_y();
+  uint32_t draw_resolution_scale_x, draw_resolution_scale_y;
+  GetDrawRasterizationScale(draw_resolution_scale_x, draw_resolution_scale_y);
+  if (draw_resolution_scale_x != texture_cache_->draw_resolution_scale_x() ||
+      draw_resolution_scale_y != texture_cache_->draw_resolution_scale_y()) {
+    // A multisampled surface rasterized at double resolution. Exact for clears
+    // (constant output), which is all the known uses; others shade per sample.
+    static bool non_clear_msaa_draw_logged = false;
+    if (!non_clear_msaa_draw_logged && vertex_shader->ucode_data_hash() != 0x0A6D1DD7767FDF27) {
+      non_clear_msaa_draw_logged = true;
+      REXGPU_WARN(
+          "Multisampled draw other than a clear (VS {:016X}) rasterized per sample at double "
+          "resolution",
+          vertex_shader->ucode_data_hash());
+    }
+  }
 
   // Get dynamic rasterizer state.
   draw_util::ViewportInfo viewport_info;
@@ -4213,7 +4239,16 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
       // Invalid-type slots already passed classification above (a kVeto draw
       // never reaches this loop), so both valid and admitted-invalid slots
       // just need their buffer ranges resident.
-      if (!shared_memory_->RequestRange(vfetch_constant.address << 2, vfetch_constant.size << 2)) {
+      uint32_t vfetch_request_size = vfetch_constant.size << 2;
+      if (!vfetch_request_size &&
+          invalid_vfetch_verdict == draw_util::InvalidVertexFetchVerdict::kRasterize) {
+        // An absent optional stream (all-zero fetch constant) that the shader
+        // reads. Current translations skip such reads, but back the address
+        // with real memory anyway, so no module ever reads a sparse page
+        // without memory, a suspect for GPU hangs on the Steam Deck.
+        vfetch_request_size = 4096;
+      }
+      if (!shared_memory_->RequestRange(vfetch_constant.address << 2, vfetch_request_size)) {
         REXGPU_ERROR(
             "Failed to request vertex buffer at 0x{:08X} (size {}) in the shared "
             "memory",
@@ -4221,6 +4256,21 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
         return false;
       }
       vertex_buffers_resident[vfetch_index >> 6] |= vfetch_bit;
+    }
+  }
+
+  if (invalid_vfetch_verdict == draw_util::InvalidVertexFetchVerdict::kRasterize) {
+    // Absent optional streams have all-zero fetch constants, so their reads go
+    // to guest address 0. Diagnostic: whether the host buffer has memory there.
+    static uint32_t null_optional_logs = 0;
+    if (null_optional_logs < 20) {
+      ++null_optional_logs;
+      REXGPU_INFO(
+          "[null-optional] drawing vs={:016X}: host memory behind guest address 0 {} (sparse "
+          "granularity 2^{})",
+          vertex_shader->ucode_data_hash(),
+          shared_memory_->IsHostGpuMemoryAllocated(0) ? "allocated" : "NOT allocated",
+          shared_memory_->host_gpu_memory_sparse_granularity_log2_public());
     }
   }
 
@@ -6053,6 +6103,18 @@ void VulkanCommandProcessor::DestroySwapFxaaSourceImage() {
   swap_fxaa_source_layout_ = VK_IMAGE_LAYOUT_UNDEFINED;
 }
 
+void VulkanCommandProcessor::GetDrawRasterizationScale(uint32_t& scale_x_out,
+                                                       uint32_t& scale_y_out) const {
+  scale_x_out = texture_cache_ ? texture_cache_->draw_resolution_scale_x() : 1;
+  scale_y_out = texture_cache_ ? texture_cache_->draw_resolution_scale_y() : 1;
+  if (render_target_cache_ && render_target_cache_->msaa_as_single_sample()) {
+    // Samples of multisampled surfaces are pixels of the host render target.
+    xenos::MsaaSamples msaa_samples = register_file_->Get<reg::RB_SURFACE_INFO>().msaa_samples;
+    scale_x_out <<= uint32_t(msaa_samples >= xenos::MsaaSamples::k4X);
+    scale_y_out <<= uint32_t(msaa_samples >= xenos::MsaaSamples::k2X);
+  }
+}
+
 void VulkanCommandProcessor::UpdateDynamicState(const draw_util::ViewportInfo& viewport_info,
                                                 bool primitive_polygonal,
                                                 reg::RB_DEPTHCONTROL normalized_depth_control) {
@@ -6061,8 +6123,8 @@ void VulkanCommandProcessor::UpdateDynamicState(const draw_util::ViewportInfo& v
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
 
   const RegisterFile& regs = *register_file_;
-  uint32_t draw_resolution_scale_x = texture_cache_ ? texture_cache_->draw_resolution_scale_x() : 1;
-  uint32_t draw_resolution_scale_y = texture_cache_ ? texture_cache_->draw_resolution_scale_y() : 1;
+  uint32_t draw_resolution_scale_x, draw_resolution_scale_y;
+  GetDrawRasterizationScale(draw_resolution_scale_x, draw_resolution_scale_y);
 
   // Window parameters.
   // http://ftp.tku.edu.tw/NetBSD/NetBSD-current/xsrc/external/mit/xf86-video-ati/dist/src/r600_reg_auto_r6xx.h
@@ -6550,11 +6612,15 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
     // 2 because 1 in the NDC is half of the viewport's axis, 0.5 for diameter
     // to radius conversion to avoid multiplying the per-vertex diameter by an
     // additional constant in the shader.
+    // The viewport is in rasterization pixels, which include samples of
+    // multisampled surfaces kept single-sampled.
+    uint32_t point_rasterization_scale_x, point_rasterization_scale_y;
+    GetDrawRasterizationScale(point_rasterization_scale_x, point_rasterization_scale_y);
     float point_screen_diameter_to_ndc_radius_x =
-        (/* 0.5f * 2.0f * */ float(draw_resolution_scale_x)) /
+        (/* 0.5f * 2.0f * */ float(point_rasterization_scale_x)) /
         std::max(viewport_info.xy_extent[0], uint32_t(1));
     float point_screen_diameter_to_ndc_radius_y =
-        (/* 0.5f * 2.0f * */ float(draw_resolution_scale_y)) /
+        (/* 0.5f * 2.0f * */ float(point_rasterization_scale_y)) /
         std::max(viewport_info.xy_extent[1], uint32_t(1));
     dirty |= system_constants_.point_screen_diameter_to_ndc_radius[0] !=
              point_screen_diameter_to_ndc_radius_x;

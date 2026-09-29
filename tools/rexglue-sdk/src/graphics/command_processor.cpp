@@ -15,7 +15,9 @@
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
+#include <string>
 #include <string_view>
+#include <vector>
 
 #include <fmt/format.h>
 
@@ -26,6 +28,7 @@
 #include <rex/graphics/command_processor.h>
 #include <rex/graphics/flags.h>
 #include <rex/graphics/graphics_system.h>
+#include <rex/graphics/native_records.h>
 #include <rex/graphics/pipeline/texture/info.h>
 #include <rex/graphics/sampler_info.h>
 #include <rex/graphics/xenos.h>
@@ -160,10 +163,15 @@ bool CommandProcessor::Initialize() {
   worker_thread_->set_name("GPU Commands");
   worker_thread_->Create();
 
+  // Direct3D hooks may replace packets with native records from now on.
+  native_records::Clear();
+  native_records::SetEnabled(true);
+
   return true;
 }
 
 void CommandProcessor::Shutdown() {
+  native_records::SetEnabled(false);
   EndTracing();
 
   worker_running_ = false;
@@ -751,10 +759,82 @@ uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t wr
   return write_index;
 }
 
+
+// PM4 census (diagnostic): what the command stream this game produces is made
+// of, as input for replacing it with native rendering calls.
+REXCVAR_DEFINE_BOOL(pm4_bulk_float_constants, true, "GPU",
+                    "Apply type-0 packets of shader float constants as one range instead of "
+                    "register by register");
+
+REXCVAR_DEFINE_INT32(pm4_census, 0, "GPU",
+                     "Log a per-frame census of the PM4 command stream every N frames "
+                     "(0 = off; diagnostic)");
+
+namespace {
+struct Pm4Census {
+  uint64_t packets = 0;
+  uint64_t dwords = 0;
+  uint64_t type_packets[4] = {};
+  uint64_t register_writes = 0;
+  // Register writes by range: config (< 0x2000), state (0x2000-0x3FFF), vertex
+  // float constants, pixel float constants, fetch constants, bool/loop
+  // constants, other.
+  uint64_t register_range_writes[7] = {};
+  uint64_t type3_opcodes[128] = {};
+  uint64_t type3_opcode_dwords[128] = {};
+  uint64_t indirect_buffers = 0;
+  uint64_t indirect_buffer_dwords = 0;
+  uint64_t nested_indirect_buffers = 0;
+  uint64_t repeated_indirect_buffers = 0;
+  // Indirect buffer dwords per 16 MB guest physical region.
+  uint64_t region_dwords[32] = {};
+};
+Pm4Census g_pm4_census;
+uint32_t g_pm4_census_frames = 0;
+uint32_t g_pm4_indirect_depth = 0;
+// Indirect buffers of the previous frame: address, length and a hash of their
+// first dwords, to spot command buffers replayed unchanged across frames.
+std::vector<uint64_t> g_pm4_previous_buffers, g_pm4_current_buffers;
+
+uint64_t Pm4BufferKey(const uint32_t* dwords, uint32_t ptr, uint32_t count) {
+  uint64_t hash = 1469598103934665603ull;
+  for (uint32_t i = 0; i < std::min(count, uint32_t(16)); ++i) {
+    hash = (hash ^ dwords[i]) * 1099511628211ull;
+  }
+  return hash ^ (uint64_t(ptr) << 20) ^ count;
+}
+}  // namespace
+
+namespace {
+// Verify-mode statistics, logged at swaps.
+uint64_t g_native_verify_records = 0;
+uint64_t g_native_verify_registers = 0;
+uint64_t g_native_verify_mismatches = 0;
+uint64_t g_native_applied_records = 0;
+uint64_t g_native_applied_registers = 0;
+uint64_t g_native_missing_records = 0;
+uint64_t g_native_fallbacks = 0;
+uint32_t g_native_stats_frames = 0;
+}  // namespace
+
 void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
   SCOPE_profile_cpu_f("gpu");
 
   trace_writer_.WriteIndirectBufferStart(ptr, count * sizeof(uint32_t));
+
+  if (REXCVAR_GET(pm4_census) > 0) {
+    ++g_pm4_census.indirect_buffers;
+    g_pm4_census.indirect_buffer_dwords += count;
+    g_pm4_census.nested_indirect_buffers += g_pm4_indirect_depth ? 1 : 0;
+    g_pm4_census.region_dwords[(ptr >> 24) & 31] += count;
+    uint64_t key = Pm4BufferKey(memory_->TranslatePhysical<const uint32_t*>(ptr), ptr, count);
+    g_pm4_current_buffers.push_back(key);
+    if (std::find(g_pm4_previous_buffers.begin(), g_pm4_previous_buffers.end(), key) !=
+        g_pm4_previous_buffers.end()) {
+      ++g_pm4_census.repeated_indirect_buffers;
+    }
+  }
+  ++g_pm4_indirect_depth;
 
   // Execute commands!
   memory::RingBuffer reader(memory_->TranslatePhysical(ptr), count * sizeof(uint32_t));
@@ -767,6 +847,7 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
       break;
     }
   } while (reader.read_count());
+  --g_pm4_indirect_depth;
 
   trace_writer_.WriteIndirectBufferEnd();
 }
@@ -787,6 +868,36 @@ void CommandProcessor::ExecutePacket(uint32_t ptr, uint32_t count) {
 bool CommandProcessor::ExecutePacket(memory::RingBuffer* reader) {
   const uint32_t packet = reader->ReadAndSwap<uint32_t>();
   const uint32_t packet_type = packet >> 30;
+  if (REXCVAR_GET(pm4_census) > 0) {
+    ++g_pm4_census.packets;
+    ++g_pm4_census.type_packets[packet_type];
+    uint32_t packet_dwords = 1;
+    if (packet_type == 0 || packet_type == 3) {
+      packet_dwords += ((packet >> 16) & 0x3FFF) + 1;
+    } else if (packet_type == 1) {
+      packet_dwords += 2;
+    }
+    g_pm4_census.dwords += packet_dwords;
+    if (packet_type == 0) {
+      uint32_t count = ((packet >> 16) & 0x3FFF) + 1;
+      g_pm4_census.register_writes += count;
+      uint32_t base = packet & 0x7FFF;
+      uint32_t range = base < 0x2000   ? 0
+                       : base < 0x4000 ? 1
+                       : base < 0x4400 ? 2
+                       : base < 0x4800 ? 3
+                       : base < 0x4900 ? 4
+                       : base < 0x4A00 ? 5
+                                       : 6;
+      g_pm4_census.register_range_writes[range] += count;
+    } else if (packet_type == 1) {
+      g_pm4_census.register_writes += 2;
+    } else if (packet_type == 3) {
+      uint32_t opcode = (packet >> 8) & 0x7F;
+      ++g_pm4_census.type3_opcodes[opcode];
+      g_pm4_census.type3_opcode_dwords[opcode] += packet_dwords;
+    }
+  }
   if (packet == 0) {
     trace_writer_.WritePacketStart(uint32_t(reader->read_ptr() - 4), 1);
     trace_writer_.WritePacketEnd();
@@ -828,6 +939,14 @@ bool CommandProcessor::ExecutePacketType0(memory::RingBuffer* reader, uint32_t p
 
   uint32_t base_index = (packet & 0x7FFF);
   uint32_t write_one_reg = (packet >> 15) & 0x1;
+  if (!write_one_reg && base_index >= XE_GPU_REG_SHADER_CONSTANT_000_X &&
+      base_index + count - 1 <= XE_GPU_REG_SHADER_CONSTANT_511_W &&
+      REXCVAR_GET(pm4_bulk_float_constants)) {
+    // Most of this game's command stream: no per-register side effects.
+    WriteRegisterRangeFromRing(reader, base_index, count);
+    trace_writer_.WritePacketEnd();
+    return true;
+  }
   for (uint32_t m = 0; m < count; m++) {
     uint32_t reg_data = reader->ReadAndSwap<uint32_t>();
     uint32_t target_index = write_one_reg ? base_index : base_index + m;
@@ -904,6 +1023,9 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
       break;
     case PM4_XE_SWAP:
       result = ExecutePacketType3_XE_SWAP(reader, packet, count);
+      break;
+    case native_records::kMarkerOpcode:
+      result = ExecutePacketType3_NATIVE_RECORD(reader, packet, count);
       break;
     case PM4_INDIRECT_BUFFER:
     case PM4_INDIRECT_BUFFER_PFD:
@@ -1119,7 +1241,149 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
 
   IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
 
+  if ((g_native_verify_records || g_native_applied_records || g_native_missing_records ||
+       g_native_fallbacks) &&
+      ++g_native_stats_frames >= 300) {
+    g_native_stats_frames = 0;
+    REXGPU_INFO(
+        "[native-records] last 300 frames: applied {} records ({} registers), verified {} "
+        "records ({} registers, {} mismatches), {} replays through packets, {} markers "
+        "without a record",
+        g_native_applied_records, g_native_applied_registers, g_native_verify_records,
+        g_native_verify_registers, g_native_verify_mismatches, g_native_fallbacks,
+        g_native_missing_records);
+    g_native_verify_records = g_native_verify_registers = g_native_verify_mismatches = 0;
+    g_native_applied_records = g_native_applied_registers = g_native_missing_records = 0;
+    g_native_fallbacks = 0;
+  }
+
+  int32_t census_interval = REXCVAR_GET(pm4_census);
+  if (census_interval > 0) {
+    if (++g_pm4_census_frames >= uint32_t(census_interval)) {
+      g_pm4_census_frames = 0;
+      const Pm4Census& c = g_pm4_census;
+      std::string opcodes;
+      std::vector<std::pair<uint64_t, uint32_t>> sorted;
+      for (uint32_t i = 0; i < 128; ++i) {
+        if (c.type3_opcodes[i]) {
+          sorted.emplace_back(c.type3_opcodes[i], i);
+        }
+      }
+      std::sort(sorted.rbegin(), sorted.rend());
+      for (const auto& [n, op] : sorted) {
+        opcodes += fmt::format(" 0x{:02X}:{}/{}dw", op, n, c.type3_opcode_dwords[op]);
+      }
+      std::string regions;
+      for (uint32_t i = 0; i < 32; ++i) {
+        if (c.region_dwords[i]) {
+          regions += fmt::format(" {:02X}xxxxxx:{}dw", i, c.region_dwords[i]);
+        }
+      }
+      REXGPU_INFO(
+          "[pm4-census] packets {} dwords {} | type0 {} type1 {} type2 {} type3 {} | register "
+          "writes {} (config {} state {} vs-float {} ps-float {} fetch {} bool/loop {} other {}) | "
+          "indirect buffers {} ({} dw, {} nested, {} same as previous frame) regions{} "
+          "| type3 opcodes (count/dwords):{}",
+          c.packets, c.dwords, c.type_packets[0], c.type_packets[1], c.type_packets[2],
+          c.type_packets[3], c.register_writes, c.register_range_writes[0],
+          c.register_range_writes[1], c.register_range_writes[2], c.register_range_writes[3],
+          c.register_range_writes[4], c.register_range_writes[5], c.register_range_writes[6],
+          c.indirect_buffers, c.indirect_buffer_dwords,
+          c.nested_indirect_buffers, c.repeated_indirect_buffers, regions, opcodes);
+    }
+    g_pm4_census = Pm4Census();
+    g_pm4_previous_buffers.swap(g_pm4_current_buffers);
+    g_pm4_current_buffers.clear();
+  }
+
   ++counter_;
+  return true;
+}
+
+
+bool CommandProcessor::ExecutePacketType3_NATIVE_RECORD(memory::RingBuffer* reader,
+                                                        uint32_t packet, uint32_t count) {
+  uint32_t sequence = reader->ReadAndSwap<uint32_t>();
+  uint32_t replaced_dwords = count > 1 ? reader->ReadAndSwap<uint32_t>() : 0;
+  if (count > 2) {
+    reader->AdvanceRead((count - 2) * sizeof(uint32_t));
+  }
+  native_records::Record record;
+  if (replaced_dwords && reader->read_count() < replaced_dwords * sizeof(uint32_t)) {
+    // The packets are not all in this buffer; execute what is there.
+    ++g_native_fallbacks;
+    return true;
+  }
+  if (!native_records::Pop(sequence, record)) {
+    if (replaced_dwords) {
+      // Replayed recorded command buffer: its packets follow and execute.
+      ++g_native_fallbacks;
+      return true;
+    }
+    // In a trace replay the record's registers arrive as a register command
+    // instead. Live, this would be a lost record.
+    if (g_native_missing_records < 12) {
+      REXGPU_WARN(
+          "[native-records] marker {} without its record (oldest queued {}), at guest {:08X}, "
+          "indirect buffer depth {}",
+          sequence, native_records::OldestSequence(),
+          uint32_t(reader->read_ptr() - reinterpret_cast<uintptr_t>(memory_->TranslatePhysical(0))) - 8,
+          g_pm4_indirect_depth);
+    }
+    ++g_native_missing_records;
+    return true;
+  }
+  switch (record.type) {
+    case native_records::RecordType::kRegisterRuns: {
+      bool verify = (record.flags & native_records::kRecordFlagVerify) != 0;
+      const uint32_t* run = record.payload.data();
+      const uint32_t* end = run + record.payload.size();
+      while (end - run >= 2) {
+        uint32_t first_register = run[0];
+        uint32_t register_count = run[1];
+        run += 2;
+        if (uint32_t(end - run) < register_count ||
+            first_register + register_count > RegisterFile::kRegisterCount) {
+          break;
+        }
+        if (verify) {
+          for (uint32_t i = 0; i < register_count; ++i) {
+            uint32_t expected = rex::byte_swap(run[i]);
+            if (register_file_->values[first_register + i] != expected) {
+              if (g_native_verify_mismatches < 8) {
+                REXGPU_WARN(
+                    "[native-records] verify mismatch: register {:04X} record {:08X} packets "
+                    "{:08X}",
+                    first_register + i, expected, register_file_->values[first_register + i]);
+              }
+              ++g_native_verify_mismatches;
+            }
+          }
+          g_native_verify_registers += register_count;
+        } else {
+          WriteRegistersFromMem(first_register, const_cast<uint32_t*>(run), register_count);
+          if (trace_writer_.is_open()) {
+            trace_writer_.WriteRegisters(first_register, register_file_->values + first_register,
+                                         register_count, false);
+          }
+          g_native_applied_registers += register_count;
+        }
+        run += register_count;
+      }
+      if (verify) {
+        ++g_native_verify_records;
+      } else {
+        ++g_native_applied_records;
+      }
+      if (replaced_dwords) {
+        reader->AdvanceRead(replaced_dwords * sizeof(uint32_t));
+      }
+      break;
+    }
+    default:
+      REXGPU_ERROR("[native-records] unknown record type {}", uint32_t(record.type));
+      break;
+  }
   return true;
 }
 

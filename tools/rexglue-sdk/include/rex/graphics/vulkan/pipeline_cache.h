@@ -444,6 +444,9 @@ class VulkanPipelineCache {
   // Ahead-of-time shader serving statistics for the shutdown log.
   size_t aot_hits_ = 0;
   size_t aot_misses_ = 0;
+  // Whether the ahead-of-time shader set matches kTranslatedModuleVersion
+  // (-1 until checked).
+  int aot_version_matches_ = -1;
   // vkCreateGraphicsPipelines calls actually issued this session. With a warm
   // persistent driver cache these are cheap replays rather than full compiles;
   // a count that keeps climbing during play is what stutter looks like.

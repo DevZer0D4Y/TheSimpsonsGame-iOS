@@ -55,6 +55,18 @@ REXCVAR_DEFINE_BOOL(native_rt_skip_transfers, false, "GPU/Vulkan",
                     "Skip EDRAM ownership transfer draws on the host render "
                     "target path (breaks character shadows in this title)");
 
+REXCVAR_DEFINE_BOOL(vulkan_2_10_10_10_exact, true, "GPU/Vulkan",
+                    "Host render targets: store 2_10_10_10 color in the exact 10:10:10:2 format "
+                    "instead of 8 bits per channel, keeping the guest's 10-bit color and 2-bit "
+                    "alpha (the 8-bit storage bleached this game's character colors)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+REXCVAR_DEFINE_BOOL(native_rt_msaa_as_single_sample, true, "GPU/Vulkan",
+                    "Native renderer: keep 2x / 4x MSAA surfaces in single-sampled render "
+                    "targets with every sample as a pixel, shared with the single-sampled view "
+                    "of the same EDRAM, instead of transferring between them")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
 REXCVAR_DEFINE_BOOL(native_rt_skip_overwritten_transfers, true, "GPU/Vulkan",
                     "Native renderer: skip EDRAM ownership transfers into the parts of render "
                     "targets that the current draw (a clear) overwrites entirely");
@@ -533,10 +545,12 @@ bool VulkanRenderTargetCache::Initialize(uint32_t shared_memory_binding_count) {
   if (path_ != Path::kHostRenderTargets) {
     native_rt_mode_ = false;
   }
-  REXGPU_INFO("VulkanRenderTargetCache: render target path = {}",
+  msaa_as_single_sample_ = native_rt_mode_ && REXCVAR_GET(native_rt_msaa_as_single_sample);
+  REXGPU_INFO("VulkanRenderTargetCache: render target path = {}{}",
               path_ == Path::kPixelShaderInterlock ? "fragment shader interlock"
               : native_rt_mode_                    ? "native (host render targets)"
-                                                   : "host render targets");
+                                                   : "host render targets",
+              msaa_as_single_sample_ ? ", MSAA surfaces single-sampled" : "");
 
   // Descriptor set layouts.
   VkDescriptorSetLayoutBinding descriptor_set_layout_bindings[2];
@@ -1780,7 +1794,7 @@ bool VulkanRenderTargetCache::Update(bool is_rasterization_done,
   RenderPassKey render_pass_key;
   // Needed even with the fragment shader interlock render backend for passing
   // the sample count to the pipeline cache.
-  render_pass_key.msaa_samples = rb_surface_info.msaa_samples;
+  render_pass_key.msaa_samples = GetKeyMsaaSamples(rb_surface_info.msaa_samples);
 
   switch (GetPath()) {
     case Path::kHostRenderTargets: {
@@ -2178,7 +2192,8 @@ VkFormat VulkanRenderTargetCache::GetColorVulkanFormat(
                                              : VK_FORMAT_R8G8B8A8_UNORM;
     case xenos::ColorRenderTargetFormat::k_2_10_10_10:
     case xenos::ColorRenderTargetFormat::k_2_10_10_10_AS_10_10_10_10:
-      return VK_FORMAT_A8B8G8R8_UNORM_PACK32;
+      return REXCVAR_GET(vulkan_2_10_10_10_exact) ? VK_FORMAT_A2B10G10R10_UNORM_PACK32
+                                                  : VK_FORMAT_A8B8G8R8_UNORM_PACK32;
     case xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT:
     case xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT_AS_16_16_16_16:
       return VK_FORMAT_R16G16B16A16_SFLOAT;
@@ -6865,10 +6880,17 @@ uint32_t VulkanRenderTargetCache::GetDrawOverwrittenRenderTargets(
     overwritten |= uint32_t(1) << (1 + i);
   }
   if (overwritten) {
-    rectangle_out.x_pixels = uint32_t(x0);
-    rectangle_out.y_pixels = uint32_t(y0);
-    rectangle_out.width_pixels = uint32_t(x1 - x0);
-    rectangle_out.height_pixels = uint32_t(y1 - y0);
+    // In render target pixels, which are samples when multisampled surfaces
+    // are single-sampled on the host.
+    uint32_t x_log2 = 0, y_log2 = 0;
+    if (msaa_as_single_sample()) {
+      x_log2 = uint32_t(surface_info.msaa_samples >= xenos::MsaaSamples::k4X);
+      y_log2 = uint32_t(surface_info.msaa_samples >= xenos::MsaaSamples::k2X);
+    }
+    rectangle_out.x_pixels = uint32_t(x0) << x_log2;
+    rectangle_out.y_pixels = uint32_t(y0) << y_log2;
+    rectangle_out.width_pixels = uint32_t(x1 - x0) << x_log2;
+    rectangle_out.height_pixels = uint32_t(y1 - y0) << y_log2;
   }
   return overwritten;
 }

@@ -195,6 +195,9 @@ class CommandProcessor {
   bool ExecutePacketType3_NOP(memory::RingBuffer* reader, uint32_t packet, uint32_t count);
   bool ExecutePacketType3_INTERRUPT(memory::RingBuffer* reader, uint32_t packet, uint32_t count);
   bool ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, uint32_t packet, uint32_t count);
+  // Marker of a native record replacing the packets a Direct3D hook skipped.
+  bool ExecutePacketType3_NATIVE_RECORD(memory::RingBuffer* reader, uint32_t packet,
+                                        uint32_t count);
   bool ExecutePacketType3_INDIRECT_BUFFER(memory::RingBuffer* reader, uint32_t packet,
                                           uint32_t count);
   bool ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reader, uint32_t packet, uint32_t count);

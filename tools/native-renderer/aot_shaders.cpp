@@ -242,6 +242,10 @@ int main(int argc, char** argv) {
               int(features.fragment_shader_sample_interlock));
   SpirvShaderTranslator translator(features, false, false, fsi);
 
+  // The runtime only uses a set made by its own translator version.
+  std::ofstream(out_dir / "translator_version.txt")
+      << SpirvShaderTranslator::kTranslatedModuleVersion << "\n";
+
   std::ofstream manifest(out_dir / "manifest.json");
   manifest << "{\n  \"shaders\": [\n";
   bool first_entry = true;

@@ -505,6 +505,12 @@ class VulkanCommandProcessor : public CommandProcessor {
   bool EnsureSwapFxaaSourceImage(uint32_t width, uint32_t height);
   void DestroySwapFxaaSourceImage();
 
+  // Resolution scale for rasterizing the current draw, including samples of
+  // multisampled surfaces kept as pixels of single-sampled render targets.
+  void GetDrawRasterizationScale(uint32_t& scale_x_out, uint32_t& scale_y_out) const;
+  // gpu_null_optional_draw_limit bookkeeping.
+  uint64_t null_optional_draw_frame_ = UINT64_MAX;
+  uint32_t null_optional_draws_this_frame_ = 0;
   void UpdateDynamicState(const draw_util::ViewportInfo& viewport_info, bool primitive_polygonal,
                           reg::RB_DEPTHCONTROL normalized_depth_control);
   void UpdateSystemConstantValues(
