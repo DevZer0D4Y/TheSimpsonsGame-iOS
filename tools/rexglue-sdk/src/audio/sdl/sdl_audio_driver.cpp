@@ -25,6 +25,9 @@
 #include <SDL3/SDL.h>
 
 REXCVAR_DEFINE_BOOL(audio_mute, false, "Audio", "Mute audio output");
+REXCVAR_DEFINE_BOOL(audio_log_underruns, false, "Audio",
+                    "Log how many played frames were silence because no frame was queued, and how "
+                    "many frames the game submitted were entirely silent (diagnostic)");
 
 namespace rex::audio::sdl {
 
@@ -142,6 +145,13 @@ void SDLAudioDriver::SubmitFrame(uint32_t frame_ptr) {
 
   std::memcpy(output_frame, input_frame, frame_samples_ * sizeof(float));
 
+  bool log_underruns = REXCVAR_GET(audio_log_underruns);
+  bool silent_frame = false;
+  if (log_underruns) {
+    silent_frame = std::all_of(output_frame, output_frame + frame_samples_,
+                               [](float sample) { return sample == 0.0f; });
+  }
+
   static uint32_t sdl_submit_count = 0;
   if (sdl_submit_count < 10) {
     REXAPU_DEBUG("SDLAudioDriver::SubmitFrame: frame_ptr={:08X} queued_count={}", frame_ptr,
@@ -153,6 +163,22 @@ void SDLAudioDriver::SubmitFrame(uint32_t frame_ptr) {
     std::unique_lock<std::mutex> guard(frames_mutex_);
     frames_queued_.push(output_frame);
     PROFILE_BUFFER_QUEUE_DEPTH(static_cast<int64_t>(frames_queued_.size()));
+    if (log_underruns) {
+      diag_silent_submitted_frames_ += uint32_t(silent_frame);
+      // About every 5 seconds, logged from the submitting thread rather than
+      // the realtime audio callback.
+      if (++diag_submitted_frames_ >= 960) {
+        REXAPU_INFO(
+            "[audio-diag] played {} frames: {} silence (nothing queued); submitted {}: {} all "
+            "zero; queued now {}",
+            diag_played_frames_, diag_underrun_frames_, diag_submitted_frames_,
+            diag_silent_submitted_frames_, frames_queued_.size());
+        diag_played_frames_ = 0;
+        diag_underrun_frames_ = 0;
+        diag_submitted_frames_ = 0;
+        diag_silent_submitted_frames_ = 0;
+      }
+    }
   }
 }
 
@@ -201,6 +227,8 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
         sdl_callback_count++;
       }
       std::memset(data, 0, len);
+      ++driver->diag_played_frames_;
+      ++driver->diag_underrun_frames_;
       if (!SDL_PutAudioStreamData(stream, data, len)) {
         REXAPU_ERROR("SDL_PutAudioStreamData() failed while filling silence: {}", SDL_GetError());
         break;
@@ -209,6 +237,7 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
     } else {
       auto buffer = driver->frames_queued_.front();
       driver->frames_queued_.pop();
+      ++driver->diag_played_frames_;
       if (REXCVAR_GET(audio_mute)) {
         std::memset(data, 0, len);
       } else {

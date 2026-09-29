@@ -49,6 +49,12 @@ class SDLAudioDriver : public AudioDriver {
   std::queue<float*> frames_queued_ = {};
   std::stack<float*> frames_unused_ = {};
   std::mutex frames_mutex_ = {};
+
+  // audio_log_underruns diagnostics, protected by frames_mutex_.
+  uint32_t diag_played_frames_ = 0;
+  uint32_t diag_underrun_frames_ = 0;
+  uint32_t diag_submitted_frames_ = 0;
+  uint32_t diag_silent_submitted_frames_ = 0;
 };
 
 }  // namespace rex::audio::sdl

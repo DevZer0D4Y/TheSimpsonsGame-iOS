@@ -24,9 +24,16 @@
 #include <rex/thread.h>
 #include <rex/cvar.h>
 
+#include <chrono>
+#include <thread>
+
 REXCVAR_DEFINE_INT32(
     audio_maxqframes, 8, "Audio",
     "Max buffered audio frames (range 4-64). Lower reduces latency but may cause stuttering.");
+
+REXCVAR_DEFINE_BOOL(audio_callback_pacing, true, "Audio",
+                    "Ask the game for audio frames at the hardware's steady rate instead of as "
+                    "fast as queue space frees up (bursts make the game submit silent frames)");
 
 // As with normal Microsoft, there are like twelve different ways to access
 // the audio APIs. Early games use XMA*() methods almost exclusively to touch
@@ -123,6 +130,14 @@ void AudioSystem::WorkerThreadMain() {
   // Initialize driver and ringbuffer.
   Initialize();
 
+  // The hardware asks for one frame (256 samples) every 5.33 ms of playback,
+  // and the game's mixer renders at that pace: called again right away, its
+  // callback submits a frame of silence. But the audio driver frees queue
+  // slots in bursts (a PipeWire period is four frames), so callbacks are
+  // spread out to just under the frame duration, which keeps the queue full.
+  constexpr auto kCallbackInterval = std::chrono::microseconds(5333 * 39 / 40);
+  std::chrono::steady_clock::time_point next_callback[kMaximumClientCount] = {};
+
   // Main run loop.
   uint32_t diag_pump_count = 0;
   while (worker_running_) {
@@ -163,6 +178,14 @@ void AudioSystem::WorkerThreadMain() {
       global_lock.unlock();
 
       if (client_callback) {
+        if (REXCVAR_GET(audio_callback_pacing)) {
+          auto now = std::chrono::steady_clock::now();
+          if (now < next_callback[index]) {
+            std::this_thread::sleep_until(next_callback[index]);
+            now = next_callback[index];
+          }
+          next_callback[index] = now + kCallbackInterval;
+        }
         if (diag_pump_count < 10) {
           REXAPU_DEBUG("AudioWorker: dispatching callback {:08X} with arg {:08X} for client {}",
                        client_callback, client_callback_arg, index);
