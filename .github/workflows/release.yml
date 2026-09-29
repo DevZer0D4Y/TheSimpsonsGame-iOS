@@ -106,8 +106,8 @@ jobs:
           # Unsigned PyInstaller executables with PyInstaller's prebuilt
           # bootloader are a common antivirus false positive (Windows Defender
           # reported Trojan:Win32/Suschil!rfn, #21 and #32). Compile the
-          # bootloader here instead, and give the exe version information and
-          # an icon like any other program.
+          # bootloader here instead, and give the exe version information like
+          # any other program.
           python -m pip install --upgrade pip
           $env:PYINSTALLER_COMPILE_BOOTLOADER = "1"
           python -m pip install --no-binary pyinstaller pyinstaller
@@ -116,7 +116,7 @@ jobs:
             python -m pip install pyinstaller
             if ($LASTEXITCODE -ne 0) { exit 1 }
           }
-          python -m pip install PySide6 pillow
+          python -m pip install PySide6
           if ($LASTEXITCODE -ne 0) { exit 1 }
 
           $v = "${{ inputs.tag }}".TrimStart("vV")
@@ -144,8 +144,7 @@ jobs:
           Set-Content version_info.txt -Value $info -Encoding utf8
 
           pyinstaller --noconfirm --onefile --windowed --noupx --name simpsons-launcher `
-            --icon launcher/icon.png --version-file version_info.txt `
-            --add-data "launcher/ui;ui" launcher/launcher.py
+            --version-file version_info.txt --add-data "launcher/ui;ui" launcher/launcher.py
           if ($LASTEXITCODE -ne 0) { exit 1 }
 
       - name: Fetch ffmpeg (launcher artwork)
