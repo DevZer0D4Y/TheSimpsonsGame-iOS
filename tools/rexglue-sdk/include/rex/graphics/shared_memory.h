@@ -95,6 +95,18 @@ class SharedMemory {
   // the pages they touch, the CPU data is properly loaded to the unmodified
   // regions in those pages.
   void RangeWrittenByGpu(uint32_t start, uint32_t length);
+  // Whether the host GPU buffer has memory behind a guest physical address
+  // (always with a non-sparse buffer).
+  uint32_t host_gpu_memory_sparse_granularity_log2_public() const {
+    return host_gpu_memory_sparse_granularity_log2_;
+  }
+  bool IsHostGpuMemoryAllocated(uint32_t address) const {
+    if (host_gpu_memory_sparse_granularity_log2_ == UINT32_MAX) {
+      return true;
+    }
+    uint32_t allocation = address >> host_gpu_memory_sparse_granularity_log2_;
+    return (host_gpu_memory_sparse_allocated_[allocation >> 6] >> (allocation & 63)) & 1;
+  }
 
  protected:
   SharedMemory(memory::Memory& memory);

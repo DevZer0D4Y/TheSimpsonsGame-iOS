@@ -418,6 +418,12 @@ class SpirvShaderTranslator : public ShaderTranslator {
   uint64_t GetDefaultPixelShaderModification(
       uint32_t dynamic_addressable_register_count) const override;
 
+  // Version of the translated SPIR-V. Increase it whenever a translator change
+  // makes modules translated earlier behave differently, so stored ones (the
+  // ahead-of-time shader set) are no longer used. 1: reads from vertex fetch
+  // constants with zero size are skipped instead of going to guest address 0.
+  static constexpr uint32_t kTranslatedModuleVersion = 1;
+
   static constexpr uint32_t GetSharedMemoryStorageBufferCountLog2(
       uint32_t max_storage_buffer_range) {
     if (max_storage_buffer_range >= 512 * 1024 * 1024) {

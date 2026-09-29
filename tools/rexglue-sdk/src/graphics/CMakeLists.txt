@@ -18,6 +18,7 @@ set(REXGRAPHICS_CORE_SOURCES
 set(REXGRAPHICS_SYSTEM_SOURCES
     graphics_system.cpp
     command_processor.cpp
+    native_records.cpp
     trace_writer.cpp
     pipeline/texture/extent.cpp
     pipeline/texture/util.cpp

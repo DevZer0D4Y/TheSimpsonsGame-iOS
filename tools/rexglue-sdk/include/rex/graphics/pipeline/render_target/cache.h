@@ -160,6 +160,20 @@ class RenderTargetCache {
   // to be discarded.
   uint32_t draw_resolution_scale_x() const { return draw_resolution_scale_x_; }
   uint32_t draw_resolution_scale_y() const { return draw_resolution_scale_y_; }
+
+  // With host render targets, whether multisampled guest surfaces are kept in
+  // single-sampled render targets with every sample as a pixel. In the EDRAM a
+  // 2x / 4x surface is laid out exactly like a single-sampled one of double
+  // height / double width and height, so both views share one host render
+  // target and switching between them needs no ownership transfer. Draws to
+  // such surfaces are rasterized at double resolution along the doubled axes
+  // (exact for the constant-output clears games use this for, full-rate
+  // shading otherwise).
+  bool msaa_as_single_sample() const { return msaa_as_single_sample_; }
+  // Render target key sample count for guest surfaces with the given one.
+  xenos::MsaaSamples GetKeyMsaaSamples(xenos::MsaaSamples msaa_samples) const {
+    return msaa_as_single_sample_ ? xenos::MsaaSamples::k1X : msaa_samples;
+  }
   bool IsDrawResolutionScaled() const {
     return draw_resolution_scale_x() > 1 || draw_resolution_scale_y() > 1;
   }
@@ -181,6 +195,9 @@ class RenderTargetCache {
   uint32_t GetLastUpdateBoundRenderTargets(uint32_t* depth_and_color_formats_out = nullptr) const;
 
  protected:
+  // See msaa_as_single_sample().
+  bool msaa_as_single_sample_ = false;
+
   RenderTargetCache(const RegisterFile& register_file, const memory::Memory& memory,
                     TraceWriter* trace_writer, uint32_t draw_resolution_scale_x,
                     uint32_t draw_resolution_scale_y)

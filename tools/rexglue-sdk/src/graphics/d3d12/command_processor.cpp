@@ -2500,11 +2500,20 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
       // Invalid-type slots already passed classification above (a kVeto draw
       // never reaches this loop), so both valid and admitted-invalid slots
       // just need their buffer ranges resident.
-      if (!shared_memory_->RequestRange(vfetch_constant.address << 2, vfetch_constant.size << 2)) {
+      uint32_t vfetch_request_size = vfetch_constant.size << 2;
+      if (!vfetch_request_size &&
+          invalid_vfetch_verdict != draw_util::InvalidVertexFetchVerdict::kNone) {
+        // An absent optional stream (all-zero fetch constant) the shader may
+        // read, at guest address 0. With tiled shared memory nothing backs that
+        // address, and reading it hung AMD GPUs right after the first cutscene
+        // (#25), like it did on the Steam Deck with Vulkan. Back it with memory.
+        vfetch_request_size = 4096;
+      }
+      if (!shared_memory_->RequestRange(vfetch_constant.address << 2, vfetch_request_size)) {
         REXGPU_ERROR(
             "Failed to request vertex buffer at 0x{:08X} (size {}) in the "
             "shared memory",
-            vfetch_constant.address << 2, vfetch_constant.size << 2);
+            vfetch_constant.address << 2, vfetch_request_size);
         return false;
       }
       vertex_buffers_resident[vfetch_index >> 6] |= vfetch_bit;
