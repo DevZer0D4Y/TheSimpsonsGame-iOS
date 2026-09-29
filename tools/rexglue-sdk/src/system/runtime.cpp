@@ -237,17 +237,21 @@ void Runtime::Shutdown() {
   }
 
   if (graphics_system_) {
+    REXSYS_INFO("Shutdown: graphics");
     graphics_system_->Shutdown();
     graphics_system_.reset();
   }
   if (audio_system_) {
+    REXSYS_INFO("Shutdown: audio");
     audio_system_->Shutdown();
     audio_system_.reset();
   }
   if (input_system_) {
+    REXSYS_INFO("Shutdown: input");
     input_system_->Shutdown();
     input_system_.reset();
   }
+  REXSYS_INFO("Shutdown: kernel and memory");
   kernel_state_.reset();
   function_dispatcher_.reset();
   export_resolver_.reset();

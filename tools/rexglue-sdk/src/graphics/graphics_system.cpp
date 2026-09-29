@@ -253,12 +253,14 @@ void GraphicsSystem::Shutdown() {
   }
 
   if (vsync_worker_thread_) {
+    REXGPU_INFO("Shutdown: vsync thread");
     vsync_worker_running_ = false;
     vsync_worker_thread_->Wait(0, 0, 0, nullptr);
     vsync_worker_thread_.reset();
   }
 
   if (presenter_) {
+    REXGPU_INFO("Shutdown: presenter");
     if (app_context_) {
       app_context_->CallInUIThreadSynchronous([this]() { presenter_.reset(); });
     }
