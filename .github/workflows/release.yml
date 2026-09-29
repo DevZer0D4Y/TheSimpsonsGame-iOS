@@ -31,9 +31,23 @@ env:
 
 jobs:
   # ---------------------------------------------------------------- Windows
+  # Each platform is built twice: the default package for x86-64-v3 CPUs
+  # (AVX2, BMI2 and FMA: Intel Haswell, AMD Excavator or Zen, and newer) and
+  # a NoAVX2 package for older CPUs, which the default one fails to start on
+  # (0xc0000142 on Windows, #28). build_variant.txt tells the launcher which
+  # one is installed, so its updater keeps fetching the right package.
   windows:
-    name: Windows x64 (clang / Vulkan + D3D12)
+    name: Windows x64 ${{ matrix.march }} (clang / Vulkan + D3D12)
     runs-on: windows-latest
+    strategy:
+      matrix:
+        include:
+          - march: x86-64-v3
+            suffix: ""
+            artifact: windows-x64
+          - march: x86-64-v2
+            suffix: "-NoAVX2"
+            artifact: windows-x64-noavx2
     steps:
       - uses: actions/checkout@v4
 
@@ -54,7 +68,8 @@ jobs:
         run: |
           cmake --preset win-amd64-relwithdebinfo `
             -DREXSDK_DIR="$env:GITHUB_WORKSPACE/tools/rexglue-sdk" `
-            "-DCMAKE_C_FLAGS=-march=x86-64-v3" "-DCMAKE_CXX_FLAGS=-march=x86-64-v3"
+            -DSIMPSONS_X86_MARCH=${{ matrix.march }} `
+            "-DCMAKE_C_FLAGS=-march=${{ matrix.march }}" "-DCMAKE_CXX_FLAGS=-march=${{ matrix.march }}"
 
       - name: Build simpsons.exe
         working-directory: simpsons
@@ -88,9 +103,50 @@ jobs:
       - name: Build launcher .exe (native window)
         shell: pwsh
         run: |
-          python -m pip install --upgrade pip pyinstaller PySide6
-          pyinstaller --noconfirm --onefile --windowed --name simpsons-launcher `
+          # Unsigned PyInstaller executables with PyInstaller's prebuilt
+          # bootloader are a common antivirus false positive (Windows Defender
+          # reported Trojan:Win32/Suschil!rfn, #21 and #32). Compile the
+          # bootloader here instead, and give the exe version information and
+          # an icon like any other program.
+          python -m pip install --upgrade pip
+          $env:PYINSTALLER_COMPILE_BOOTLOADER = "1"
+          python -m pip install --no-binary pyinstaller pyinstaller
+          if ($LASTEXITCODE -ne 0) {
+            Write-Warning "Compiling the PyInstaller bootloader failed; using the prebuilt one"
+            python -m pip install pyinstaller
+            if ($LASTEXITCODE -ne 0) { exit 1 }
+          }
+          python -m pip install PySide6 pillow
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+          $v = "${{ inputs.tag }}".TrimStart("vV")
+          $nums = @($v.Split(".") | ForEach-Object { $d = $_ -replace "[^0-9]", ""; if ($d) { [int]$d } else { 0 } })
+          while ($nums.Count -lt 4) { $nums += 0 }
+          $vt = ($nums[0..3] -join ", ")
+          $info = @"
+          VSVersionInfo(
+            ffi=FixedFileInfo(filevers=($vt), prodvers=($vt), mask=0x3f, flags=0x0,
+                              OS=0x40004, fileType=0x1, subtype=0x0, date=(0, 0)),
+            kids=[
+              StringFileInfo([StringTable(u'040904B0', [
+                StringStruct(u'CompanyName', u'The Simpsons Game Recompiled contributors'),
+                StringStruct(u'FileDescription', u'The Simpsons Game Recompiled launcher'),
+                StringStruct(u'FileVersion', u'$v'),
+                StringStruct(u'InternalName', u'simpsons-launcher'),
+                StringStruct(u'LegalCopyright', u'Open source under the GNU GPL v3'),
+                StringStruct(u'OriginalFilename', u'simpsons-launcher.exe'),
+                StringStruct(u'ProductName', u'The Simpsons Game Recompiled'),
+                StringStruct(u'ProductVersion', u'$v')])]),
+              VarFileInfo([VarStruct(u'Translation', [1033, 1200])])
+            ]
+          )
+          "@
+          Set-Content version_info.txt -Value $info -Encoding utf8
+
+          pyinstaller --noconfirm --onefile --windowed --noupx --name simpsons-launcher `
+            --icon launcher/icon.png --version-file version_info.txt `
             --add-data "launcher/ui;ui" launcher/launcher.py
+          if ($LASTEXITCODE -ne 0) { exit 1 }
 
       - name: Fetch ffmpeg (launcher artwork)
         shell: pwsh
@@ -120,6 +176,7 @@ jobs:
           Copy-Item "dist/simpsons-launcher.exe"        release/
           Copy-Item "ffmpeg.exe"                         release/
           Copy-Item "README.md"                         release/
+          Set-Content release/build_variant.txt -Encoding ascii -Value "${{ matrix.march }}"
           Set-Content release/simpsons.toml -Encoding utf8 -Value @(
             '# The Simpsons Game - runtime configuration (edit these via the launcher)',
             'gpu_allow_invalid_fetch_constants = false',
@@ -128,7 +185,7 @@ jobs:
           # Fail here, not for a player after download, if a required file
           # never made it into the package (Copy-Item on a non-matching
           # wildcard is silent, so this is the only real check we get).
-          $required = @("simpsons.exe", "extract-xiso.exe", "simpsons-launcher.exe", "ffmpeg.exe", "rexruntimerd.dll")
+          $required = @("simpsons.exe", "extract-xiso.exe", "simpsons-launcher.exe", "ffmpeg.exe", "rexruntimerd.dll", "build_variant.txt")
           $required += (Get-ChildItem "$bd" -Filter "*.dll" -Name -ErrorAction SilentlyContinue)
           $required += (Get-ChildItem "tools/rexglue-sdk/out/win-amd64" -Filter "*.dll" -Name -ErrorAction SilentlyContinue)
           $required = $required | Select-Object -Unique
@@ -138,18 +195,27 @@ jobs:
             exit 1
           }
 
-          Compress-Archive -Path release/* -DestinationPath TheSimpsonsGame-Recompiled-Windows-x64.zip -Force
+          Compress-Archive -Path release/* -DestinationPath "TheSimpsonsGame-Recompiled-Windows-x64${{ matrix.suffix }}.zip" -Force
 
       - uses: actions/upload-artifact@v4
         with:
-          name: windows-x64
-          path: TheSimpsonsGame-Recompiled-Windows-x64.zip
+          name: ${{ matrix.artifact }}
+          path: TheSimpsonsGame-Recompiled-Windows-x64${{ matrix.suffix }}.zip
 
   # ---------------------------------------------------------------- Linux
   # Best-effort; mirrors the documented Linux build. Uses the Vulkan backend.
   linux:
-    name: Linux x64 (clang / Vulkan)
+    name: Linux x64 ${{ matrix.march }} (clang / Vulkan)
     runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        include:
+          - march: x86-64-v3
+            suffix: ""
+            artifact: linux-x64
+          - march: x86-64-v2
+            suffix: "-NoAVX2"
+            artifact: linux-x64-noavx2
     steps:
       - uses: actions/checkout@v4
 
@@ -172,7 +238,8 @@ jobs:
         run: |
           cmake --preset linux-amd64-relwithdebinfo \
             -DREXSDK_DIR="$GITHUB_WORKSPACE/tools/rexglue-sdk" \
-            "-DCMAKE_C_FLAGS=-march=x86-64-v3" "-DCMAKE_CXX_FLAGS=-march=x86-64-v3"
+            -DSIMPSONS_X86_MARCH=${{ matrix.march }} \
+            "-DCMAKE_C_FLAGS=-march=${{ matrix.march }}" "-DCMAKE_CXX_FLAGS=-march=${{ matrix.march }}"
 
       - name: Build simpsons
         working-directory: simpsons
@@ -211,6 +278,7 @@ jobs:
           cp tools/extract-xiso/build/extract-xiso release/
           cp -r launcher release/launcher
           cp README.md release/
+          printf '%s\n' "${{ matrix.march }}" > release/build_variant.txt
           printf '# The Simpsons Game - runtime configuration (edit these via the launcher)\ngpu_allow_invalid_fetch_constants = false\ngpu_shader_max_cf_iterations = 0\n' > release/simpsons.toml
 
           # launcher.py's DEFAULT_CONFIG assumes the nested dev-tree layout
@@ -245,12 +313,12 @@ jobs:
             exit 1
           fi
 
-          tar -czf TheSimpsonsGame-Recompiled-Linux-x64.tar.gz -C release .
+          tar -czf "TheSimpsonsGame-Recompiled-Linux-x64${{ matrix.suffix }}.tar.gz" -C release .
 
       - uses: actions/upload-artifact@v4
         with:
-          name: linux-x64
-          path: TheSimpsonsGame-Recompiled-Linux-x64.tar.gz
+          name: ${{ matrix.artifact }}
+          path: TheSimpsonsGame-Recompiled-Linux-x64${{ matrix.suffix }}.tar.gz
 
   # ---------------------------------------------------------------- Release
   release:
@@ -258,6 +326,11 @@ jobs:
     needs: [windows, linux]
     runs-on: ubuntu-latest
     steps:
+      # Only the release notes are needed from the repository.
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github
+
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
@@ -275,16 +348,8 @@ jobs:
           make_latest: true
           fail_on_unmatched_files: true
           files: artifacts/**/*
-          body: |
-            First-bring-up build of the recompiled game for Windows (D3D12) and Linux (Vulkan).
-
-            **You must own The Simpsons Game (Xbox 360).** No game content is included —
-            install it from your own legally-owned ISO.
-
-            **Windows:** unzip, run `simpsons-launcher.exe`, click *Install from ISO*, then *Play*.
-
-            ⚠️ Do **not** enable the "Instant character pop-in" patch on Steam Deck / Van Gogh
-            APU class GPUs — it crashes on level load (a kernel BSOD on Windows).
+          # Written for each release in .github/release-notes.md.
+          body_path: .github/release-notes.md
 
       # The release now holds its own copy of the zips, so drop the transient
       # workflow artifacts to keep storage clean.
@@ -293,4 +358,6 @@ jobs:
         with:
           name: |
             windows-x64
+            windows-x64-noavx2
             linux-x64
+            linux-x64-noavx2

@@ -54,6 +54,8 @@ TEST_ROOT = os.path.expanduser("~/simpsons-test")
 REAL_USER_DATA = os.path.expanduser("~/.local/share/simpsons")
 GPU_SYSFS = "/sys/class/drm/card0/device"
 LIB_OVERRIDE = None
+# Game executable to run instead of the regular build (--exe).
+EXE_OVERRIDE = None
 # When set, the game's audio goes to this PipeWire null sink instead of the
 # speakers, and the audio step records its monitor.
 TEST_SINK = None
@@ -102,10 +104,11 @@ def prepare(name, overrides):
         shutil.rmtree(run_dir)
     os.makedirs(run_dir)
     exe = os.path.join(run_dir, "simpsons")
+    source_exe = EXE_OVERRIDE or os.path.join(BUILD_DIR, "simpsons")
     try:
-        os.link(os.path.join(BUILD_DIR, "simpsons"), exe)
+        os.link(source_exe, exe)
     except OSError:
-        shutil.copy2(os.path.join(BUILD_DIR, "simpsons"), exe)
+        shutil.copy2(source_exe, exe)
     user_data = os.path.join(TEST_ROOT, "userdata")
     if not os.path.isdir(user_data):
         shutil.copytree(REAL_USER_DATA, user_data, symlinks=True)
@@ -424,11 +427,13 @@ def main():
     ap.add_argument("script")
     ap.add_argument("--set", action="append", default=[], help="config override key=value")
     ap.add_argument("--lib-dir", default=None)
+    ap.add_argument("--exe", default=None, help="game executable instead of the regular build")
     ap.add_argument("--silent-audio", action="store_true",
                     help="route game audio to a null sink (recordable, not audible)")
     args = ap.parse_args()
-    global LIB_OVERRIDE, TEST_SINK
+    global LIB_OVERRIDE, TEST_SINK, EXE_OVERRIDE
     LIB_OVERRIDE = args.lib_dir
+    EXE_OVERRIDE = args.exe
     sink_module = None
     if args.silent_audio:
         TEST_SINK = "simpsons_test_sink"

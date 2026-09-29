@@ -39,7 +39,7 @@ from pathlib import Path
 # at build time, so packaged builds always know exactly which release they
 # are (otherwise every launcher shipped inside vX.Y.Z.W would compare itself
 # against its own release and nag "update available" forever).
-VERSION = "0.0.5"
+VERSION = "0.0.6.0"
 
 FROZEN = getattr(sys, "frozen", False)
 if FROZEN:
@@ -248,7 +248,9 @@ SETTINGS_SCHEMA = {
     # quality
     "resolution_scale": ("int", 1, True),
     "anisotropic_override": ("int", 3, False),
-    "swap_post_effect": ("str", "none", True),     # none, fxaa, fxaa_extreme
+    # FXAA works on every backend since 0.0.6.0 (it used to show a black
+    # screen with Vulkan on the Steam Deck); new installs start with it.
+    "swap_post_effect": ("str", "fxaa", True),     # none, fxaa, fxaa_extreme
     # fps
     "video_mode_refresh_rate": ("float", 60.0, True),
     # input
@@ -256,7 +258,9 @@ SETTINGS_SCHEMA = {
     "mnk_sensitivity": ("float", 1.0, False),
     # game
     "user_language": ("int", 1, True),
-    "subtitles": ("bool", True, True),
+    # Always show subtitles, even in a new game's first cutscene (the engine
+    # then overrides the in-game option, so it starts off).
+    "subtitles": ("bool", False, True),
     # graphics backend: "" = automatic (Vulkan first, D3D12 fallback on
     # Windows), "vulkan" or "d3d12" to force one. Chosen at startup.
     "gpu": ("str", "", True),
@@ -873,11 +877,13 @@ def restore_saves(name):
 # (regenerated locally from the player's own files), gamedata/, and
 # simpsons.toml (the player's own runtime settings).
 if PLAT == "Windows":
-    UPDATE_MANAGED_PATHS = ["simpsons.exe", "extract-xiso.exe", "ffmpeg.exe", "README.md"]
+    UPDATE_MANAGED_PATHS = ["simpsons.exe", "extract-xiso.exe", "ffmpeg.exe", "README.md",
+                            "build_variant.txt"]
     UPDATE_GLOB_PATHS = ["*.dll"]
 else:
     UPDATE_MANAGED_PATHS = ["simpsons", "extract-xiso", "launcher/ui",
-                            "launcher/launcher.py", "launcher/simpsons-launcher.sh", "README.md"]
+                            "launcher/launcher.py", "launcher/simpsons-launcher.sh", "README.md",
+                            "build_variant.txt"]
     UPDATE_GLOB_PATHS = ["*.so*"]
 # The launcher's own executable (Windows only, PyInstaller-frozen release)
 # needs special handling: it can't overwrite its own running file's content,
@@ -885,9 +891,51 @@ else:
 UPDATE_SELF_EXE = "simpsons-launcher.exe"
 
 
-def _platform_asset_name():
-    return ("TheSimpsonsGame-Recompiled-Windows-x64.zip" if PLAT == "Windows"
-            else "TheSimpsonsGame-Recompiled-Linux-x64.tar.gz")
+# Releases come in two builds: the default one for x86-64-v3 CPUs (AVX2, BMI2
+# and FMA: Intel Haswell, AMD Excavator or Zen, and newer), and a NoAVX2 one
+# for older CPUs. The default build fails to start on those with error
+# 0xc0000142 on Windows (#28). Packages name their build in build_variant.txt.
+BUILD_VARIANT_FILE = ROOT / "build_variant.txt"
+VARIANT_DEFAULT = "x86-64-v3"
+VARIANT_NO_AVX2 = "x86-64-v2"
+
+
+def cpu_runs_default_build():
+    """Whether this CPU has the x86-64-v3 features the default build uses."""
+    try:
+        if PLAT == "Windows":
+            import ctypes
+            # PF_AVX2_INSTRUCTIONS_AVAILABLE: also false when the OS does not
+            # enable AVX. Every CPU with AVX2 also has the rest of x86-64-v3.
+            return bool(ctypes.windll.kernel32.IsProcessorFeaturePresent(40))
+        with open("/proc/cpuinfo", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if line.startswith("flags"):
+                    flags = set(line.split(":", 1)[1].split())
+                    return {"avx2", "bmi1", "bmi2", "fma", "movbe"} <= flags
+    except Exception:  # noqa: BLE001
+        pass
+    # Unknown: assume the default build, which fits nearly every PC today.
+    return True
+
+
+def installed_build_variant():
+    """The build of the installed package, or None for a source tree or a
+    package from before 0.0.6.0 (all of which were default builds)."""
+    try:
+        return BUILD_VARIANT_FILE.read_text(encoding="utf-8").strip() or None
+    except OSError:
+        return None
+
+
+def wanted_build_variant():
+    return VARIANT_DEFAULT if cpu_runs_default_build() else VARIANT_NO_AVX2
+
+
+def _platform_asset_name(variant=VARIANT_DEFAULT):
+    suffix = "-NoAVX2" if variant == VARIANT_NO_AVX2 else ""
+    return (f"TheSimpsonsGame-Recompiled-Windows-x64{suffix}.zip" if PLAT == "Windows"
+            else f"TheSimpsonsGame-Recompiled-Linux-x64{suffix}.tar.gz")
 
 
 def check_updates():
@@ -916,8 +964,14 @@ def check_updates():
                 return
             raise
         tag = data.get("tag_name", "")
-        asset_name = _platform_asset_name()
+        wanted_variant = wanted_build_variant()
+        asset_name = _platform_asset_name(wanted_variant)
         asset = next((a for a in data.get("assets", []) if a.get("name") == asset_name), None)
+        # An installed package this CPU cannot run (the default build on a CPU
+        # without AVX2) is replaced even without a newer version.
+        installed_variant = installed_build_variant()
+        wrong_build = (FROZEN or installed_variant is not None) and \
+            (installed_variant or VARIANT_DEFAULT) != wanted_variant
 
         def _ver_tuple(s):
             # "v0.3.1" / "0.3.1" -> (0, 3, 1); malformed parts count as 0 so a
@@ -935,7 +989,12 @@ def check_updates():
         # Strictly newer only: a mismatched-but-older tag must never nag
         # every user with a bogus "update available".
         is_newer = bool(tag) and _ver_tuple(tag) > _ver_tuple(VERSION)
-        if is_newer and asset:
+        if wrong_build and asset:
+            update_state.update(checked=True, update_available=True,
+                                download_url=asset["browser_download_url"], latest_tag=tag,
+                                msg=f"This CPU needs the build for older CPUs (no AVX2): "
+                                    f"install {tag} for it now.")
+        elif is_newer and asset:
             update_state.update(checked=True, update_available=True,
                                 download_url=asset["browser_download_url"], latest_tag=tag,
                                 msg=f"Update available: {tag} (you're on {VERSION})")
@@ -1695,6 +1754,12 @@ def launch_game():
             return False, ("Game data is incomplete: the movies folder is missing from "
                            f"{GAMEDATA}. Re-run the install from your ISO in the "
                            "Install tab.")
+        if (installed_build_variant() or VARIANT_DEFAULT) == VARIANT_DEFAULT and \
+                (FROZEN or installed_build_variant()) and not cpu_runs_default_build():
+            return False, ("This build needs a CPU with AVX2 (Intel from 2013 or AMD from "
+                           "2015 on). Open the About tab and check for updates to install "
+                           "the build for older CPUs, or download the NoAVX2 package from "
+                           "the Releases page.")
         start_save_guard()
         repaired = repair_saves()
         if repaired:
@@ -2018,6 +2083,17 @@ def open_browser(url):
 
 
 def main():
+    if "--play" in sys.argv:
+        # Start the game straight away without the launcher window, e.g. from
+        # a Steam shortcut in Game Mode (#18, #20). Settings, save protection
+        # and the environment are handled exactly as by the Play button.
+        ok, message = launch_game()
+        if not ok:
+            print(message)
+            sys.exit(1)
+        if game_proc:
+            game_proc.wait()
+        return
     # In the background: a full artwork sweep can take a minute on a slow
     # disk, and players were staring at nothing until it finished.
     threading.Thread(target=generate_art, daemon=True).start()
