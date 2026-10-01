@@ -11,6 +11,7 @@
  */
 
 #include <array>
+#include <functional>
 #include <memory>
 #include <unordered_map>
 #include <utility>
@@ -137,6 +138,11 @@ class VulkanTextureCache final : public TextureCache {
   // textures that sample it instead of being reloaded from guest memory. Must be
   // set before textures are created, as it affects image creation.
   void SetNativeResolveTexturesEnabled(bool enabled) { native_resolve_textures_enabled_ = enabled; }
+  // Called before scaled resolve memory is read by a texture load, with the
+  // unscaled range, to write back resolved data only held in textures so far.
+  void SetScaledResolveMemoryFlusher(std::function<void(uint32_t start, uint32_t length)> flusher) {
+    scaled_resolve_memory_flusher_ = std::move(flusher);
+  }
   struct NativeResolveTarget {
     // Opaque texture reference, valid within the resolve it was found for.
     void* texture = nullptr;
@@ -158,6 +164,13 @@ class VulkanTextureCache final : public TextureCache {
   // To be called once the target's memory range has been marked as resolved and
   // the texture data has been written, so it matches guest memory again.
   void EndNativeResolveWrite(const NativeResolveTarget& target);
+  // Write-back of native resolve targets to the scaled resolve memory
+  // (native_resolve_scaled_lazy_memory). The texture is the opaque reference of
+  // a NativeResolveTarget, kept alive while pending.
+  void AddScaledMemoryPending(void* texture, int32_t delta);
+  // Transitions the texture for reading in the write-back compute shader, and
+  // returns its raw bits (integer) view.
+  VkImageView BeginScaledMemoryWriteback(void* texture);
 
  protected:
   bool IsSignedVersionSeparateForFormat(TextureKey key) const override;
@@ -220,6 +233,9 @@ class VulkanTextureCache final : public TextureCache {
       kGuestShaderSampled,
       kSwapSampled,
       kNativeResolveWrite,
+      // Read by a compute shader writing its resolved data back to the scaled
+      // resolve memory.
+      kScaledMemoryWriteback,
     };
 
     // Takes ownership of the image and its memory.
@@ -414,6 +430,7 @@ class VulkanTextureCache final : public TextureCache {
   uint8_t unsupported_format_features_used_[64] = {};
 
   bool native_resolve_textures_enabled_ = false;
+  std::function<void(uint32_t start, uint32_t length)> scaled_resolve_memory_flusher_;
   std::unordered_map<VkFormat, bool> color_attachment_format_support_;
 
   uint32_t sampler_max_count_;

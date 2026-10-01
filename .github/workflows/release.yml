@@ -230,7 +230,7 @@ jobs:
             libxcursor-dev libxi-dev libxfixes-dev libxss-dev \
             libxkbcommon-dev libxkbcommon-x11-dev \
             libwayland-dev wayland-protocols libudev-dev \
-            libasound2-dev libpulse-dev libpipewire-0.3-dev
+            libasound2-dev libpulse-dev libpipewire-0.3-dev glslang-tools
 
       - name: Configure (game + SDK, Vulkan)
         working-directory: simpsons
@@ -277,6 +277,11 @@ jobs:
           cp tools/extract-xiso/build/extract-xiso release/
           cp -r launcher release/launcher
           cp README.md release/
+          # Native replacement shaders for the most expensive passes, used by
+          # the runtime from native_shaders next to the executable (sets for
+          # 1x and 2x internal resolution; bit-identical to the translation).
+          python3 tools/native-renderer/native_shaders/build_native_shaders.py \
+            release/native_shaders 0000400000000001
           printf '%s\n' "${{ matrix.march }}" > release/build_variant.txt
           printf '# The Simpsons Game - runtime configuration (edit these via the launcher)\ngpu_allow_invalid_fetch_constants = false\ngpu_shader_max_cf_iterations = 0\n' > release/simpsons.toml
 

@@ -279,6 +279,13 @@ void TextureCache::CompletedSubmissionUpdated(uint64_t completed_submission_inde
     if (!limit_hard_exceeded && (texture->last_usage_time() + limit_soft_lifetime) > current_time) {
       break;
     }
+    if (texture->scaled_memory_pending()) {
+      // Holds resolved data not written back to the scaled resolve memory yet:
+      // keep it, moving it to the end of the usage list (with the current
+      // submission index, so this loop stops when it comes around again).
+      texture->MarkAsUsed();
+      continue;
+    }
     if (!destroyed_any) {
       destroyed_any = true;
       // The texture being destroyed might have been bound in the previous

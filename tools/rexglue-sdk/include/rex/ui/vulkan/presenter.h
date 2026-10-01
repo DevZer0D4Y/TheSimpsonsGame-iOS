@@ -230,12 +230,10 @@ class VulkanPresenter final : public Presenter {
 
   enum GuestOutputPaintPipelineLayoutIndex : size_t {
     kGuestOutputPaintPipelineLayoutIndexBilinear,
-#if defined(REX_HAS_FIDELITYFX_SDK)
     kGuestOutputPaintPipelineLayoutIndexCasSharpen,
     kGuestOutputPaintPipelineLayoutIndexCasResample,
     kGuestOutputPaintPipelineLayoutIndexFsrEasu,
     kGuestOutputPaintPipelineLayoutIndexFsrRcas,
-#endif
 
     kGuestOutputPaintPipelineLayoutCount,
   };
@@ -246,7 +244,6 @@ class VulkanPresenter final : public Presenter {
       case GuestOutputPaintEffect::kBilinear:
       case GuestOutputPaintEffect::kBilinearDither:
         return kGuestOutputPaintPipelineLayoutIndexBilinear;
-#if defined(REX_HAS_FIDELITYFX_SDK)
       case GuestOutputPaintEffect::kCasSharpen:
       case GuestOutputPaintEffect::kCasSharpenDither:
         return kGuestOutputPaintPipelineLayoutIndexCasSharpen;
@@ -258,7 +255,6 @@ class VulkanPresenter final : public Presenter {
       case GuestOutputPaintEffect::kFsrRcas:
       case GuestOutputPaintEffect::kFsrRcasDither:
         return kGuestOutputPaintPipelineLayoutIndexFsrRcas;
-#endif
       default:
         assert_unhandled_case(effect);
         return kGuestOutputPaintPipelineLayoutCount;

@@ -220,6 +220,21 @@ class DeferredCommandBuffer {
                 regions, sizeof(VkBufferImageCopy) * region_count);
   }
 
+  void CmdVkCopyImageToBuffer(VkImage src_image, VkImageLayout src_image_layout,
+                              VkBuffer dst_buffer, uint32_t region_count,
+                              const VkBufferImageCopy* regions) {
+    const size_t header_size =
+        rex::align(sizeof(ArgsVkCopyImageToBuffer), alignof(VkBufferImageCopy));
+    uint8_t* args_ptr = reinterpret_cast<uint8_t*>(WriteCommand(
+        Command::kVkCopyImageToBuffer, header_size + sizeof(VkBufferImageCopy) * region_count));
+    auto& args = *reinterpret_cast<ArgsVkCopyImageToBuffer*>(args_ptr);
+    args.src_image = src_image;
+    args.src_image_layout = src_image_layout;
+    args.dst_buffer = dst_buffer;
+    args.region_count = region_count;
+    std::memcpy(args_ptr + header_size, regions, sizeof(VkBufferImageCopy) * region_count);
+  }
+
   void CmdVkCopyQueryPoolResults(VkQueryPool query_pool, uint32_t first_query, uint32_t query_count,
                                  VkBuffer dst_buffer, VkDeviceSize dst_offset, VkDeviceSize stride,
                                  VkQueryResultFlags flags) {
@@ -386,6 +401,7 @@ class DeferredCommandBuffer {
     kVkCopyBuffer,
     kVkFillBuffer,  // HAND PATCH
     kVkCopyBufferToImage,
+    kVkCopyImageToBuffer,
     kVkCopyQueryPoolResults,
     kVkDispatch,
     kVkDraw,
@@ -511,6 +527,15 @@ class DeferredCommandBuffer {
     VkBuffer src_buffer;
     VkImage dst_image;
     VkImageLayout dst_image_layout;
+    uint32_t region_count;
+    // Followed by aligned VkBufferImageCopy[].
+    static_assert(alignof(VkBufferImageCopy) <= alignof(uintmax_t));
+  };
+
+  struct ArgsVkCopyImageToBuffer {
+    VkImage src_image;
+    VkImageLayout src_image_layout;
+    VkBuffer dst_buffer;
     uint32_t region_count;
     // Followed by aligned VkBufferImageCopy[].
     static_assert(alignof(VkBufferImageCopy) <= alignof(uintmax_t));

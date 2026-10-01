@@ -110,6 +110,11 @@ class CommandProcessor {
   virtual void IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                          uint32_t frontbuffer_height) = 0;
 
+  // Diagnostic (gpu_wait_stats): host ticks the command processor thread spent
+  // blocked on host GPU fences, reported by the backend. full_sync is set for
+  // waits for all submitted work rather than for an older frame.
+  static void RecordHostGpuFenceWait(uint64_t host_ticks, bool full_sync);
+
   // May be called not only from the command processor thread when the command
   // processor is paused, and the termination of this function may be explicitly
   // awaited.
@@ -305,6 +310,10 @@ class CommandProcessor {
   // Set by backend command processors to their legacy memexport readback cvar
   // name (for explicit-override compatibility).
   const char* legacy_readback_memexport_cvar_name_ = nullptr;
+  // Whether the legacy cvar above has a non-default value: -1 until checked.
+  // The check is a string lookup in the cvar registry, too slow for every
+  // draw, so it's cached and redone once per frame (at the swap).
+  mutable int8_t legacy_readback_memexport_overridden_ = -1;
 
  private:
   reg::DC_LUT_30_COLOR gamma_ramp_256_entry_table_[256] = {};

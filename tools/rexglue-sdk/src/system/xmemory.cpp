@@ -10,6 +10,7 @@
  */
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <utility>
 
@@ -38,6 +39,30 @@ REXCVAR_DEFINE_BOOL(protect_on_release, false, "Memory",
 REXCVAR_DEFINE_BOOL(scribble_heap, false, "Memory", "Scribble 0xCD into all allocated heap memory");
 
 namespace rex::memory {
+
+// Diagnostic counters for the command processor's gpu_wait_stats log: host
+// page protection changes that arm GPU write watches, and the guest write
+// faults that fire them (host ticks).
+std::atomic<uint64_t> g_watch_protect_calls{0};
+std::atomic<uint64_t> g_watch_protect_ticks{0};
+std::atomic<uint64_t> g_watch_fault_count{0};
+std::atomic<uint64_t> g_watch_fault_ticks{0};
+// Per 1 MB region of physical memory: protect calls, pages protected, write
+// faults; and protect calls per physical heap view (A, C, E).
+std::atomic<uint32_t> g_watch_region_protects[512];
+std::atomic<uint32_t> g_watch_region_protect_pages[512];
+std::atomic<uint32_t> g_watch_region_faults[512];
+std::atomic<uint32_t> g_watch_view_protects[3];
+
+static void CountWatchProtect(uint32_t physical_address, uint32_t pages, uint32_t heap_base) {
+  uint32_t region = (physical_address >> 20) & 511;
+  g_watch_region_protects[region].fetch_add(1, std::memory_order_relaxed);
+  g_watch_region_protect_pages[region].fetch_add(pages, std::memory_order_relaxed);
+  uint32_t view = (heap_base >> 29) - 5;
+  if (view < 3) {
+    g_watch_view_protects[view].fetch_add(1, std::memory_order_relaxed);
+  }
+}
 
 uint32_t get_page_count(uint32_t value, uint32_t page_size, uint32_t page_size_shift) {
   return rex::round_up(value, page_size) >> page_size_shift;
@@ -473,8 +498,15 @@ bool Memory::AccessViolationCallback(std::unique_lock<std::recursive_mutex> glob
     // Will be rounded to physical page boundaries internally, so just pass 1 as
     // the length - guranteed not to cross page boundaries also.
     auto physical_heap = static_cast<PhysicalHeap*>(heap);
-    if (physical_heap->TriggerCallbacks(std::move(global_lock_locked_once), virtual_address, 1,
-                                        is_write, false)) {
+    uint64_t fault_start_tick = rex::chrono::Clock::QueryHostTickCount();
+    bool handled = physical_heap->TriggerCallbacks(std::move(global_lock_locked_once),
+                                                   virtual_address, 1, is_write, false);
+    g_watch_fault_count.fetch_add(1, std::memory_order_relaxed);
+    g_watch_region_faults[(physical_heap->GetPhysicalAddress(virtual_address) >> 20) & 511]
+        .fetch_add(1, std::memory_order_relaxed);
+    g_watch_fault_ticks.fetch_add(rex::chrono::Clock::QueryHostTickCount() - fault_start_tick,
+                                  std::memory_order_relaxed);
+    if (handled) {
       return true;
     }
   }
@@ -1884,16 +1916,28 @@ void PhysicalHeap::EnableAccessCallbacks(uint32_t physical_address, uint32_t len
       }
     } else {
       if (protect_system_page_first != UINT32_MAX) {
+        uint64_t protect_start_tick = rex::chrono::Clock::QueryHostTickCount();
         rex::memory::Protect(protect_base + protect_system_page_first * system_page_size_,
                              (i - protect_system_page_first) * system_page_size_, protect_access);
+        g_watch_protect_calls.fetch_add(1, std::memory_order_relaxed);
+        CountWatchProtect(physical_address, i - protect_system_page_first, heap_base_);
+        g_watch_protect_ticks.fetch_add(
+            rex::chrono::Clock::QueryHostTickCount() - protect_start_tick,
+            std::memory_order_relaxed);
         protect_system_page_first = UINT32_MAX;
       }
     }
   }
   if (protect_system_page_first != UINT32_MAX) {
+    uint64_t protect_start_tick = rex::chrono::Clock::QueryHostTickCount();
     rex::memory::Protect(protect_base + protect_system_page_first * system_page_size_,
                          (system_page_last + 1 - protect_system_page_first) * system_page_size_,
                          protect_access);
+    g_watch_protect_calls.fetch_add(1, std::memory_order_relaxed);
+    CountWatchProtect(physical_address, system_page_last + 1 - protect_system_page_first,
+                      heap_base_);
+    g_watch_protect_ticks.fetch_add(rex::chrono::Clock::QueryHostTickCount() - protect_start_tick,
+                                    std::memory_order_relaxed);
   }
 }
 

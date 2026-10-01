@@ -14,6 +14,7 @@
 #include <cctype>
 #include <utility>
 
+#include <rex/chrono/clock.h>
 #include <rex/assert.h>
 #include <rex/cvar.h>
 #include <rex/logging.h>
@@ -44,7 +45,6 @@ REXCVAR_DEFINE_INT32(present_safe_area_y, 90, "UI/Presenter",
                      "Vertical safe area percentage (0-100)")
     .range(0, 100);
 
-#if defined(REX_HAS_FIDELITYFX_SDK)
 REXCVAR_DEFINE_STRING(present_effect, "bilinear", "UI/Presenter",
                       "Guest output effect: bilinear, cas, fsr, fsr2, fsr3")
     .allowed({"bilinear", "cas", "fsr", "fsr2", "fsr3"})
@@ -75,11 +75,6 @@ REXCVAR_DEFINE_STRING(
     "Temporal FSR quality mode: auto, nativeaa, quality, balanced, performance, ultra_performance")
     .allowed({"auto", "nativeaa", "quality", "balanced", "performance", "ultra_performance"})
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
-#else
-REXCVAR_DEFINE_STRING(present_effect, "bilinear", "UI/Presenter", "Guest output effect: bilinear")
-    .allowed({"bilinear"})
-    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
-#endif
 
 REXCVAR_DEFINE_BOOL(present_dither, false, "UI/Presenter",
                     "Enable output dithering in the final present pass")
@@ -96,7 +91,6 @@ GuestOutputPaintConfig::Effect ParsePresentEffect(const std::string& effect_name
   std::string lowered = effect_name;
   std::transform(lowered.begin(), lowered.end(), lowered.begin(),
                  [](unsigned char c) { return char(std::tolower(c)); });
-#if defined(REX_HAS_FIDELITYFX_SDK)
   if (lowered == "cas") {
     return GuestOutputPaintConfig::Effect::kCas;
   }
@@ -109,11 +103,9 @@ GuestOutputPaintConfig::Effect ParsePresentEffect(const std::string& effect_name
   if (lowered == "fsr3") {
     return GuestOutputPaintConfig::Effect::kFsr3;
   }
-#endif
   return GuestOutputPaintConfig::Effect::kBilinear;
 }
 
-#if defined(REX_HAS_FIDELITYFX_SDK)
 bool IsTemporalFsrCompatibilityEffect(GuestOutputPaintConfig::Effect effect) {
   return effect == GuestOutputPaintConfig::Effect::kFsr2 ||
          effect == GuestOutputPaintConfig::Effect::kFsr3;
@@ -253,25 +245,20 @@ void LogTemporalFsrQualityModeInputLimitOnce() {
         "guest output; using guest output size");
   }
 }
-#endif  // defined(REX_HAS_FIDELITYFX_SDK)
 
 GuestOutputPaintConfig BuildGuestOutputPaintConfigFromCVar() {
   GuestOutputPaintConfig config;
   GuestOutputPaintConfig::Effect parsed_effect = ParsePresentEffect(REXCVAR_GET(present_effect));
-#if defined(REX_HAS_FIDELITYFX_SDK)
   if (IsTemporalFsrCompatibilityEffect(parsed_effect)) {
     LogTemporalFsrCompatibilityPathOnce();
   }
-#endif
   config.SetAllowOverscanCutoff(REXCVAR_GET(present_allow_overscan_cutoff));
   config.SetEffect(parsed_effect);
-#if defined(REX_HAS_FIDELITYFX_SDK)
   config.SetCasAdditionalSharpness(float(REXCVAR_GET(present_cas_additional_sharpness)));
   config.SetFsrMaxUpsamplingPasses(
       uint32_t(std::max(int32_t(1), REXCVAR_GET(present_fsr_max_upsampling_passes))));
   config.SetFsrSharpnessReduction(float(REXCVAR_GET(present_fsr_sharpness_reduction)));
   config.SetFsrQualityMode(ParsePresentFsrQualityMode(REXCVAR_GET(present_fsr_quality_mode)));
-#endif
   config.SetDither(REXCVAR_GET(present_dither));
   return config;
 }
@@ -280,6 +267,26 @@ GuestOutputPaintConfig BuildGuestOutputPaintConfigFromCVar() {
 
 namespace rex {
 namespace ui {
+
+// Successful host presents, for the command processor's gpu_wait_stats log.
+std::atomic<uint64_t> g_host_presents{0};
+// Longest times (host ticks) since the last gpu_wait_stats log: 0 awaiting an
+// old paint submission, 1 acquiring a swapchain image, 2 vkQueuePresentKHR,
+// 3 other waits in painting, 4 refreshing the guest output, 5 painting overall,
+// 6 getting a fence for the paint submission, 7 waiting for the queue lock for
+// it, 8 its vkQueueSubmit, 9 recording the paint commands.
+std::atomic<uint64_t> g_present_max_ticks[10] = {};
+// Total times of the same, for averages.
+std::atomic<uint64_t> g_present_total_ticks[10] = {};
+
+void RecordPresentTime(uint32_t kind, uint64_t ticks) {
+  g_present_total_ticks[kind].fetch_add(ticks, std::memory_order_relaxed);
+  std::atomic<uint64_t>& max_ticks = g_present_max_ticks[kind];
+  uint64_t current = max_ticks.load(std::memory_order_relaxed);
+  while (ticks > current &&
+         !max_ticks.compare_exchange_weak(current, ticks, std::memory_order_relaxed)) {
+  }
+}
 
 void Presenter::FatalErrorHostGpuLossCallback([[maybe_unused]] bool is_responsible,
                                               [[maybe_unused]] bool statically_from_ui_thread) {
@@ -563,8 +570,12 @@ bool Presenter::RefreshGuestOutput(
   writable_properties.is_8bpc = false;
   bool is_active = writable_properties.IsActive();
   if (is_active) {
-    if (!RefreshGuestOutputImpl(guest_output_mailbox_writable_, frontbuffer_width,
-                                frontbuffer_height, refresher, writable_properties.is_8bpc)) {
+    uint64_t refresh_start_tick = rex::chrono::Clock::QueryHostTickCount();
+    bool refreshed = RefreshGuestOutputImpl(guest_output_mailbox_writable_, frontbuffer_width,
+                                            frontbuffer_height, refresher,
+                                            writable_properties.is_8bpc);
+    RecordPresentTime(4, rex::chrono::Clock::QueryHostTickCount() - refresh_start_tick);
+    if (!refreshed) {
       // If failed to refresh, don't send the currently writable image to the
       // mailbox as it may be in an undefined state. Don't disable the guest
       // output either though because the failure may be something transient.
@@ -632,7 +643,9 @@ bool Presenter::RefreshGuestOutput(
       case PaintMode::kGuestOutputThreadImmediately:
         // Both painting and window paint requesting are accessible.
         if (surface_paint_connection_state_ == SurfacePaintConnectionState::kConnectedPaintable) {
+          uint64_t paint_start_tick = rex::chrono::Clock::QueryHostTickCount();
           paint_result = PaintAndPresent(false);
+          RecordPresentTime(5, rex::chrono::Clock::QueryHostTickCount() - paint_start_tick);
           if (surface_paint_connection_state_ == SurfacePaintConnectionState::kConnectedOutdated) {
             RequestPaintOrConnectionRecoveryViaWindow(true);
           }
@@ -663,7 +676,6 @@ void Presenter::SetGuestOutputPaintConfigFromUIThread(const GuestOutputPaintConf
     modified = true;
     request_repaint = true;
   }
-#if defined(REX_HAS_FIDELITYFX_SDK)
   if (guest_output_paint_config_.GetFsrSharpnessReduction() !=
       new_config.GetFsrSharpnessReduction()) {
     modified = true;
@@ -683,12 +695,10 @@ void Presenter::SetGuestOutputPaintConfigFromUIThread(const GuestOutputPaintConf
       request_repaint = true;
     }
   }
-#endif
   if (guest_output_paint_config_.GetDither() != new_config.GetDither()) {
     modified = true;
     request_repaint = true;
   }
-#if defined(REX_HAS_FIDELITYFX_SDK)
   if (guest_output_paint_config_.GetFsrQualityMode() != new_config.GetFsrQualityMode()) {
     modified = true;
     if (new_config.GetEffect() == GuestOutputPaintConfig::Effect::kFsr2 ||
@@ -696,7 +706,6 @@ void Presenter::SetGuestOutputPaintConfigFromUIThread(const GuestOutputPaintConf
       request_repaint = true;
     }
   }
-#endif
   if (modified) {
     {
       std::unique_lock<std::mutex> config_lock(guest_output_paint_config_mutex_);
@@ -1034,7 +1043,6 @@ Presenter::GuestOutputPaintFlow Presenter::GetGuestOutputPaintFlow(
   uint32_t output_width_clamped = std::min(output_width, max_rt_width);
   uint32_t output_height_clamped = std::min(output_height, max_rt_height);
 
-#if defined(REX_HAS_FIDELITYFX_SDK)
   if (config.GetEffect() == GuestOutputPaintConfig::Effect::kCas ||
       config.GetEffect() == GuestOutputPaintConfig::Effect::kFsr ||
       config.GetEffect() == GuestOutputPaintConfig::Effect::kFsr2 ||
@@ -1149,7 +1157,6 @@ Presenter::GuestOutputPaintFlow Presenter::GetGuestOutputPaintFlow(
                                               : GuestOutputPaintEffect::kCasResample;
     }
   }
-#endif  // defined(REX_HAS_FIDELITYFX_SDK)
 
   std::pair<uint32_t, uint32_t>* last_pre_bilinear_effect_size =
       flow.effect_count ? &flow.effect_output_sizes[flow.effect_count - 1] : nullptr;
@@ -1160,12 +1167,10 @@ Presenter::GuestOutputPaintFlow Presenter::GetGuestOutputPaintFlow(
     // Clamp the output size of the last effect to the maximum render target
     // size because it will go to an intermediate image now.
     if (last_pre_bilinear_effect_size) {
-#if defined(REX_HAS_FIDELITYFX_SDK)
       // RCAS only works for 1:1, clamping must be done explicitly for FSR.
       assert_false(flow.effects[flow.effect_count - 1] == GuestOutputPaintEffect::kFsrRcas &&
                    (last_pre_bilinear_effect_size->first > max_rt_width ||
                     last_pre_bilinear_effect_size->second > max_rt_height));
-#endif
       last_pre_bilinear_effect_size->first =
           std::min(last_pre_bilinear_effect_size->first, max_rt_width);
       last_pre_bilinear_effect_size->second =
@@ -1192,7 +1197,6 @@ Presenter::GuestOutputPaintFlow Presenter::GetGuestOutputPaintFlow(
           last_effect = GuestOutputPaintEffect::kBilinearDither;
         }
         break;
-#if defined(REX_HAS_FIDELITYFX_SDK)
       case GuestOutputPaintEffect::kCasSharpen:
         last_effect = GuestOutputPaintEffect::kCasSharpenDither;
         break;
@@ -1202,7 +1206,6 @@ Presenter::GuestOutputPaintFlow Presenter::GetGuestOutputPaintFlow(
       case GuestOutputPaintEffect::kFsrRcas:
         last_effect = GuestOutputPaintEffect::kFsrRcasDither;
         break;
-#endif
       default:
         break;
     }
@@ -1502,6 +1505,9 @@ Presenter::PaintResult Presenter::PaintAndPresent(bool execute_ui_drawers) {
   assert_false(execute_ui_drawers && !is_in_ui_thread_paint_);
   assert_true(surface_paint_connection_state_ == SurfacePaintConnectionState::kConnectedPaintable);
   PaintResult result = PaintAndPresentImpl(execute_ui_drawers);
+  if (result == PaintResult::kPresented || result == PaintResult::kPresentedSuboptimal) {
+    g_host_presents.fetch_add(1, std::memory_order_relaxed);
+  }
   switch (result) {
     case PaintResult::kPresented:
       surface_paint_connection_was_optimal_at_successful_paint_ = true;

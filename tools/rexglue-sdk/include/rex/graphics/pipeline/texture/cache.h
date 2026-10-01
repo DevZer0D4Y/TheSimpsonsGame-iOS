@@ -236,6 +236,14 @@ class TextureCache {
     // destroyed while still in use.
     void MarkAsUsed();
 
+    // Native resolves whose scaled resolve memory hasn't been written yet: the
+    // texture holds the only copy of that data, so it's kept alive until the
+    // render target cache writes it back (see native_resolve_scaled_lazy_memory).
+    uint32_t scaled_memory_pending() const { return scaled_memory_pending_; }
+    void AddScaledMemoryPending(int32_t delta) {
+      scaled_memory_pending_ = uint32_t(int32_t(scaled_memory_pending_) + delta);
+    }
+
     void LogAction(const char* action) const;
 
    protected:
@@ -258,6 +266,7 @@ class TextureCache {
 
     uint64_t last_usage_submission_index_;
     uint64_t last_usage_time_;
+    uint32_t scaled_memory_pending_ = 0;
     Texture* used_previous_;
     Texture* used_next_;
     bool in_usage_list_;

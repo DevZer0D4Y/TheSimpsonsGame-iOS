@@ -402,9 +402,12 @@ class Run:
             return
         # A window-manager close request takes the same clean shutdown path as
         # the player closing the window; the engine does not act on SIGTERM.
+        # windowquit asks the window manager to close the window; windowclose
+        # destroys the X window out from under GTK, which then sometimes dies
+        # on an X error (BadWindow from a cursor change) with exit code 1.
         w = self.window()
         if w:
-            subprocess.run(["xdotool", "windowclose", w], env=self.env(), capture_output=True)
+            subprocess.run(["xdotool", "windowquit", w], env=self.env(), capture_output=True)
             try:
                 self.proc.wait(timeout=60)
                 self.note(f"closed cleanly rc={self.proc.returncode}")

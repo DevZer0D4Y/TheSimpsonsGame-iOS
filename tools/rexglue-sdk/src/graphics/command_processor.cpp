@@ -11,12 +11,15 @@
 
 #include <atomic>
 #include <algorithm>
+#include <condition_variable>
+#include <mutex>
 #include <bitset>
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 #include <fmt/format.h>
@@ -29,9 +32,11 @@
 #include <rex/graphics/flags.h>
 #include <rex/graphics/graphics_system.h>
 #include <rex/graphics/native_records.h>
+#include <rex/graphics/ring_progress.h>
 #include <rex/graphics/pipeline/texture/info.h>
 #include <rex/graphics/sampler_info.h>
 #include <rex/graphics/xenos.h>
+#include <rex/hash.h>
 #include <rex/logging.h>
 #include <rex/math.h>
 #include <rex/memory.h>
@@ -40,7 +45,60 @@
 #include <rex/system/kernel_state.h>
 #include <rex/system/user_module.h>
 
+#if REX_PLATFORM_LINUX
+#include <sys/resource.h>
+#endif
+
+namespace rex::memory {
+// Defined in xmemory.cpp, for the gpu_wait_stats log.
+extern std::atomic<uint64_t> g_watch_protect_calls;
+extern std::atomic<uint64_t> g_watch_protect_ticks;
+extern std::atomic<uint64_t> g_watch_fault_count;
+extern std::atomic<uint64_t> g_watch_fault_ticks;
+extern std::atomic<uint32_t> g_watch_region_protects[512];
+extern std::atomic<uint32_t> g_watch_region_protect_pages[512];
+extern std::atomic<uint32_t> g_watch_region_faults[512];
+extern std::atomic<uint32_t> g_watch_view_protects[3];
+}  // namespace rex::memory
+
+namespace rex::graphics {
+// Defined in shared_memory.cpp, for the gpu_wait_stats log.
+extern std::atomic<uint64_t> g_streamed_page_uploads;
+extern std::atomic<uint64_t> g_streamed_page_max_uploads;
+extern std::atomic<uint64_t> g_streamed_pages_over[4];
+}  // namespace rex::graphics
+
+namespace rex::ui {
+// Defined in presenter.cpp, for the gpu_wait_stats log.
+extern std::atomic<uint64_t> g_host_presents;
+extern std::atomic<uint64_t> g_present_max_ticks[10];
+extern std::atomic<uint64_t> g_present_total_ticks[10];
+}  // namespace rex::ui
+
+#if REX_HAS_VULKAN
+namespace rex::graphics::vulkan {
+// Defined in vulkan/command_processor.cpp and vulkan/render_target_cache.cpp,
+// for the gpu_wait_stats log.
+extern std::atomic<uint64_t> g_submission_build_ticks;
+extern std::atomic<uint64_t> g_submission_submit_ticks;
+extern std::atomic<uint64_t> g_submission_count;
+extern std::atomic<uint64_t> g_memexport_readback_ticks;
+extern std::atomic<uint64_t> g_stencil_enabled_draws;
+extern std::atomic<uint64_t> g_stencil_write_draws;
+extern std::atomic<uint64_t> g_stencil_nonzero_clears;
+}  // namespace rex::graphics::vulkan
+#endif  // REX_HAS_VULKAN
+
 REXCVAR_DEFINE_BOOL(vsync, true, "GPU", "Enable vertical sync");
+
+REXCVAR_DEFINE_BOOL(gpu_incremental_read_pointer, false, "GPU",
+                    "Write the ring buffer read pointer back after every primary packet instead "
+                    "of once per batch, so the game can reuse command memory sooner");
+
+REXCVAR_DEFINE_INT32(gpu_wait_stats, 0, "GPU",
+                     "Log where the command processor thread spends its time (waiting for the "
+                     "game, WAIT_REG_MEM, host GPU fences, swaps) every N frames "
+                     "(0 = off; diagnostic)");
 
 REXCVAR_DEFINE_BOOL(clear_memory_page_state, true, "GPU",
                     "Refresh page-valid state from GPU-written memory at frame end. "
@@ -90,6 +148,306 @@ namespace rex::graphics {
 using namespace rex::graphics::xenos;
 
 namespace {
+// Ring progress written back to guest memory (read pointer and scratch
+// register writebacks), for guest code waiting for the ring to be consumed (see
+// ring_progress.h). The mutex and condition variable are only touched when
+// someone waits.
+std::atomic<uint32_t> g_read_pointer_writebacks{0};
+std::atomic<uint32_t> g_read_pointer_waiters{0};
+std::atomic<uint32_t> g_read_pointer_writeback_address{0};
+std::mutex g_read_pointer_mutex;
+std::condition_variable g_read_pointer_condition;
+
+void NotifyRingProgress() {
+  g_read_pointer_writebacks.fetch_add(1, std::memory_order_seq_cst);
+  if (g_read_pointer_waiters.load(std::memory_order_seq_cst)) {
+    std::lock_guard<std::mutex> lock(g_read_pointer_mutex);
+    g_read_pointer_condition.notify_all();
+  }
+}
+}  // namespace
+
+uint32_t GetRingProgressCount() {
+  return g_read_pointer_writebacks.load(std::memory_order_seq_cst);
+}
+
+void WaitForRingProgress(uint32_t seen_count, uint32_t timeout_us) {
+  // Registered before checking the count, and the notifier increments the
+  // count before checking for waiters, so a writeback can't be missed.
+  g_read_pointer_waiters.fetch_add(1, std::memory_order_seq_cst);
+  {
+    std::unique_lock<std::mutex> lock(g_read_pointer_mutex);
+    g_read_pointer_condition.wait_for(lock, std::chrono::microseconds(timeout_us), [&] {
+      return g_read_pointer_writebacks.load(std::memory_order_seq_cst) != seen_count;
+    });
+  }
+  g_read_pointer_waiters.fetch_sub(1, std::memory_order_seq_cst);
+}
+
+uint32_t GetReadPointerWritebackAddress() {
+  return g_read_pointer_writeback_address.load(std::memory_order_relaxed);
+}
+
+namespace {
+
+// gpu_wait_stats: where the command processor thread's time goes, in host
+// ticks, accumulated between logs. Only the command processor thread writes
+// these, except the fence counters, which the backend may report from
+// elsewhere.
+struct GpuWaitSite {
+  uint32_t address = 0;
+  uint32_t wait_info = 0;
+  uint32_t mask = 0;
+  uint32_t ref = 0;
+  uint32_t interval = 0;
+  uint32_t unmet_value = 0;
+  uint64_t packets = 0;
+  uint64_t unmet = 0;
+  uint64_t in_indirect = 0;
+  uint64_t ticks = 0;
+  uint64_t max_ticks = 0;
+};
+struct GpuWaitStats {
+  uint64_t ring_idle_waits = 0;
+  uint64_t ring_idle_ticks = 0;
+  uint64_t wait_packets = 0;
+  uint64_t wait_unmet = 0;
+  uint64_t wait_sleeps = 0;
+  uint64_t wait_ticks = 0;
+  uint64_t swap_ticks = 0;
+  uint64_t max_swap_ticks = 0;
+  static constexpr uint32_t kMaxSites = 24;
+  GpuWaitSite sites[kMaxSites];
+  uint32_t site_count = 0;
+  uint64_t untracked_site_packets = 0;
+};
+GpuWaitStats g_gpu_wait_stats;
+std::atomic<uint64_t> g_gpu_fence_waits{0}, g_gpu_fence_ticks{0};
+std::atomic<uint64_t> g_gpu_full_sync_waits{0}, g_gpu_full_sync_ticks{0};
+uint32_t g_gpu_wait_stats_frames = 0;
+uint64_t g_gpu_wait_stats_start_tick = 0;
+// CPU time of the command processor thread at the start of the window, ms.
+double g_gpu_wait_stats_user_ms = 0.0;
+double g_gpu_wait_stats_system_ms = 0.0;
+
+void GetCommandProcessorThreadTimes(double& user_ms, double& system_ms) {
+  user_ms = system_ms = 0.0;
+#if REX_PLATFORM_LINUX
+  struct rusage usage;
+  if (getrusage(RUSAGE_THREAD, &usage) == 0) {
+    user_ms = double(usage.ru_utime.tv_sec) * 1000.0 + double(usage.ru_utime.tv_usec) / 1000.0;
+    system_ms = double(usage.ru_stime.tv_sec) * 1000.0 + double(usage.ru_stime.tv_usec) / 1000.0;
+  }
+#endif
+}
+
+void RecordGpuWait(uint32_t address, uint32_t wait_info, uint32_t mask, uint32_t ref,
+                   uint32_t interval, bool in_indirect, bool unmet, uint32_t unmet_value,
+                   uint64_t unmet_ticks) {
+  GpuWaitStats& s = g_gpu_wait_stats;
+  ++s.wait_packets;
+  if (unmet) {
+    ++s.wait_unmet;
+    s.wait_ticks += unmet_ticks;
+  }
+  GpuWaitSite* site = nullptr;
+  for (uint32_t i = 0; i < s.site_count; ++i) {
+    GpuWaitSite& candidate = s.sites[i];
+    if (candidate.address == address && candidate.wait_info == wait_info &&
+        candidate.mask == mask) {
+      site = &candidate;
+      break;
+    }
+  }
+  if (!site) {
+    if (s.site_count >= GpuWaitStats::kMaxSites) {
+      ++s.untracked_site_packets;
+      return;
+    }
+    site = &s.sites[s.site_count++];
+    site->address = address;
+    site->wait_info = wait_info;
+    site->mask = mask;
+  }
+  ++site->packets;
+  site->ref = ref;
+  site->interval = interval;
+  site->in_indirect += in_indirect ? 1 : 0;
+  if (unmet) {
+    ++site->unmet;
+    site->unmet_value = unmet_value;
+    site->ticks += unmet_ticks;
+    site->max_ticks = std::max(site->max_ticks, unmet_ticks);
+  }
+}
+
+void LogGpuWaitStats(uint32_t interval) {
+  uint64_t now = rex::chrono::Clock::QueryHostTickCount();
+  if (!g_gpu_wait_stats_start_tick) {
+    // Start the first window at a swap.
+    g_gpu_wait_stats = GpuWaitStats();
+    g_gpu_fence_waits = g_gpu_fence_ticks = 0;
+    g_gpu_full_sync_waits = g_gpu_full_sync_ticks = 0;
+    g_gpu_wait_stats_frames = 0;
+    g_gpu_wait_stats_start_tick = now;
+    rex::memory::g_watch_protect_calls = rex::memory::g_watch_protect_ticks = 0;
+    rex::memory::g_watch_fault_count = rex::memory::g_watch_fault_ticks = 0;
+    g_streamed_page_uploads = 0;
+    rex::ui::g_host_presents = 0;
+    GetCommandProcessorThreadTimes(g_gpu_wait_stats_user_ms, g_gpu_wait_stats_system_ms);
+    return;
+  }
+  if (++g_gpu_wait_stats_frames < interval) {
+    return;
+  }
+  const GpuWaitStats& s = g_gpu_wait_stats;
+  const double ms_per_tick = 1000.0 / double(rex::chrono::Clock::QueryHostTickFrequency());
+  const double frames = double(g_gpu_wait_stats_frames);
+  auto per_frame_ms = [&](uint64_t ticks) { return double(ticks) * ms_per_tick / frames; };
+  uint64_t fence_waits = g_gpu_fence_waits.exchange(0);
+  uint64_t fence_ticks = g_gpu_fence_ticks.exchange(0);
+  uint64_t full_sync_waits = g_gpu_full_sync_waits.exchange(0);
+  uint64_t full_sync_ticks = g_gpu_full_sync_ticks.exchange(0);
+  uint64_t host_presents = rex::ui::g_host_presents.exchange(0);
+  REXGPU_INFO(
+      "[gpu-wait] last {} frames, {:.2f} ms/frame: waiting for the game {:.2f} ms ({:.1f} "
+      "waits), WAIT_REG_MEM {:.2f} ms ({:.1f} packets, {:.1f} unmet, {:.1f} sleeps), host GPU "
+      "fences {:.2f} ms ({:.1f} waits), full syncs {:.2f} ms ({:.1f}), swap {:.2f} ms (max "
+      "{:.2f}), {:.2f} host presents per frame",
+      g_gpu_wait_stats_frames, per_frame_ms(now - g_gpu_wait_stats_start_tick),
+      per_frame_ms(s.ring_idle_ticks), double(s.ring_idle_waits) / frames,
+      per_frame_ms(s.wait_ticks), double(s.wait_packets) / frames,
+      double(s.wait_unmet) / frames, double(s.wait_sleeps) / frames, per_frame_ms(fence_ticks),
+      double(fence_waits) / frames, per_frame_ms(full_sync_ticks),
+      double(full_sync_waits) / frames, per_frame_ms(s.swap_ticks),
+      double(s.max_swap_ticks) * ms_per_tick, double(host_presents) / frames);
+  // The sites that cost the most time, then the most frequent.
+  std::vector<const GpuWaitSite*> sites;
+  for (uint32_t i = 0; i < s.site_count; ++i) {
+    sites.push_back(&s.sites[i]);
+  }
+  std::sort(sites.begin(), sites.end(), [](const GpuWaitSite* a, const GpuWaitSite* b) {
+    return a->ticks != b->ticks ? a->ticks > b->ticks : a->packets > b->packets;
+  });
+  static const char* const kFunctions[] = {"never", "<", "<=", "==", "!=", ">=", ">", "always"};
+  for (size_t i = 0; i < std::min(sites.size(), size_t(8)); ++i) {
+    const GpuWaitSite& site = *sites[i];
+    REXGPU_INFO(
+        "[gpu-wait]   {} {:08X} & {:08X} {} {:08X} (interval {:X}): {:.1f}/frame, {:.1f} unmet "
+        "({:.3f} ms/frame, max {:.3f} ms, last unmet value {:08X}), {:.0f}% in indirect buffers",
+        (site.wait_info & 0x10) ? "mem" : "reg", site.address, site.mask,
+        kFunctions[site.wait_info & 7], site.ref, site.interval, double(site.packets) / frames,
+        double(site.unmet) / frames, per_frame_ms(site.ticks),
+        double(site.max_ticks) * ms_per_tick, site.unmet_value,
+        100.0 * double(site.in_indirect) / double(site.packets));
+  }
+  if (s.untracked_site_packets) {
+    REXGPU_INFO("[gpu-wait]   {} packets at untracked sites", s.untracked_site_packets);
+  }
+  // Write watches on guest memory the GPU has read: protection changes to arm
+  // them (made by the command processor thread) and the guest write faults
+  // that fire them (on the writing threads). Plus the command processor
+  // thread's own CPU time split into user and kernel.
+  uint64_t protect_calls = rex::memory::g_watch_protect_calls.exchange(0);
+  uint64_t protect_ticks = rex::memory::g_watch_protect_ticks.exchange(0);
+  uint64_t fault_count = rex::memory::g_watch_fault_count.exchange(0);
+  uint64_t fault_ticks = rex::memory::g_watch_fault_ticks.exchange(0);
+  double user_ms, system_ms;
+  GetCommandProcessorThreadTimes(user_ms, system_ms);
+  uint64_t streamed_page_uploads = g_streamed_page_uploads.exchange(0);
+  REXGPU_INFO(
+      "[gpu-wait]   write watches: {:.1f} protects ({:.3f} ms), {:.1f} guest write faults "
+      "({:.3f} ms in handlers), {:.1f} streamed pages uploaded unwatched | command processor "
+      "thread CPU: user {:.2f} ms, kernel {:.2f} ms",
+      double(protect_calls) / frames, per_frame_ms(protect_ticks), double(fault_count) / frames,
+      per_frame_ms(fault_ticks), double(streamed_page_uploads) / frames,
+      (user_ms - g_gpu_wait_stats_user_ms) / frames,
+      (system_ms - g_gpu_wait_stats_system_ms) / frames);
+  // The 1 MB physical memory regions with the most watch protect calls.
+  std::vector<std::pair<uint32_t, uint32_t>> regions;
+  uint32_t region_protects[512], region_pages[512], region_faults[512];
+  for (uint32_t i = 0; i < 512; ++i) {
+    region_protects[i] = rex::memory::g_watch_region_protects[i].exchange(0);
+    region_pages[i] = rex::memory::g_watch_region_protect_pages[i].exchange(0);
+    region_faults[i] = rex::memory::g_watch_region_faults[i].exchange(0);
+    if (region_protects[i] || region_faults[i]) {
+      regions.emplace_back(region_protects[i] + region_faults[i], i);
+    }
+  }
+  std::sort(regions.rbegin(), regions.rend());
+  std::string region_text;
+  for (size_t i = 0; i < std::min(regions.size(), size_t(8)); ++i) {
+    uint32_t r = regions[i].second;
+    region_text += fmt::format(" {:03X}xxxxx: {:.1f} protects ({:.1f} pages), {:.1f} faults |", r,
+                               double(region_protects[r]) / frames,
+                               double(region_pages[r]) / frames,
+                               double(region_faults[r]) / frames);
+  }
+  uint32_t view_protects[3];
+  for (uint32_t i = 0; i < 3; ++i) {
+    view_protects[i] = rex::memory::g_watch_view_protects[i].exchange(0);
+  }
+  REXGPU_INFO("[gpu-wait]   watch protects by view A/C/E: {:.1f}/{:.1f}/{:.1f}, by region:{}",
+              double(view_protects[0]) / frames, double(view_protects[1]) / frames,
+              double(view_protects[2]) / frames, region_text);
+  uint64_t present_max[10];
+  for (uint32_t i = 0; i < 10; ++i) {
+    present_max[i] = rex::ui::g_present_max_ticks[i].exchange(0);
+  }
+  REXGPU_INFO(
+      "[gpu-wait]   presenter longest: guest output refresh {:.2f} ms, paint {:.2f} ms (old "
+      "paint submission {:.2f}, acquire {:.2f}, recording {:.2f}, fence {:.2f}, queue lock "
+      "{:.2f}, submit {:.2f}, present {:.2f}, other waits {:.2f})",
+      double(present_max[4]) * ms_per_tick, double(present_max[5]) * ms_per_tick,
+      double(present_max[0]) * ms_per_tick, double(present_max[1]) * ms_per_tick,
+      double(present_max[9]) * ms_per_tick, double(present_max[6]) * ms_per_tick,
+      double(present_max[7]) * ms_per_tick, double(present_max[8]) * ms_per_tick,
+      double(present_max[2]) * ms_per_tick, double(present_max[3]) * ms_per_tick);
+#if REX_HAS_VULKAN
+  {
+    uint64_t present_total[10];
+    for (uint32_t i = 0; i < 10; ++i) {
+      present_total[i] = rex::ui::g_present_total_ticks[i].exchange(0);
+    }
+    uint64_t build_ticks = vulkan::g_submission_build_ticks.exchange(0);
+    uint64_t submit_ticks = vulkan::g_submission_submit_ticks.exchange(0);
+    uint64_t submission_count = vulkan::g_submission_count.exchange(0);
+    uint64_t readback_ticks = vulkan::g_memexport_readback_ticks.exchange(0);
+    REXGPU_INFO(
+        "[gpu-wait]   swap parts per frame: memexport readback {:.2f} ms, submission build "
+        "{:.2f} ms ({:.1f} submissions), vkQueueSubmit {:.2f} ms, presenter: guest output "
+        "refresh {:.2f} ms, paint {:.2f} ms (acquire {:.2f}, recording {:.2f}, submit {:.2f}, "
+        "present {:.2f})",
+        per_frame_ms(readback_ticks), per_frame_ms(build_ticks),
+        double(submission_count) / frames, per_frame_ms(submit_ticks),
+        per_frame_ms(present_total[4]), per_frame_ms(present_total[5]),
+        per_frame_ms(present_total[1]), per_frame_ms(present_total[9]),
+        per_frame_ms(present_total[8]), per_frame_ms(present_total[2]));
+    REXGPU_INFO(
+        "[gpu-wait]   stencil: {:.1f} draws per frame with the stencil test, {:.1f} of them can "
+        "write it, {:.1f} resolve clears with a non-zero stencil value",
+        double(vulkan::g_stencil_enabled_draws.exchange(0)) / frames,
+        double(vulkan::g_stencil_write_draws.exchange(0)) / frames,
+        double(vulkan::g_stencil_nonzero_clears.exchange(0)) / frames);
+  }
+#endif  // REX_HAS_VULKAN
+  uint64_t streamed_max = g_streamed_page_max_uploads.exchange(0);
+  uint64_t streamed_over[4];
+  for (uint32_t i = 0; i < 4; ++i) {
+    streamed_over[i] = g_streamed_pages_over[i].exchange(0);
+  }
+  REXGPU_INFO(
+      "[gpu-wait]   streamed page uploads per frame: most for one page {:.1f}, pages over 8 "
+      "{:.1f}, over 16 {:.1f}, over 32 {:.1f}, at the cap {:.1f}",
+      double(streamed_max) / frames, double(streamed_over[0]) / frames,
+      double(streamed_over[1]) / frames, double(streamed_over[2]) / frames,
+      double(streamed_over[3]) / frames);
+  g_gpu_wait_stats_user_ms = user_ms;
+  g_gpu_wait_stats_system_ms = system_ms;
+  g_gpu_wait_stats = GpuWaitStats();
+  g_gpu_wait_stats_frames = 0;
+  g_gpu_wait_stats_start_tick = now;
+}
 
 ReadbackResolveMode ParseReadbackResolveMode(std::string_view value) {
   if (value == "fast") {
@@ -279,8 +637,14 @@ ReadbackResolveMode CommandProcessor::GetReadbackResolveMode(
 }
 
 bool CommandProcessor::IsReadbackMemexportEnabled(bool legacy_backend_flag) const {
-  if (legacy_readback_memexport_cvar_name_ &&
-      rex::cvar::HasNonDefaultValue(legacy_readback_memexport_cvar_name_)) {
+  if (legacy_readback_memexport_overridden_ < 0) {
+    legacy_readback_memexport_overridden_ =
+        (legacy_readback_memexport_cvar_name_ &&
+         rex::cvar::HasNonDefaultValue(legacy_readback_memexport_cvar_name_))
+            ? 1
+            : 0;
+  }
+  if (legacy_readback_memexport_overridden_) {
     return legacy_backend_flag;
   }
   return REXCVAR_GET(readback_memexport);
@@ -322,6 +686,8 @@ void CommandProcessor::WorkerThreadMain() {
       // (down from 5) bounds how long a CallInThread posted from another
       // thread can sit unnoticed, since those don't signal the event.
       PrepareForWait();
+      const bool wait_stats = REXCVAR_GET(gpu_wait_stats) > 0;
+      uint64_t idle_start_tick = wait_stats ? rex::chrono::Clock::QueryHostTickCount() : 0;
       uint32_t loop_count = 0;
       do {
         if (loop_count < 32) {
@@ -334,6 +700,11 @@ void CommandProcessor::WorkerThreadMain() {
         write_ptr_index = write_ptr_index_.load();
       } while (worker_running_ && pending_fns_.empty() &&
                (write_ptr_index == 0xBAADF00D || read_ptr_index_ == write_ptr_index));
+      if (wait_stats) {
+        ++g_gpu_wait_stats.ring_idle_waits;
+        g_gpu_wait_stats.ring_idle_ticks +=
+            rex::chrono::Clock::QueryHostTickCount() - idle_start_tick;
+      }
       ReturnFromWait();
       if (!worker_running_ || !pending_fns_.empty()) {
         continue;
@@ -349,6 +720,7 @@ void CommandProcessor::WorkerThreadMain() {
     if (read_ptr_writeback_ptr_) {
       memory::store_and_swap<uint32_t>(memory_->TranslatePhysical(read_ptr_writeback_ptr_),
                                        read_ptr_index_);
+      NotifyRingProgress();
     }
 
     // FIXME: We're supposed to process the WAIT_UNTIL register at this point,
@@ -424,6 +796,7 @@ void CommandProcessor::EnableReadPointerWriteBack(uint32_t ptr, uint32_t block_s
   // CP_RB_RPTR_ADDR Ring Buffer Read Pointer Address 0x70C
   // ptr = RB_RPTR_ADDR, pointer to write back the address to.
   read_ptr_writeback_ptr_ = ptr;
+  g_read_pointer_writeback_address.store(ptr, std::memory_order_relaxed);
   // CP_RB_CNTL Ring Buffer Control 0x704
   // block_size = RB_BLKSZ, log2 of number of quadwords read between updates of
   //              the read pointer.
@@ -470,6 +843,8 @@ void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
       uint32_t scratch_addr = regs.values[XE_GPU_REG_SCRATCH_ADDR];
       uint32_t mem_addr = scratch_addr + (scratch_reg * 4);
       memory::store_and_swap<uint32_t>(memory_->TranslatePhysical(mem_addr), value);
+      // The Direct3D code's fences.
+      NotifyRingProgress();
     }
   } else {
     switch (index) {
@@ -717,6 +1092,19 @@ void CommandProcessor::PrepareForWait() {
 
 void CommandProcessor::ReturnFromWait() {}
 
+void CommandProcessor::RecordHostGpuFenceWait(uint64_t host_ticks, bool full_sync) {
+  if (REXCVAR_GET(gpu_wait_stats) <= 0) {
+    return;
+  }
+  if (full_sync) {
+    g_gpu_full_sync_waits.fetch_add(1, std::memory_order_relaxed);
+    g_gpu_full_sync_ticks.fetch_add(host_ticks, std::memory_order_relaxed);
+  } else {
+    g_gpu_fence_waits.fetch_add(1, std::memory_order_relaxed);
+    g_gpu_fence_ticks.fetch_add(host_ticks, std::memory_order_relaxed);
+  }
+}
+
 uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t write_index) {
   SCOPE_profile_cpu_f("gpu");
 
@@ -743,12 +1131,24 @@ uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t wr
   memory::RingBuffer reader(memory_->TranslatePhysical(primary_buffer_ptr_), primary_buffer_size_);
   reader.set_read_offset(read_index * sizeof(uint32_t));
   reader.set_write_offset(write_index * sizeof(uint32_t));
+  const bool incremental_read_ptr = REXCVAR_GET(gpu_incremental_read_pointer);
   do {
     if (!ExecutePacket(&reader)) {
       // This probably should be fatal - but we're going to continue anyways.
       REXGPU_ERROR("**** PRIMARY RINGBUFFER: Failed to execute packet.");
       assert_always();
       break;
+    }
+    // Report the progress through the ring after every packet, like the
+    // hardware's periodic read pointer writeback, rather than only once the
+    // whole batch is done: an indirect buffer's commands have all been parsed
+    // when its packet returns, and the game waits for the read pointer before
+    // reusing command buffer memory, so it can keep recording instead of
+    // spinning until the command processor catches up with everything queued.
+    if (incremental_read_ptr && read_ptr_writeback_ptr_) {
+      memory::store_and_swap<uint32_t>(memory_->TranslatePhysical(read_ptr_writeback_ptr_),
+                                       uint32_t(reader.read_offset() / sizeof(uint32_t)));
+      NotifyRingProgress();
     }
   } while (reader.read_count());
 
@@ -788,6 +1188,21 @@ struct Pm4Census {
   uint64_t repeated_indirect_buffers = 0;
   // Indirect buffer dwords per 16 MB guest physical region.
   uint64_t region_dwords[32] = {};
+  // Indirect buffers with the address and length of one in the previous
+  // frame: with the same contents (replays of command buffers recorded once),
+  // with different contents (patched in place); and the rest.
+  uint64_t patched_indirect_buffers = 0;
+  uint64_t new_indirect_buffers = 0;
+  uint64_t replay_dwords = 0;
+  // Executed inside unchanged replays (including buffers they call).
+  uint64_t replay_packets = 0;
+  uint64_t replay_register_writes = 0;
+  uint64_t replay_draws = 0;
+  uint64_t replay_ticks = 0;
+  // Of replay_ticks, the time in IssueDraw (turning the draws into host
+  // commands) rather than decoding packets.
+  uint64_t replay_draw_ticks = 0;
+  uint64_t draws = 0;
 };
 Pm4Census g_pm4_census;
 uint32_t g_pm4_census_frames = 0;
@@ -795,6 +1210,11 @@ uint32_t g_pm4_indirect_depth = 0;
 // Indirect buffers of the previous frame: address, length and a hash of their
 // first dwords, to spot command buffers replayed unchanged across frames.
 std::vector<uint64_t> g_pm4_previous_buffers, g_pm4_current_buffers;
+// Indirect buffers by address and length, with a hash of their whole
+// contents, this frame and the previous one.
+std::unordered_map<uint64_t, uint64_t> g_pm4_previous_ib_contents, g_pm4_current_ib_contents;
+// How many unchanged replays the command processor is inside.
+uint32_t g_pm4_replay_depth = 0;
 
 uint64_t Pm4BufferKey(const uint32_t* dwords, uint32_t ptr, uint32_t count) {
   uint64_t hash = 1469598103934665603ull;
@@ -822,17 +1242,37 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
 
   trace_writer_.WriteIndirectBufferStart(ptr, count * sizeof(uint32_t));
 
+  bool census_replay = false;
+  uint64_t census_replay_start_tick = 0;
+
   if (REXCVAR_GET(pm4_census) > 0) {
     ++g_pm4_census.indirect_buffers;
     g_pm4_census.indirect_buffer_dwords += count;
     g_pm4_census.nested_indirect_buffers += g_pm4_indirect_depth ? 1 : 0;
     g_pm4_census.region_dwords[(ptr >> 24) & 31] += count;
-    uint64_t key = Pm4BufferKey(memory_->TranslatePhysical<const uint32_t*>(ptr), ptr, count);
+    const uint32_t* ib_dwords = memory_->TranslatePhysical<const uint32_t*>(ptr);
+    uint64_t key = Pm4BufferKey(ib_dwords, ptr, count);
     g_pm4_current_buffers.push_back(key);
     if (std::find(g_pm4_previous_buffers.begin(), g_pm4_previous_buffers.end(), key) !=
         g_pm4_previous_buffers.end()) {
       ++g_pm4_census.repeated_indirect_buffers;
     }
+    uint64_t location = (uint64_t(ptr) << 20) | count;
+    uint64_t contents = XXH3_64bits(ib_dwords, size_t(count) * sizeof(uint32_t));
+    auto previous = g_pm4_previous_ib_contents.find(location);
+    if (previous == g_pm4_previous_ib_contents.end()) {
+      ++g_pm4_census.new_indirect_buffers;
+    } else if (previous->second != contents) {
+      ++g_pm4_census.patched_indirect_buffers;
+    } else {
+      census_replay = true;
+      g_pm4_census.replay_dwords += count;
+      if (!g_pm4_replay_depth) {
+        census_replay_start_tick = rex::chrono::Clock::QueryHostTickCount();
+      }
+      ++g_pm4_replay_depth;
+    }
+    g_pm4_current_ib_contents[location] = contents;
   }
   ++g_pm4_indirect_depth;
 
@@ -848,6 +1288,10 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
     }
   } while (reader.read_count());
   --g_pm4_indirect_depth;
+  if (census_replay && !--g_pm4_replay_depth) {
+    g_pm4_census.replay_ticks +=
+        rex::chrono::Clock::QueryHostTickCount() - census_replay_start_tick;
+  }
 
   trace_writer_.WriteIndirectBufferEnd();
 }
@@ -878,9 +1322,15 @@ bool CommandProcessor::ExecutePacket(memory::RingBuffer* reader) {
       packet_dwords += 2;
     }
     g_pm4_census.dwords += packet_dwords;
+    if (g_pm4_replay_depth) {
+      ++g_pm4_census.replay_packets;
+    }
     if (packet_type == 0) {
       uint32_t count = ((packet >> 16) & 0x3FFF) + 1;
       g_pm4_census.register_writes += count;
+      if (g_pm4_replay_depth) {
+        g_pm4_census.replay_register_writes += count;
+      }
       uint32_t base = packet & 0x7FFF;
       uint32_t range = base < 0x2000   ? 0
                        : base < 0x4000 ? 1
@@ -892,10 +1342,19 @@ bool CommandProcessor::ExecutePacket(memory::RingBuffer* reader) {
       g_pm4_census.register_range_writes[range] += count;
     } else if (packet_type == 1) {
       g_pm4_census.register_writes += 2;
+      if (g_pm4_replay_depth) {
+        g_pm4_census.replay_register_writes += 2;
+      }
     } else if (packet_type == 3) {
       uint32_t opcode = (packet >> 8) & 0x7F;
       ++g_pm4_census.type3_opcodes[opcode];
       g_pm4_census.type3_opcode_dwords[opcode] += packet_dwords;
+      if (opcode == PM4_DRAW_INDX || opcode == PM4_DRAW_INDX_2) {
+        ++g_pm4_census.draws;
+        if (g_pm4_replay_depth) {
+          ++g_pm4_census.replay_draws;
+        }
+      }
     }
   }
   if (packet == 0) {
@@ -1239,7 +1698,19 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
   uint32_t frontbuffer_height = reader->ReadAndSwap<uint32_t>();
   reader->AdvanceRead((count - 4) * sizeof(uint32_t));
 
+  // Pick up changes of the legacy memexport readback cvar once per frame.
+  legacy_readback_memexport_overridden_ = -1;
+
+  int32_t wait_stats_interval = REXCVAR_GET(gpu_wait_stats);
+  uint64_t swap_start_tick =
+      wait_stats_interval > 0 ? rex::chrono::Clock::QueryHostTickCount() : 0;
   IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
+  if (wait_stats_interval > 0) {
+    uint64_t swap_ticks = rex::chrono::Clock::QueryHostTickCount() - swap_start_tick;
+    g_gpu_wait_stats.swap_ticks += swap_ticks;
+    g_gpu_wait_stats.max_swap_ticks = std::max(g_gpu_wait_stats.max_swap_ticks, swap_ticks);
+    LogGpuWaitStats(uint32_t(wait_stats_interval));
+  }
 
   if ((g_native_verify_records || g_native_applied_records || g_native_missing_records ||
        g_native_fallbacks) &&
@@ -1290,10 +1761,24 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
           c.register_range_writes[4], c.register_range_writes[5], c.register_range_writes[6],
           c.indirect_buffers, c.indirect_buffer_dwords,
           c.nested_indirect_buffers, c.repeated_indirect_buffers, regions, opcodes);
+      // The census covers the one frame it's logged at.
+      REXGPU_INFO(
+          "[pm4-census] indirect buffers replayed unchanged {} ({} dw), patched {}, new {} | "
+          "inside unchanged replays: {} packets, {} register writes, {} of {} draws, {:.2f} ms ({:.2f} "
+          "ms of it issuing the draws)",
+          c.indirect_buffers - c.patched_indirect_buffers - c.new_indirect_buffers,
+          c.replay_dwords, c.patched_indirect_buffers, c.new_indirect_buffers, c.replay_packets,
+          c.replay_register_writes, c.replay_draws, c.draws,
+          double(c.replay_ticks) * 1000.0 /
+              double(rex::chrono::Clock::QueryHostTickFrequency()),
+          double(c.replay_draw_ticks) * 1000.0 /
+              double(rex::chrono::Clock::QueryHostTickFrequency()));
     }
     g_pm4_census = Pm4Census();
     g_pm4_previous_buffers.swap(g_pm4_current_buffers);
     g_pm4_current_buffers.clear();
+    g_pm4_previous_ib_contents.swap(g_pm4_current_ib_contents);
+    g_pm4_current_ib_contents.clear();
   }
 
   ++counter_;
@@ -1412,6 +1897,9 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
 
   bool is_memory = (wait_info & 0x10) != 0;
 
+  const bool wait_stats = REXCVAR_GET(gpu_wait_stats) > 0;
+  uint64_t unmet_start_tick = 0;
+  uint32_t unmet_value = 0;
   bool matched = false;
   do {
     uint32_t value = 0;
@@ -1454,8 +1942,15 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
         break;
     }
     if (!matched) {
+      if (wait_stats && !unmet_start_tick) {
+        unmet_start_tick = rex::chrono::Clock::QueryHostTickCount();
+        unmet_value = value;
+      }
       // Wait.
       if (wait >= 0x100) {
+        if (wait_stats) {
+          ++g_gpu_wait_stats.wait_sleeps;
+        }
         PrepareForWait();
         if (!REXCVAR_GET(vsync)) {
           // User wants it fast and dangerous.
@@ -1483,6 +1978,13 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
       }
     }
   } while (!matched);
+
+  if (wait_stats) {
+    RecordGpuWait(poll_reg_addr, wait_info, mask, ref, wait, g_pm4_indirect_depth != 0,
+                  unmet_start_tick != 0, unmet_value,
+                  unmet_start_tick ? rex::chrono::Clock::QueryHostTickCount() - unmet_start_tick
+                                   : 0);
+  }
 
   return true;
 }
@@ -1816,8 +2318,14 @@ bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32
 
       bool major_mode_explicit =
           xenos::IsMajorModeExplicit(vgt_draw_initiator.major_mode, vgt_draw_initiator.prim_type);
+      uint64_t census_draw_start_tick =
+          g_pm4_replay_depth ? rex::chrono::Clock::QueryHostTickCount() : 0;
       draw_succeeded = IssueDraw(vgt_draw_initiator.prim_type, vgt_draw_initiator.num_indices,
                                  is_indexed ? &index_buffer_info : nullptr, major_mode_explicit);
+      if (g_pm4_replay_depth) {
+        g_pm4_census.replay_draw_ticks +=
+            rex::chrono::Clock::QueryHostTickCount() - census_draw_start_tick;
+      }
       if (!draw_succeeded) {
         // HAND PATCH: rate-limit this log. This game rejects hundreds of draws
         // per frame while streaming (invalid vertex fetch constants during
