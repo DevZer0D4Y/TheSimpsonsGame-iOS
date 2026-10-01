@@ -282,6 +282,13 @@ jobs:
           # 1x and 2x internal resolution; bit-identical to the translation).
           python3 tools/native-renderer/native_shaders/build_native_shaders.py \
             release/native_shaders 0000400000000001
+          # Every other shader, translated ahead of time on a Steam Deck
+          # (tools/native-renderer/build_translated_set.sh): served only where
+          # the translator source and the GPU configuration match the ones it
+          # was made with, translated at runtime everywhere else.
+          if [ -f tools/native-renderer/translated_shaders.tar.xz ]; then
+            tar -C release/native_shaders -xJf tools/native-renderer/translated_shaders.tar.xz
+          fi
           printf '%s\n' "${{ matrix.march }}" > release/build_variant.txt
           printf '# The Simpsons Game - runtime configuration (edit these via the launcher)\ngpu_allow_invalid_fetch_constants = false\ngpu_shader_max_cf_iterations = 0\n' > release/simpsons.toml
 

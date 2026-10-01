@@ -35,6 +35,11 @@
 
 REXCVAR_DEFINE_BOOL(non_seamless_cube_map, false, "GPU", "Use non-seamless cube map sampling");
 
+REXCVAR_DEFINE_BOOL(vulkan_sparse_scaled_resolve_buffer, true, "GPU/Vulkan",
+                    "With draw resolution scaling, allocate the scaled resolve buffer sparsely "
+                    "when supported (off: one allocation of the whole buffer, for drivers whose "
+                    "sparse buffers are unreliable, such as llvmpipe)");
+
 namespace rex::graphics::vulkan {
 
 // Generated with `xb buildshaders`.
@@ -2329,7 +2334,8 @@ bool VulkanTextureCache::InitializeScaledResolveBuffer() {
   buffer_create_info.queueFamilyIndexCount = 0;
   buffer_create_info.pQueueFamilyIndices = nullptr;
 
-  if (vulkan_device->properties().sparseResidencyBuffer &&
+  if (REXCVAR_GET(vulkan_sparse_scaled_resolve_buffer) &&
+      vulkan_device->properties().sparseResidencyBuffer &&
       dfn.vkCreateBuffer(device, &buffer_create_info, nullptr, &scaled_resolve_buffer_) ==
           VK_SUCCESS) {
     VkMemoryRequirements memory_requirements;

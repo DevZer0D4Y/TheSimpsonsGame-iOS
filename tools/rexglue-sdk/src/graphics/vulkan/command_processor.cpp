@@ -4443,7 +4443,17 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
       ++g_probe_current_full_run;
     }
   }
-  if (gpu_profiler_.per_draw()) {
+  if (gpu_profiler_.per_render_target()) {
+    const RegisterFile& rt_regs = *register_file_;
+    auto rt_depth_control = rt_regs.Get<reg::RB_DEPTHCONTROL>();
+    uint32_t rt_depth_info = (rt_depth_control.z_enable || rt_depth_control.stencil_enable)
+                                 ? rt_regs[XE_GPU_REG_RB_DEPTH_INFO]
+                                 : UINT32_MAX;
+    gpu_profiler_.MarkDraw(
+        deferred_command_buffer_,
+        (uint64_t(rt_regs[XE_GPU_REG_RB_SURFACE_INFO]) << 32) | rt_depth_info,
+        (uint64_t(rt_regs[XE_GPU_REG_RB_COLOR_INFO]) << 32) | rt_regs[XE_GPU_REG_RB_COLOR_MASK]);
+  } else if (gpu_profiler_.per_draw()) {
     gpu_profiler_.MarkDraw(deferred_command_buffer_, vertex_shader->ucode_data_hash(),
                            pixel_shader ? pixel_shader->ucode_data_hash() : 0);
   }

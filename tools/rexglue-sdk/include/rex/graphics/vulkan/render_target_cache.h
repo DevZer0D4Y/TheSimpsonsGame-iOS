@@ -400,6 +400,16 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
     uint32_t temporary_sort_index() const { return temporary_sort_index_; }
     void SetTemporarySortIndex(uint32_t index) { temporary_sort_index_ = index; }
 
+    // Depth: a rectangle (guest pixels) where the stencil is known to have one
+    // value - cleared by a draw, not written since. Valid while the generation
+    // is the render target cache's uniform_stencil_generation_.
+    struct UniformStencil {
+      Transfer::Rectangle rectangle = {};
+      uint32_t value = 0;
+      uint64_t generation = 0;
+    };
+    UniformStencil& uniform_stencil() { return uniform_stencil_; }
+
    private:
     VulkanRenderTargetCache& render_target_cache_;
 
@@ -424,6 +434,8 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
 
     // Temporary storage for indices in operations like transfers and dumps.
     uint32_t temporary_sort_index_ = 0;
+
+    UniformStencil uniform_stencil_;
   };
 
   struct FramebufferKey {
@@ -915,6 +927,9 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
     // Whether the first target contains the whole resolve rectangle, so
     // drawing it can also write all of the resolved memory.
     bool can_write_memory = false;
+    // Nothing samples the destination yet: the only target is a stand-in with
+    // no image (unused color attachment), and the draw only writes the memory.
+    bool memory_only = false;
     uint32_t target_count = 0;
     VulkanTextureCache::NativeResolveTarget targets[VulkanTextureCache::kMaxNativeResolveTargets];
   };
@@ -922,10 +937,37 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   // For a draw clearing a rectangle with the XDK clear shader: the render
   // targets (bit 0 depth, bits 1-4 color) it overwrites entirely inside the
   // rectangle, so ownership transfers of their old contents there are dead.
+  // exact_edges_out (optional) tells whether the rectangle's edges are on
+  // pixel boundaries, so the draw writes nothing outside it at any resolution
+  // scale or sample count.
   uint32_t GetDrawOverwrittenRenderTargets(reg::RB_DEPTHCONTROL normalized_depth_control,
                                            uint32_t normalized_color_mask,
                                            const Shader& vertex_shader,
-                                           Transfer::Rectangle& rectangle_out) const;
+                                           Transfer::Rectangle& rectangle_out,
+                                           bool* exact_edges_out = nullptr) const;
+  // With native_rt_skip_overwritten_transfers, transfers into render targets
+  // that the draws right after binding them clear are held back while
+  // consecutive clears keep overwriting them, then performed only outside the
+  // cleared area - before the first draw that isn't such a clear, a change of
+  // the bindings, or a resolve.
+  void FlushDeferredTransfers();
+  // If the union of the two rectangles is a rectangle, stores it in
+  // accumulated and returns true.
+  static bool MergeTransferCutout(Transfer::Rectangle& accumulated,
+                                  const Transfer::Rectangle& rectangle);
+  // Uniform stencil tracking (native_resolve_uniform_stencil): a clear draw
+  // makes the stencil in its rectangle the reference value, a draw that may
+  // write the stencil anywhere, or a transfer into the rectangle, forgets it.
+  // Depth resolves of a rectangle with a uniform stencil then don't need to
+  // capture the stencil for writing the memory later.
+  void UpdateUniformStencil(VulkanRenderTarget& depth_render_target,
+                            reg::RB_DEPTHCONTROL normalized_depth_control,
+                            uint32_t normalized_color_mask, const Shader& vertex_shader);
+  void ForgetUniformStencilWrittenByTransfers(VulkanRenderTarget& depth_render_target,
+                                              const std::vector<Transfer>& transfers,
+                                              const Transfer::Rectangle* cutout);
+  bool GetUniformStencil(VulkanRenderTarget& depth_render_target, uint32_t x0, uint32_t y0,
+                         uint32_t x1, uint32_t y1, uint32_t& value_out);
   bool EnsureNativeResolvePipelineLayouts();
   void ShutdownNativeResolve();
   VkPipeline GetNativeResolvePipeline(NativeResolveShader shader, VkFormat dest_format);
@@ -999,6 +1041,18 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   // Temporary storage for PerformTransfersAndResolveClears.
   std::vector<TransferInvocation> current_transfer_invocations_;
 
+  // Transfers held back by clears (see FlushDeferredTransfers): the render
+  // targets they go to (bit 0 depth, bits 1-4 color), the bindings when they
+  // were held back, and the area cleared since.
+  uint32_t deferred_transfer_targets_ = 0;
+  RenderTarget* deferred_transfer_bindings_[1 + xenos::kMaxColorRenderTargets] = {};
+  std::array<std::vector<Transfer>, 1 + xenos::kMaxColorRenderTargets> deferred_transfers_;
+  Transfer::Rectangle deferred_transfer_cutout_;
+
+  // Incremented when the contents of all render targets may change outside
+  // draws and transfers (EDRAM snapshot restores), forgetting uniform stencils.
+  uint64_t uniform_stencil_generation_ = 1;
+
   // Temporary storage for DumpRenderTargets.
   std::vector<ResolveCopyDumpRectangle> dump_rectangles_;
   std::vector<DumpInvocation> dump_invocations_;
@@ -1032,6 +1086,10 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
     uint32_t flags = 0;
     uint32_t stencil_capture = UINT32_MAX;
     bool stencil_capture_quads = false;
+    // Instead of a capture, the stencil of the whole rectangle (uniform),
+    // filled into a capture when writing back.
+    bool stencil_uniform = false;
+    uint32_t stencil_uniform_value = 0;
     // native_resolve_debug_verify_stencil_capture: a copied capture the
     // write-back compares the quad capture with.
     uint32_t verify_stencil_capture = UINT32_MAX;
@@ -1069,6 +1127,9 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   // Copies the stencil of the resolved rectangle of the source to a capture.
   void CaptureScaledResolveStencil(VulkanRenderTarget& source, uint32_t x0, uint32_t y0,
                                    uint32_t x1, uint32_t y1, uint32_t capture_index);
+  // Fills the first size bytes of a capture with one stencil value, laid out
+  // like a copied capture (a byte per texel).
+  void FillScaledStencilCapture(uint32_t capture_index, uint32_t value, VkDeviceSize size);
   // Releases what a pending resolve holds without writing it back.
   void DropPendingScaledResolveMemory(const PendingScaledResolveMemory& pending);
   // Records the write-back of one pending resolve and releases its texture.

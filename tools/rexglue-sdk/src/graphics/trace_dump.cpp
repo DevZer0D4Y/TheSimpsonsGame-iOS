@@ -146,6 +146,22 @@ bool TraceDump::Load(const std::filesystem::path& trace_file_path) {
 }
 
 int TraceDump::Run() {
+  // TRACE_SHADER_STORAGE=<cache root>:<title ID, hex>: load a shader storage
+  // first, as the game does at boot - every stored shader translated, every
+  // stored pipeline created (with aot_export_path, to export a complete
+  // ahead-of-time shader set). The storage is appended to, so pass a copy.
+  if (const char* storage_env = std::getenv("TRACE_SHADER_STORAGE")) {
+    std::string storage_spec(storage_env);
+    size_t separator = storage_spec.rfind(':');
+    if (separator != std::string::npos) {
+      uint32_t title_id =
+          uint32_t(std::strtoul(storage_spec.c_str() + separator + 1, nullptr, 16));
+      std::filesystem::path cache_root(storage_spec.substr(0, separator));
+      REXGPU_INFO("TraceDump: loading the shader storage of title {:08X} from {}", title_id,
+                  cache_root.string());
+      graphics_system_->InitializeShaderStorage(cache_root, title_id, true);
+    }
+  }
   BeginHostCapture();
   const TraceReader::Frame* frame = player_->frame_count() ? player_->frame(0) : nullptr;
   if (!frame || frame->commands.empty()) {
