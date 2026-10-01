@@ -52,6 +52,11 @@ class VulkanCommandProcessor : public CommandProcessor {
   enum class SingleTransientDescriptorLayout {
     kStorageBufferCompute,
     kStorageBufferPairCompute,
+    // One storage buffer visible to the guest shader stages: defined like the
+    // shared memory set layout with a single shared memory binding and no
+    // EDRAM binding, so it can stand in for it (native resolves writing the
+    // scaled resolve buffer).
+    kStorageBufferGuestShaders,
     kCount,
   };
 
@@ -148,7 +153,8 @@ class VulkanCommandProcessor : public CommandProcessor {
   }
 
   bool CompileGlslToSpirv(VkShaderStageFlagBits stage, std::string_view source,
-                          std::vector<uint32_t>& spirv_out, std::string& error_out) const;
+                          std::vector<uint32_t>& spirv_out, std::string& error_out,
+                          bool spirv_1_3 = false) const;
 
   // Returns the deferred drawing command list for the currently open
   // submission.

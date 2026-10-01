@@ -76,9 +76,18 @@ class SharedMemory {
 
   // Checks if the range has been updated, uploads new data if needed and
   // ensures the host GPU memory backing the range are resident. Returns true if
-  // the range has been fully updated and is usable.
-  bool RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, size_t count);
-  bool RequestRange(uint32_t start, uint32_t length);
+  // the range has been fully updated and is usable. allow_streamed is for
+  // vertex and index data that only the current draw reads: with
+  // gpu_stream_dynamic_pages, pages the game rewrites every frame are then
+  // uploaded without being made valid or write-protected (so they're uploaded
+  // again on every such request, and never go stale).
+  bool RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, size_t count,
+                     bool allow_streamed = false);
+  bool RequestRange(uint32_t start, uint32_t length, bool allow_streamed = false);
+
+  // Call once per guest frame, on the command processor thread, to update
+  // which pages count as streamed (see RequestRanges).
+  void OnGuestFrameEnd();
 
   // Marks the range and, if not exact_range, potentially its surroundings
   // (to up to the first GPU-written page, as an access violation exception
@@ -181,7 +190,7 @@ class SharedMemory {
   // merged and backed by host GPU memory. Lets a single-range request skip
   // building and sorting a vector. original_count is only for the profiler.
   bool RequestValidatedRanges(const std::pair<uint32_t, uint32_t>* merged_ranges,
-                              size_t merged_count, size_t original_count);
+                              size_t merged_count, size_t original_count, bool allow_streamed);
   uint32_t host_gpu_memory_sparse_granularity_log2_ = UINT32_MAX;
   std::vector<uint64_t> host_gpu_memory_sparse_allocated_;
   uint32_t host_gpu_memory_sparse_allocations_ = 0;
@@ -227,6 +236,32 @@ class SharedMemory {
   // Subset of valid pages containing data written by the GPU.
   std::vector<uint64_t> system_page_flags_valid_and_gpu_written_;
   uint32_t num_system_page_flags_ = 0;
+
+  // gpu_stream_dynamic_pages: pages the game rewrites every frame. Requests
+  // with allow_streamed upload them without making them valid or protecting
+  // them, saving a protection change and a guest write fault per page per
+  // frame. A page is streamed after write faults in two frames in a row, and
+  // the set is re-learned every kStreamedPagesResetFrames frames. Only the
+  // command processor thread changes the streamed set (under the global
+  // critical region); guest threads set the faulted bits.
+  static constexpr uint32_t kStreamedPagesResetFrames = 600;
+  // A streamed page uploaded more times than this in one frame (used by very
+  // many draws) is cheaper to protect: it goes back to being watched, and
+  // can't be streamed again until the next reset. An extra 4 KB upload costs
+  // well under a microsecond, a protection change plus the write fault that
+  // undoes it about 25. A cap of 4 sent enough Springfield pages back to
+  // being watched to cost about 1 FPS there.
+  static constexpr uint8_t kStreamedPageMaxUploadsPerFrame = 64;
+  std::vector<uint64_t> system_page_flags_streamed_;
+  std::vector<uint64_t> system_page_flags_streamed_blocked_;
+  std::vector<uint64_t> system_page_flags_faulted_;
+  std::vector<uint64_t> system_page_flags_faulted_previous_;
+  std::vector<uint8_t> streamed_page_uploads_this_frame_;
+  uint32_t streamed_pages_frames_ = 0;
+  bool streamed_pages_active_ = false;
+  // Set while RequestValidatedRanges uploads for an allow_streamed request,
+  // read by MakeRangeValid (both on the command processor thread).
+  bool upload_allow_streamed_ = false;
 
   static std::pair<uint32_t, uint32_t> MemoryInvalidationCallbackThunk(
       void* context_ptr, uint32_t physical_address_start, uint32_t length, bool exact_range);

@@ -38,6 +38,7 @@
 #include <rex/graphics/pipeline/shader/spirv.h>
 #include <rex/graphics/pipeline/shader/spirv_builder.h>
 #include <rex/graphics/pipeline/shader/spirv_translator.h>
+#include <rex/graphics/pipeline/texture/util.h>
 #include <rex/graphics/register_file.h>
 #include <rex/graphics/registers.h>
 #include <rex/graphics/util/draw.h>
@@ -53,6 +54,13 @@
 
 REXCVAR_DEFINE_BOOL(gpu_log_pipeline_state, false, "GPU/Vulkan",
                     "Log the state of every graphics pipeline created (diagnostic)");
+
+REXCVAR_DEFINE_BOOL(texture_fetch_fast_path, true, "GPU/Vulkan",
+                    "Translate pixel shaders whose textures are all unsigned without the "
+                    "per-component signedness handling, so their texture fetches can overlap, "
+                    "and those whose textures all have one mip level, no anisotropic filtering "
+                    "and the same magnification and minification filter sampling level 0 "
+                    "without gradients (both give the same results)");
 
 REXCVAR_DEFINE_INT32(
     vulkan_pipeline_creation_threads, -1, "GPU/Vulkan",
@@ -80,12 +88,14 @@ REXCVAR_DEFINE_STRING(shader_inventory_csv, "", "GPU",
 // The native renderer's ahead-of-time shader directory: when set, shader
 // translations are loaded as precompiled SPIR-V modules from
 // <dir>/<ucode_hash>_<vs|ps>_<modification>.spv instead of running the
-// microcode translator at draw time. Files are produced by the AOT compiler
-// from a play session's shader dumps; anything missing falls back to the
-// runtime translator transparently.
+// microcode translator at draw time (native replacement shaders, built by
+// tools/native-renderer/native_shaders/build_native_shaders.py); anything
+// missing falls back to the runtime translator transparently. Empty uses the
+// native_shaders folder next to the executable, where release packages put it.
 REXCVAR_DEFINE_STRING(aot_shader_path, "", "GPU",
-                      "Directory of ahead-of-time compiled shader modules "
-                      "(empty = translate at runtime).");
+                      "Directory of ahead-of-time compiled shader modules (empty = the "
+                      "native_shaders folder next to the executable if there is one, otherwise "
+                      "translate at runtime).");
 
 REXCVAR_DEFINE_STRING(pipeline_inventory_json, "", "GPU",
                       "Path to write the full pipeline state inventory to at exit "
@@ -691,8 +701,12 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
     bool translation_is_new = false;
     auto* translation = static_cast<VulkanShader::VulkanTranslation*>(
         shader->GetOrCreateTranslation(translation_needed.second, &translation_is_new));
+    // Ahead-of-time modules serve stored modifications too, so they're used
+    // in play and not only by shaders first seen this session.
     if (!translation->is_translated() &&
-        !TranslateAnalyzedShader(*shader_translator_, *translation)) {
+        !TryLoadAotTranslation(
+            *translation, shader->type() == xenos::ShaderType::kVertex ? "vs" : "ps") &&
+        (++aot_misses_, !TranslateAnalyzedShader(*shader_translator_, *translation))) {
       if (translation_is_new) {
         shader->DestroyTranslation(translation_needed.second);
       }
@@ -991,7 +1005,7 @@ void VulkanPipelineCache::WritePipelineInventory() const {
 }
 
 void VulkanPipelineCache::Shutdown() {
-  if (!REXCVAR_GET(aot_shader_path).empty()) {
+  if (!aot_set_dir_.empty()) {
     REXGPU_INFO("VulkanPipelineCache: AOT shader loads {} hit / {} translated at runtime",
                 aot_hits_, aot_misses_);
   }
@@ -1216,6 +1230,44 @@ SpirvShaderTranslator::Modification VulkanPipelineCache::GetCurrentPixelShaderMo
     modification.pixel.param_gen_point = 0;
   }
 
+  // The plain texture variant: every component of every texture the shader
+  // fetches is unsigned. The texture cache gives the shader the same swizzled
+  // signs (and unsigned ones for textures it doesn't bind).
+  if (REXCVAR_GET(texture_fetch_fast_path) && !shader.texture_bindings().empty() &&
+      command_processor_.GetVulkanDevice()->properties().imageViewFormatSwizzle) {
+    constexpr uint8_t kSwizzledSignsUnsigned =
+        uint8_t(xenos::TextureSign::kUnsigned) * uint8_t(0b01010101);
+    bool textures_plain = true;
+    for (const Shader::TextureBinding& binding : shader.texture_bindings()) {
+      if (texture_util::SwizzleSigns(regs.GetTextureFetch(binding.fetch_constant)) !=
+          kSwizzledSignsUnsigned) {
+        textures_plain = false;
+        break;
+      }
+    }
+    modification.pixel.textures_plain = uint32_t(textures_plain);
+  }
+
+  // The level 0 variant: every texture the shader fetches has a single mip
+  // level (no mip address), no anisotropic filtering (without mips, the texture
+  // cache takes it only from the fetch constant) and the same magnification
+  // and minification filter (the texture cache samples linearly exactly where
+  // the fetch constant says linear), so gradients can't change the results.
+  if (REXCVAR_GET(texture_fetch_fast_path) && !shader.texture_bindings().empty()) {
+    bool textures_level0 = true;
+    for (const Shader::TextureBinding& binding : shader.texture_bindings()) {
+      xenos::xe_gpu_texture_fetch_t fetch = regs.GetTextureFetch(binding.fetch_constant);
+      if ((fetch.mip_address & 0x1FFFF) != 0 ||
+          fetch.aniso_filter != xenos::AnisoFilter::kDisabled ||
+          (fetch.mag_filter == xenos::TextureFilter::kLinear) !=
+              (fetch.min_filter == xenos::TextureFilter::kLinear)) {
+        textures_level0 = false;
+        break;
+      }
+    }
+    modification.pixel.textures_level0 = uint32_t(textures_level0);
+  }
+
   if (render_target_cache_.GetPath() == RenderTargetCache::Path::kHostRenderTargets) {
     using DepthStencilMode = SpirvShaderTranslator::Modification::DepthStencilMode;
     if (render_target_cache_.depth_float24_convert_in_pixel_shader() &&
@@ -1239,6 +1291,192 @@ SpirvShaderTranslator::Modification VulkanPipelineCache::GetCurrentPixelShaderMo
   return modification;
 }
 
+std::filesystem::path VulkanPipelineCache::FindAotShaderSet() const {
+  std::filesystem::path aot_dir(REXCVAR_GET(aot_shader_path));
+  if (aot_dir.empty()) {
+    std::filesystem::path packaged_dir = rex::filesystem::GetExecutableFolder() / "native_shaders";
+    std::error_code packaged_dir_error;
+    if (!std::filesystem::is_directory(packaged_dir, packaged_dir_error)) {
+      return {};
+    }
+    aot_dir = packaged_dir;
+  }
+  // A module only fits the translator configuration it was made for, beyond
+  // the shader and the modification its file name keys: the draw resolution
+  // scale (the set for a scale other than 1x1 is in the scale<X>x<Y>
+  // subdirectory), the render target path (render_target_path.txt, "host" if
+  // absent - modules for host render targets write color outputs, which the
+  // fragment shader interlock path doesn't have), and the image view swizzles
+  // and float controls the modules rely on.
+  std::filesystem::path set_dir(aot_dir);
+  uint32_t scale_x = render_target_cache_.draw_resolution_scale_x();
+  uint32_t scale_y = render_target_cache_.draw_resolution_scale_y();
+  if (scale_x != 1 || scale_y != 1) {
+    set_dir /= fmt::format("scale{}x{}", scale_x, scale_y);
+  }
+  std::error_code set_dir_error;
+  if (!std::filesystem::is_directory(set_dir, set_dir_error)) {
+    REXGPU_WARN(
+        "VulkanPipelineCache: no ahead-of-time shader set for draw resolution scale {}x{} in {}; "
+        "shaders are translated at runtime",
+        scale_x, scale_y, set_dir.string());
+    return {};
+  }
+  // A set made by an older translator can still contain fixed bugs, so it is
+  // only used when made by this translator version.
+  uint32_t version = 0;
+  FILE* version_file = rex::filesystem::OpenFile(set_dir / "translator_version.txt", "rb");
+  if (version_file) {
+    if (fscanf(version_file, "%u", &version) != 1) {
+      version = 0;
+    }
+    fclose(version_file);
+  }
+  if (version != SpirvShaderTranslator::kTranslatedModuleVersion) {
+    REXGPU_WARN(
+        "VulkanPipelineCache: ignoring the ahead-of-time shader set in {}: made by translator "
+        "version {}, current is {}; shaders are translated at runtime",
+        set_dir.string(), version, SpirvShaderTranslator::kTranslatedModuleVersion);
+    return {};
+  }
+  char set_render_target_path[16] = "host";
+  FILE* path_file = rex::filesystem::OpenFile(set_dir / "render_target_path.txt", "rb");
+  if (path_file) {
+    if (fscanf(path_file, "%15s", set_render_target_path) != 1) {
+      std::strcpy(set_render_target_path, "host");
+    }
+    fclose(path_file);
+  }
+  const char* render_target_path =
+      render_target_cache_.GetPath() == RenderTargetCache::Path::kPixelShaderInterlock ? "fsi"
+                                                                                       : "host";
+  if (std::strcmp(set_render_target_path, render_target_path)) {
+    REXGPU_WARN(
+        "VulkanPipelineCache: ignoring the ahead-of-time shader set in {}: made for the {} "
+        "render target path, the current one is {}; shaders are translated at runtime",
+        set_dir.string(), set_render_target_path, render_target_path);
+    return {};
+  }
+  SpirvShaderTranslator::Features features(command_processor_.GetVulkanDevice());
+  if (!features.image_view_format_swizzle || !features.signed_zero_inf_nan_preserve_float32 ||
+      !features.denorm_flush_to_zero_float32 || !features.rounding_mode_rte_float32) {
+    REXGPU_WARN(
+        "VulkanPipelineCache: ignoring the ahead-of-time shader set in {}: the device lacks "
+        "image view swizzles or float controls its modules rely on; shaders are translated at "
+        "runtime",
+        set_dir.string());
+    return {};
+  }
+  REXGPU_INFO("VulkanPipelineCache: serving ahead-of-time shaders from {}", set_dir.string());
+  return set_dir;
+}
+
+bool VulkanPipelineCache::TryLoadAotTranslation(VulkanShader::VulkanTranslation& translation,
+                                                const char* stage) {
+  if (!aot_set_checked_) {
+    aot_set_checked_ = true;
+    aot_set_dir_ = FindAotShaderSet();
+  }
+  if (aot_set_dir_.empty()) {
+    return false;
+  }
+  auto open_aot_module = [&](uint64_t modification) {
+    return rex::filesystem::OpenFile(
+        aot_set_dir_ /
+            fmt::format("{:016X}_{}_{:016X}.spv", translation.shader().ucode_data_hash(), stage,
+                        modification),
+        "rb");
+  };
+  FILE* aot_file = open_aot_module(translation.modification());
+  if (!aot_file && translation.shader().type() == xenos::ShaderType::kPixel) {
+    // A module made without the plain or the level 0 texture variant handles
+    // every texture signedness and filtering, so it serves those draws too:
+    // try without the level 0 bit, then without the plain bit, then without
+    // both.
+    SpirvShaderTranslator::Modification modification(translation.modification());
+    for (uint32_t clear : {1u, 2u, 3u}) {
+      SpirvShaderTranslator::Modification general(modification);
+      bool changed = false;
+      if ((clear & 1) && general.pixel.textures_level0) {
+        general.pixel.textures_level0 = 0;
+        changed = true;
+      }
+      if ((clear & 2) && general.pixel.textures_plain) {
+        general.pixel.textures_plain = 0;
+        changed = true;
+      }
+      if (changed && (aot_file = open_aot_module(general.value))) {
+        break;
+      }
+    }
+  }
+  if (!aot_file) {
+    return false;
+  }
+  fseek(aot_file, 0, SEEK_END);
+  long aot_size = ftell(aot_file);
+  fseek(aot_file, 0, SEEK_SET);
+  std::vector<uint8_t> aot_data;
+  bool ok = false;
+  if (aot_size > 0 && !(aot_size & 3)) {
+    aot_data.resize(size_t(aot_size));
+    ok = fread(aot_data.data(), 1, aot_data.size(), aot_file) == aot_data.size();
+  }
+  fclose(aot_file);
+  if (!ok) {
+    return false;
+  }
+  // The binding sidecar is mandatory: PostTranslation never runs for a
+  // served module, and without the texture/sampler binding lists pipeline
+  // layout construction walks empty structures (which crashed - in a loop,
+  // through the guest exception handler - on the first boot that served
+  // one). Missing sidecar means the set predates it: fall back to runtime
+  // translation for safety.
+  SpirvShader* spirv_shader = dynamic_cast<SpirvShader*>(&translation.shader());
+  if (!spirv_shader) {
+    return false;
+  }
+  std::filesystem::path bind_path =
+      aot_set_dir_ /
+      fmt::format("{:016X}_{}.bind", translation.shader().ucode_data_hash(), stage);
+  FILE* bind_file = rex::filesystem::OpenFile(bind_path, "rb");
+  if (!bind_file) {
+    return false;
+  }
+  std::vector<SpirvShader::TextureBinding> aot_textures;
+  std::vector<SpirvShader::SamplerBinding> aot_samplers;
+  bool bind_ok = false;
+  {
+    uint32_t magic = 0, tex_count = 0, samp_count = 0;
+    if (fread(&magic, 4, 1, bind_file) == 1 && magic == 0x444E4258 &&
+        fread(&tex_count, 4, 1, bind_file) == 1 && tex_count <= 64) {
+      aot_textures.resize(tex_count);
+      if (!tex_count || fread(aot_textures.data(), sizeof(aot_textures[0]), tex_count,
+                              bind_file) == tex_count) {
+        if (fread(&samp_count, 4, 1, bind_file) == 1 && samp_count <= 64) {
+          aot_samplers.resize(samp_count);
+          bind_ok = !samp_count || fread(aot_samplers.data(), sizeof(aot_samplers[0]),
+                                         samp_count, bind_file) == samp_count;
+        }
+      }
+    }
+    fclose(bind_file);
+  }
+  if (!bind_ok) {
+    return false;
+  }
+  spirv_shader->InstallBindingsFromPrecompiled(std::move(aot_textures),
+                                               std::move(aot_samplers));
+  translation.InstallPrecompiledBinary(std::move(aot_data));
+  // The same setup as after a runtime translation: without the binding
+  // layout IDs the command processor never bound a served shader's textures.
+  if (!SetUpTranslatedShader(translation)) {
+    return false;
+  }
+  ++aot_hits_;
+  return true;
+}
+
 bool VulkanPipelineCache::EnsureShadersTranslated(VulkanShader::VulkanTranslation* vertex_shader,
                                                   VulkanShader::VulkanTranslation* pixel_shader) {
   // Edge flags are not supported yet (because polygon primitives are not).
@@ -1247,100 +1485,6 @@ bool VulkanPipelineCache::EnsureShadersTranslated(VulkanShader::VulkanTranslatio
               register_file_.Get<reg::SQ_PROGRAM_CNTL>().vs_export_mode !=
                   xenos::VertexShaderExportMode::kPosition2VectorsEdgeKill);
   assert_false(register_file_.Get<reg::SQ_PROGRAM_CNTL>().gen_index_vtx);
-  auto try_aot = [this](Shader::Translation& translation, const char* stage) {
-    const std::string& aot_dir = REXCVAR_GET(aot_shader_path);
-    if (aot_dir.empty()) {
-      return false;
-    }
-    if (aot_version_matches_ < 0) {
-      // A set made by an older translator can still contain fixed bugs, so it
-      // is only used when made by this translator version.
-      uint32_t aot_version = 0;
-      FILE* version_file = rex::filesystem::OpenFile(
-          std::filesystem::path(aot_dir) / "translator_version.txt", "rb");
-      if (version_file) {
-        if (fscanf(version_file, "%u", &aot_version) != 1) {
-          aot_version = 0;
-        }
-        fclose(version_file);
-      }
-      aot_version_matches_ = aot_version == SpirvShaderTranslator::kTranslatedModuleVersion;
-      if (!aot_version_matches_) {
-        REXGPU_WARN(
-            "VulkanPipelineCache: ignoring the ahead-of-time shader set in {}: made by "
-            "translator version {}, current is {}; shaders are translated at runtime",
-            aot_dir, aot_version, SpirvShaderTranslator::kTranslatedModuleVersion);
-      }
-    }
-    if (!aot_version_matches_) {
-      return false;
-    }
-    std::filesystem::path aot_path =
-        std::filesystem::path(aot_dir) /
-        fmt::format("{:016X}_{}_{:016X}.spv", translation.shader().ucode_data_hash(), stage,
-                    translation.modification());
-    FILE* aot_file = rex::filesystem::OpenFile(aot_path, "rb");
-    if (!aot_file) {
-      return false;
-    }
-    fseek(aot_file, 0, SEEK_END);
-    long aot_size = ftell(aot_file);
-    fseek(aot_file, 0, SEEK_SET);
-    std::vector<uint8_t> aot_data;
-    bool ok = false;
-    if (aot_size > 0 && !(aot_size & 3)) {
-      aot_data.resize(size_t(aot_size));
-      ok = fread(aot_data.data(), 1, aot_data.size(), aot_file) == aot_data.size();
-    }
-    fclose(aot_file);
-    if (!ok) {
-      return false;
-    }
-    // The binding sidecar is mandatory: PostTranslation never runs for a
-    // served module, and without the texture/sampler binding lists pipeline
-    // layout construction walks empty structures (which crashed - in a loop,
-    // through the guest exception handler - on the first boot that served
-    // one). Missing sidecar means the set predates it: fall back to runtime
-    // translation for safety.
-    SpirvShader* spirv_shader = dynamic_cast<SpirvShader*>(&translation.shader());
-    if (!spirv_shader) {
-      return false;
-    }
-    std::filesystem::path bind_path =
-        std::filesystem::path(aot_dir) /
-        fmt::format("{:016X}_{}.bind", translation.shader().ucode_data_hash(), stage);
-    FILE* bind_file = rex::filesystem::OpenFile(bind_path, "rb");
-    if (!bind_file) {
-      return false;
-    }
-    std::vector<SpirvShader::TextureBinding> aot_textures;
-    std::vector<SpirvShader::SamplerBinding> aot_samplers;
-    bool bind_ok = false;
-    {
-      uint32_t magic = 0, tex_count = 0, samp_count = 0;
-      if (fread(&magic, 4, 1, bind_file) == 1 && magic == 0x444E4258 &&
-          fread(&tex_count, 4, 1, bind_file) == 1 && tex_count <= 64) {
-        aot_textures.resize(tex_count);
-        if (!tex_count || fread(aot_textures.data(), sizeof(aot_textures[0]), tex_count,
-                                bind_file) == tex_count) {
-          if (fread(&samp_count, 4, 1, bind_file) == 1 && samp_count <= 64) {
-            aot_samplers.resize(samp_count);
-            bind_ok = !samp_count || fread(aot_samplers.data(), sizeof(aot_samplers[0]),
-                                           samp_count, bind_file) == samp_count;
-          }
-        }
-      }
-      fclose(bind_file);
-    }
-    if (!bind_ok) {
-      return false;
-    }
-    spirv_shader->InstallBindingsFromPrecompiled(std::move(aot_textures),
-                                                 std::move(aot_samplers));
-    translation.InstallPrecompiledBinary(std::move(aot_data));
-    ++aot_hits_;
-    return true;
-  };
   // Modification-aware translated-binary dump (dump_shaders alone only
   // writes ucode on Vulkan): the ground truth to diff an ahead-of-time
   // module against when a served pipeline misbehaves.
@@ -1362,7 +1506,7 @@ bool VulkanPipelineCache::EnsureShadersTranslated(VulkanShader::VulkanTranslatio
   };
   if (!vertex_shader->is_translated()) {
     vertex_shader->shader().AnalyzeUcode(ucode_disasm_buffer_);
-    if (!try_aot(*vertex_shader, "vs") &&
+    if (!TryLoadAotTranslation(*vertex_shader, "vs") &&
         (++aot_misses_, !TranslateAnalyzedShader(*shader_translator_, *vertex_shader))) {
       REXGPU_ERROR("Failed to translate the vertex shader!");
       return false;
@@ -1378,7 +1522,7 @@ bool VulkanPipelineCache::EnsureShadersTranslated(VulkanShader::VulkanTranslatio
       // Analysis must run regardless of the AOT path - modification
       // derivation and texture binding info read it.
       pixel_shader->shader().AnalyzeUcode(ucode_disasm_buffer_);
-      if (!try_aot(*pixel_shader, "ps") &&
+      if (!TryLoadAotTranslation(*pixel_shader, "ps") &&
           (++aot_misses_, !TranslateAnalyzedShader(*shader_translator_, *pixel_shader))) {
         REXGPU_ERROR("Failed to translate the pixel shader!");
         return false;
@@ -1593,6 +1737,11 @@ bool VulkanPipelineCache::TranslateAnalyzedShader(SpirvShaderTranslator& transla
     REXGPU_ERROR("Shader {:016X} translation failed; marking as ignored", shader.ucode_data_hash());
     return false;
   }
+  return SetUpTranslatedShader(translation);
+}
+
+bool VulkanPipelineCache::SetUpTranslatedShader(VulkanShader::VulkanTranslation& translation) {
+  VulkanShader& shader = static_cast<VulkanShader&>(translation.shader());
   if (translation.GetOrCreateShaderModule() == VK_NULL_HANDLE) {
     return false;
   }

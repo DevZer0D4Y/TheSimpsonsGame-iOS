@@ -193,7 +193,6 @@ class Presenter {
    public:
     enum class Effect {
       kBilinear,
-#if defined(REX_HAS_FIDELITYFX_SDK)
       kCas,
       // AMD FidelityFX Super Resolution upsampling, Contrast Adaptive
       // Sharpening otherwise.
@@ -206,10 +205,8 @@ class Presenter {
       // where available; currently still experimental due to limited temporal
       // inputs in the presenter path.
       kFsr3,
-#endif
     };
 
-#if defined(REX_HAS_FIDELITYFX_SDK)
     enum class FsrQualityMode {
       // Keep current behavior and use the guest output size as-is.
       kAuto,
@@ -241,7 +238,6 @@ class Presenter {
     static constexpr float kFsrSharpnessReductionDefault = 0.2f;
     static_assert(kFsrSharpnessReductionDefault >= kFsrSharpnessReductionMin &&
                   kFsrSharpnessReductionDefault <= kFsrSharpnessReductionMax);
-#endif  // defined(REX_HAS_FIDELITYFX_SDK)
 
     // In the sharpness setters, min / max with a constant as the first argument
     // also drops NaNs.
@@ -254,7 +250,6 @@ class Presenter {
     Effect GetEffect() const { return effect_; }
     void SetEffect(Effect new_effect) { effect_ = new_effect; }
 
-#if defined(REX_HAS_FIDELITYFX_SDK)
     float GetCasAdditionalSharpness() const { return cas_additional_sharpness_; }
     void SetCasAdditionalSharpness(float new_cas_additional_sharpness) {
       cas_additional_sharpness_ =
@@ -280,7 +275,6 @@ class Presenter {
     void SetFsrQualityMode(FsrQualityMode new_fsr_quality_mode) {
       fsr_quality_mode_ = new_fsr_quality_mode;
     }
-#endif  // defined(REX_HAS_FIDELITYFX_SDK)
 
     // Very tiny effect, but highly noticeable, for instance, on the sky in the
     // 4D5307E6 main menu (prominently in Custom Games, especially with FSR -
@@ -295,12 +289,10 @@ class Presenter {
     // original front buffer as possible.
     bool allow_overscan_cutoff_ = false;
     Effect effect_ = Effect::kBilinear;
-#if defined(REX_HAS_FIDELITYFX_SDK)
     float cas_additional_sharpness_ = kCasAdditionalSharpnessDefault;
     uint32_t fsr_max_upsampling_passes_ = kFsrMaxUpscalingPassesMax;
     float fsr_sharpness_reduction_ = kFsrSharpnessReductionDefault;
     FsrQualityMode fsr_quality_mode_ = FsrQualityMode::kAuto;
-#endif
     bool dither_ = false;
   };
 
@@ -408,7 +400,6 @@ class Presenter {
   enum class GuestOutputPaintEffect {
     kBilinear,
     kBilinearDither,
-#if defined(REX_HAS_FIDELITYFX_SDK)
     kCasSharpen,
     kCasSharpenDither,
     kCasResample,
@@ -416,7 +407,6 @@ class Presenter {
     kFsrEasu,
     kFsrRcas,
     kFsrRcasDither,
-#endif
 
     kCount,
   };
@@ -427,11 +417,9 @@ class Presenter {
       // Dithering is never performed in intermediate passes because it may be
       // interpreted as features by the subsequent passes.
       case GuestOutputPaintEffect::kBilinearDither:
-#if defined(REX_HAS_FIDELITYFX_SDK)
       case GuestOutputPaintEffect::kCasSharpenDither:
       case GuestOutputPaintEffect::kCasResampleDither:
       case GuestOutputPaintEffect::kFsrRcasDither:
-#endif
         return false;
       default:
         // The result of any other effect can be stretched with bilinear
@@ -442,16 +430,13 @@ class Presenter {
 
   static constexpr bool CanGuestOutputPaintEffectBeFinal(GuestOutputPaintEffect effect) {
     switch (effect) {
-#if defined(REX_HAS_FIDELITYFX_SDK)
       case GuestOutputPaintEffect::kFsrEasu:
         return false;
-#endif
       default:
         return true;
     };
   }
 
-#if defined(REX_HAS_FIDELITYFX_SDK)
   // The longest path is kFsrMaxUpscalingPassesMax + optionally RCAS +
   // optionally bilinear, when upscaling by more than
   // 2^kFsrMaxUpscalingPassesMax along any direction.
@@ -459,10 +444,6 @@ class Presenter {
   // more than 2 along any direction) CAS followed by bilinear.
   static constexpr size_t kMaxGuestOutputPaintEffects =
       GuestOutputPaintConfig::kFsrMaxUpscalingPassesMax + 2;
-#else
-  // Bilinear-only path: at most 1 effect.
-  static constexpr size_t kMaxGuestOutputPaintEffects = 1;
-#endif
 
   struct GuestOutputPaintFlow {
     // Letterbox on up to 4 sides.
@@ -529,7 +510,6 @@ class Presenter {
     }
   };
 
-#if defined(REX_HAS_FIDELITYFX_SDK)
   static constexpr float CalculateCasPostSetupSharpness(float sharpness) {
     // CasSetup const1.x.
     return -1.0f / (8.0f - 3.0f * sharpness);
@@ -596,7 +576,6 @@ class Presenter {
       sharpness_post_setup = CalculatePostSetupSharpness(config.GetFsrSharpnessReduction());
     }
   };
-#endif  // defined(REX_HAS_FIDELITYFX_SDK)
 
   explicit Presenter(HostGpuLossCallback host_gpu_loss_callback)
       : host_gpu_loss_callback_(host_gpu_loss_callback) {}

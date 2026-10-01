@@ -54,7 +54,13 @@ class VulkanGpuProfiler {
   // shader pair, so the log can rank shader pairs by GPU time.
   bool per_draw() const { return per_draw_; }
   void MarkDraw(DeferredCommandBuffer& command_buffer, uint64_t vertex_shader_hash,
-                uint64_t pixel_shader_hash);
+                uint64_t pixel_shader_hash) {
+    MarkKeyed(command_buffer, Category::kDraw, vertex_shader_hash, pixel_shader_hash);
+  }
+  // With gpu_profile_draws, starts an interval of `next` charged to a key
+  // (such as a resolve's formats and size), ranked with the draws.
+  void MarkKeyed(DeferredCommandBuffer& command_buffer, Category next, uint64_t key_a,
+                 uint64_t key_b);
   // Final mark of the frame, before the swap submission ends.
   void EndFrame(DeferredCommandBuffer& command_buffer);
   // Called once the frame's submissions have completed on the GPU.
@@ -82,6 +88,7 @@ class VulkanGpuProfiler {
     double ms = 0.0;
     uint32_t count = 0;
     uint32_t first_ordinal = 0;
+    Category category = Category::kDraw;
   };
 
   const ui::vulkan::VulkanDevice* vulkan_device_ = nullptr;

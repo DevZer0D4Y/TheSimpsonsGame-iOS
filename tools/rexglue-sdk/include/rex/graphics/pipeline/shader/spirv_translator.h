@@ -88,6 +88,15 @@ class SpirvShaderTranslator : public ShaderTranslator {
       uint32_t param_gen_point : 1;
       // For host render targets - depth / stencil output mode.
       DepthStencilMode depth_stencil_mode : 3;
+      // Every component of every texture the shader fetches is unsigned, so
+      // texture fetches read only the unsigned binding and skip the
+      // per-component signedness handling (see AreTextureFetchesPlain).
+      uint32_t textures_plain : 1;
+      // Every texture the shader fetches has a single mip level, no
+      // anisotropic filtering and the same magnification and minification
+      // filter, so implicit-LOD fetches sample level 0 instead of using
+      // gradients (see AreTextureFetchesLevel0).
+      uint32_t textures_level0 : 1;
     } pixel;
     uint64_t value = 0;
 
@@ -538,6 +547,23 @@ class SpirvShaderTranslator : public ShaderTranslator {
   bool IsSpirvRectangleListVertexLoopEnabled() const {
     return IsSpirvVertexShader() && GetSpirvShaderModification().vertex.host_vertex_shader_type ==
                                         Shader::HostVertexShaderType::kRectangleListAsTriangleStrip;
+  }
+
+  // Texture fetches of the plain texture variant: with only unsigned
+  // components, the result is the unsigned sample (times the exponent bias),
+  // fetched without branching, so the host compiler can issue the fetches of a
+  // block together instead of waiting for each before the next.
+  bool AreTextureFetchesPlain() const {
+    return is_pixel_shader() && GetSpirvShaderModification().pixel.textures_plain &&
+           features_.image_view_format_swizzle;
+  }
+
+  // Texture fetches of the level 0 variant: with a single mip level, no
+  // anisotropic filtering and the same filter either way, gradients can't
+  // change what a fetch using the fetch constant's filters returns, so it
+  // samples level 0 directly, without computing them.
+  bool AreTextureFetchesLevel0() const {
+    return is_pixel_shader() && GetSpirvShaderModification().pixel.textures_level0;
   }
 
   bool IsExecutionModeEarlyFragmentTests() const {

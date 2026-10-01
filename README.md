@@ -116,18 +116,15 @@ because the game runs their logic once per frame (`menu_frame_rate` in `simpsons
 this off).
 
 **Image quality.** FXAA anti-aliasing is on by default for new installs and smooths the
-cel-shading outlines at little cost. On a Steam Deck, keep the render scale at 1x. On desktop
-GPUs, a render scale of 2x or 3x supersamples the whole image, which gives the outlines their
-cleanest look.
+cel-shading outlines at little cost. A render scale of 2x or 3x supersamples the whole image, which
+gives the outlines their cleanest look. On a Steam Deck, 1x holds 60 FPS; 2x looks much sharper
+and runs at about 50 FPS in Springfield, the busiest area.
 
 ## Known issues
 
 - At 60 FPS some scripted sequences can misbehave, because the game was built for 30 FPS. A known
   case is the dam in "Lisa the Tree Hugger", where random deaths can happen at 60; switch to 30
   for that section if it happens.
-- The launcher's "Instant character pop-in" patch is experimental. Characters appear without it
-  now; the patch additionally runs the game's streaming priming draws, which have crashed Steam
-  Deck GPUs during level loads in the past. Leave it off unless you are testing it.
 - If videos show a black screen on Windows, switch the graphics backend to Vulkan in the
   launcher's settings.
 
@@ -244,10 +241,24 @@ build output.
 
 ## Roadmap
 
-- **Native renderer.** The game draws through the Xbox 360 GPU's command stream, which the runtime
-  decodes and translates. That layer is being replaced step by step with rendering driven directly
-  by the game's Direct3D calls, with the current renderer kept as a fallback throughout.
-- **Performance** on Steam Deck, especially in heavy scenes.
+The goal is for this to be the best way to play the game. In rough order:
+
+- **Fully native renderer.** The game draws through the Xbox 360 GPU's command stream, which the
+  runtime decodes and translates. That layer is being replaced step by step with rendering driven
+  directly by the game's Direct3D calls, with the current renderer kept as a fallback throughout.
+  The most expensive shaders already have native replacements. A native renderer is also what the
+  features below build on.
+- **No slowdowns or stutters.** A steady 60 FPS everywhere, including at 2x internal resolution
+  on the Steam Deck, with no shader compilation hitches.
+- **Widescreen.** Wider aspect ratios such as 21:9 without stretching.
+- **Keyboard and mouse.** Proper keyboard controls with rebinding, instead of the current
+  controller emulation.
+- **Controller prompts.** Button icons that match the controller you have connected (Xbox,
+  PlayStation, Nintendo, Steam Deck) in every in-game prompt, menu and tutorial.
+- **Game fixes.** Fixes for bugs in the original game.
+- **Restored content.** Unused content from the original game, brought back where it works.
+- **Mod support.** A mod loader and tools for replacing and adding scripts, models, objects and
+  levels.
 - **Android** port.
 
 ## Legal

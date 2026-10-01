@@ -40,7 +40,11 @@ namespace {
 
 constexpr size_t kNumCounters = static_cast<size_t>(CounterId::kCount);
 
-std::array<std::atomic<int64_t>, kNumCounters> g_counters{};
+// Each counter on its own cache line: different threads (the GPU command
+// processor, audio, guest threads) increment different counters, and packed
+// together every increment bounced the shared lines between cores.
+struct alignas(64) PaddedCounter : std::atomic<int64_t> {};
+std::array<PaddedCounter, kNumCounters> g_counters{};
 std::array<std::atomic<int64_t>, kNumCounters> g_snapshot{};
 
 constexpr const char* kCounterNames[] = {

@@ -1410,6 +1410,20 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
         // kTextureFetch.
         assert_true(instr.opcode == ucode::FetchOpcode::kTextureFetch);
 
+        // In the plain texture variant, only the unsigned binding is sampled,
+        // and the result needs no signedness handling (SampleTexture takes no
+        // binding conditions for this).
+        bool textures_plain = AreTextureFetchesPlain();
+        // In the level 0 variant, fetches with the fetch constant's filters
+        // sample level 0 without gradients (the result is the same).
+        bool sample_level0 = AreTextureFetchesLevel0() && use_computed_lod &&
+                             !instr.attributes.use_register_gradients &&
+                             instr.dimension == xenos::FetchOpDimension::k2D &&
+                             instr.attributes.mag_filter == xenos::TextureFilter::kUseFetchConst &&
+                             instr.attributes.min_filter == xenos::TextureFilter::kUseFetchConst &&
+                             instr.attributes.aniso_filter == xenos::AnisoFilter::kUseFetchConst;
+        bool sample_with_gradients = use_computed_lod && !sample_level0;
+
         // Extract the signedness for each component of the swizzled result, and
         // get which bindings (unsigned and signed) are needed.
         spv::Id swizzled_signs[4] = {};
@@ -1419,7 +1433,7 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
         spv::Id const_uint_2 = builder_->makeUintConstant(2);
         spv::Id const_uint_sign_signed =
             builder_->makeUintConstant(uint32_t(xenos::TextureSign::kSigned));
-        {
+        if (!textures_plain) {
           uint32_t result_remaining_components = used_result_nonzero_components;
           uint32_t result_component_index;
           while (rex::bit_scan_forward(result_remaining_components, &result_component_index)) {
@@ -1447,7 +1461,8 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
           }
         }
         spv::Id is_any_unsigned =
-            builder_->createUnaryOp(spv::OpLogicalNot, type_bool_, is_all_signed);
+            textures_plain ? spv::NoResult
+                           : builder_->createUnaryOp(spv::OpLogicalNot, type_bool_, is_all_signed);
 
         // Load the fetch constant word 4, needed unconditionally for LOD
         // biasing, for result exponent biasing, and conditionally for stacked
@@ -1495,7 +1510,7 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
         // k2D.
         // 3D vectors for k3DOrStacked, kCube.
         spv::Id gradients_h = spv::NoResult, gradients_v = spv::NoResult;
-        if (use_computed_lod) {
+        if (sample_with_gradients) {
           // TODO(Triang3l): Gradient exponent adjustment is currently not done
           // in getCompTexLOD, so not doing it here too for now. Apply the
           // gradient exponent biases from the word 4 of the fetch constant in
@@ -1656,9 +1671,11 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
 
         // Sample the texture.
         spv::ImageOperandsMask image_operands_mask =
-            use_computed_lod ? spv::ImageOperandsGradMask : spv::ImageOperandsLodMask;
+            sample_with_gradients ? spv::ImageOperandsGradMask : spv::ImageOperandsLodMask;
         spv::Id sample_result_unsigned, sample_result_signed;
-        if (!use_computed_lod) {
+        if (sample_level0) {
+          texture_parameters.lod = const_float_0_;
+        } else if (!use_computed_lod) {
           texture_parameters.lod = lod;
         }
         if (instr.dimension == xenos::FetchOpDimension::k3DOrStacked) {
@@ -1878,7 +1895,7 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
           sample_result_signed =
               if_data_is_3d.createMergePhi(sample_result_signed_3d, sample_result_signed_stacked);
         } else {
-          if (use_computed_lod) {
+          if (sample_with_gradients) {
             texture_parameters.gradX = gradients_h;
             texture_parameters.gradY = gradients_v;
           }
@@ -1990,6 +2007,11 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
                     ? builder_->createCompositeExtract(sample_result_unsigned, type_float_,
                                                        result_component_index)
                     : result[result_component_index];
+            if (textures_plain) {
+              // Unsigned - the component as sampled.
+              result[result_component_index] = sample_result_component_unsigned;
+              continue;
+            }
             spv::Block& block_sign_head = *builder_->getBuildPoint();
             spv::Block* block_sign_signed =
                 features_.image_view_format_swizzle ? &builder_->makeNewBlock() : nullptr;
@@ -2225,32 +2247,38 @@ void SpirvShaderTranslator::SampleTexture(spv::Builder::TextureParameters& textu
                                           spv::Id is_any_signed, spv::Id& result_unsigned_out,
                                           spv::Id& result_signed_out, spv::Id lerp_factor,
                                           spv::Id lerp_first_unsigned, spv::Id lerp_first_signed) {
+  auto sample = [&](uint32_t is_signed) {
+    spv::Id image = is_signed ? image_signed : image_unsigned;
+    // OpSampledImage must be in the same block as where its result is used.
+    texture_parameters.sampler = builder_->createBinOp(
+        spv::OpSampledImage, builder_->makeSampledImageType(builder_->getTypeId(image)), image,
+        sampler);
+    spv::Id sign_result =
+        builder_->createTextureCall(spv::NoPrecision, type_float4_, false, false, false, false,
+                                    false, texture_parameters, image_operands_mask);
+    if (lerp_factor != spv::NoResult) {
+      spv::Id lerp_first = is_signed ? lerp_first_signed : lerp_first_unsigned;
+      if (lerp_first != spv::NoResult) {
+        spv::Id lerp_difference = builder_->createNoContractionBinOp(
+            spv::OpVectorTimesScalar, type_float4_,
+            builder_->createNoContractionBinOp(spv::OpFSub, type_float4_, sign_result, lerp_first),
+            lerp_factor);
+        sign_result = builder_->createNoContractionBinOp(spv::OpFAdd, type_float4_, sign_result,
+                                                         lerp_difference);
+      }
+    }
+    return sign_result;
+  };
+  if (is_any_unsigned == spv::NoResult) {
+    // Plain texture fetch - only the unsigned binding, without branching.
+    result_unsigned_out = sample(0);
+    result_signed_out = const_float4_0_;
+    return;
+  }
   for (uint32_t i = 0; i < 2; ++i) {
     SpirvBuilder::IfBuilder sign_if(i ? is_any_signed : is_any_unsigned,
                                     spv::SelectionControlDontFlattenMask, *builder_);
-    spv::Id sign_result;
-    {
-      spv::Id image = i ? image_signed : image_unsigned;
-      // OpSampledImage must be in the same block as where its result is used.
-      texture_parameters.sampler = builder_->createBinOp(
-          spv::OpSampledImage, builder_->makeSampledImageType(builder_->getTypeId(image)), image,
-          sampler);
-      sign_result =
-          builder_->createTextureCall(spv::NoPrecision, type_float4_, false, false, false, false,
-                                      false, texture_parameters, image_operands_mask);
-      if (lerp_factor != spv::NoResult) {
-        spv::Id lerp_first = i ? lerp_first_signed : lerp_first_unsigned;
-        if (lerp_first != spv::NoResult) {
-          spv::Id lerp_difference = builder_->createNoContractionBinOp(
-              spv::OpVectorTimesScalar, type_float4_,
-              builder_->createNoContractionBinOp(spv::OpFSub, type_float4_, sign_result,
-                                                 lerp_first),
-              lerp_factor);
-          sign_result = builder_->createNoContractionBinOp(spv::OpFAdd, type_float4_, sign_result,
-                                                           lerp_difference);
-        }
-      }
-    }
+    spv::Id sign_result = sample(i);
     sign_if.makeEndIf();
     // This may overwrite the first lerp endpoint for the sign (such usage of
     // this function is allowed).

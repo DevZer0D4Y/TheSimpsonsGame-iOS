@@ -39,7 +39,7 @@ from pathlib import Path
 # at build time, so packaged builds always know exactly which release they
 # are (otherwise every launcher shipped inside vX.Y.Z.W would compare itself
 # against its own release and nag "update available" forever).
-VERSION = "0.0.6.0"
+VERSION = "0.0.6.1"
 
 FROZEN = getattr(sys, "frozen", False)
 if FROZEN:
@@ -248,6 +248,10 @@ SETTINGS_SCHEMA = {
     # quality
     "resolution_scale": ("int", 1, True),
     "anisotropic_override": ("int", 3, False),
+    # How the guest image is scaled to the window: bilinear, AMD FidelityFX
+    # FSR 1 (spatial upscaling with sharpening) or CAS (sharpening only).
+    "present_effect": ("str", "bilinear", True),
+    "present_fsr_sharpness_reduction": ("float", 0.2, True),   # stops, 0 = sharpest
     # FXAA works on every backend since 0.0.6.0 (it used to show a black
     # screen with Vulkan on the Steam Deck); new installs start with it.
     "swap_post_effect": ("str", "fxaa", True),     # none, fxaa, fxaa_extreme
@@ -413,48 +417,25 @@ def _toml_flag(key, default="false"):
     return m.group(1) if m else default
 
 
-def patch_instant_popin_state():
-    return "on" if _toml_flag("gpu_allow_invalid_fetch_constants") == "true" else "off"
-
-
-def patch_instant_popin(enable):
-    """Community fix for characters/props loading in late (they exist on the
-    disc with 'invalid' vertex descriptors; real hardware drew them anyway --
-    xenia-project/game-compatibility#542). Trade-off on Steam Deck: rarely, a
-    level load can hand the GPU garbage and hang it, so a shader runaway cap
-    is enabled alongside as a guardrail. If a level load freezes, turn this
-    patch off."""
-    if not GAME_TOML.exists():
-        return False, "game config not found"
+def retire_instant_popin_patch():
+    """The old 'Instant character pop-in' patch (the stale streaming 'priming'
+    draws, which could hang the GPU on Steam Deck) is gone: the engine draws
+    characters with absent optional streams itself now. Turn its settings off
+    for anyone who still had it on."""
+    if _toml_flag("gpu_allow_invalid_fetch_constants") != "true":
+        return
     text = GAME_TOML.read_text(encoding="utf-8")
-    subs = [
-        (r"^gpu_allow_invalid_fetch_constants\s*=.*$",
-         f"gpu_allow_invalid_fetch_constants = {'true' if enable else 'false'}"),
-        (r"^gpu_shader_max_cf_iterations\s*=.*$",
-         f"gpu_shader_max_cf_iterations = {'4096' if enable else '0'}"),
-    ]
-    for pat, rep in subs:
-        if not re.search(pat, text, re.M):
-            return False, "config keys missing - reinstall/repair first"
-        text = re.sub(pat, rep, text, flags=re.M)
+    text = re.sub(r"^gpu_allow_invalid_fetch_constants\s*=.*$",
+                  "gpu_allow_invalid_fetch_constants = false", text, flags=re.M)
+    text = re.sub(r"^gpu_shader_max_cf_iterations\s*=.*$",
+                  "gpu_shader_max_cf_iterations = 0", text, flags=re.M)
     GAME_TOML.write_text(text, encoding="utf-8")
-    # the runaway cap is baked into translated shaders - force a rebuild
+    # the shader runaway cap it enabled is baked into translated shaders
     shutil.rmtree(USER_DATA / "cache", ignore_errors=True)
-    return True, ("instant pop-in ON (shader cache rebuilds on next launch)"
-                  if enable else "instant pop-in OFF (maximum stability)")
 
 
 def patches_list():
     return [
-        {"id": "instant_popin", "name": "Instant character pop-in (community fix)",
-         "desc": "EXPERIMENTAL - the engine now draws finished characters with "
-                 "absent optional streams by default, so most missing-character "
-                 "cases no longer need this. This toggle additionally runs the "
-                 "stale streaming 'priming' draws; it has CRASHED on Steam Deck "
-                 "during level loads in the past (a GPU driver interaction; the "
-                 "same fix works in Xenia on desktop GPUs). Try it only if "
-                 "things still stream in late.",
-         "state": patch_instant_popin_state(), "available": GAME_TOML.exists()},
         {"id": "skip_intro", "name": "Skip intro logo videos",
          "desc": "Boots straight past the EA / Fox / Gracie logo movies.",
          "state": patch_skip_intro_state(), "available": patch_skip_intro_state() != "unavailable"},
@@ -1316,11 +1297,9 @@ def diagnose_exit(code, duration, log_text):
         verdict = f"The game exited with error code {code}."
     if any(s in low for s in ("device lost", "vk_error_device_lost", "gpu hang", "gpu hung",
                               "device_lost")):
-        hints.append("A GPU hang / 'device lost' shows in the log. If the 'Instant character "
-                     "pop-in' patch is enabled, disable it in the Patches tab — that is its "
-                     "known failure mode on Steam Deck. The launcher purges the shader cache "
-                     "automatically after a bad exit, so the next launch may stutter briefly "
-                     "while it rebuilds.")
+        hints.append("A GPU hang / 'device lost' shows in the log. The launcher purges the "
+                     "shader cache automatically after a bad exit, so the next launch may "
+                     "stutter briefly while it rebuilds.")
     if any(s in low for s in ("out of memory", "bad_alloc", "not enough memory")):
         hints.append("An out-of-memory error shows in the log — close other applications or "
                      "lower quality settings.")
@@ -1743,6 +1722,7 @@ def launch_game():
     with game_proc_lock:
         if game_running_pids():
             return False, "Game is already running"
+        retire_instant_popin_patch()
         if not GAMEDATA.is_dir():
             return False, ("No game data installed yet — use the Install tab to install "
                            "from your Xbox 360 ISO.")
@@ -1798,20 +1778,6 @@ def launch_game():
         # it for the game regardless of the user's global LS settings.
         env["DISABLE_LSFG"] = "1"
         env_notes.append("DISABLE_LSFG=1 (Lossless Scaling frame-gen disabled for stability)")
-        if patch_instant_popin_state() == "on":
-            # capture a driver dump if the GPU ever hangs (black-box recorder)
-            env["RADV_DEBUG"] = "hang"
-            # DRIVER EXPERIMENT: the level-load wedge reproduces on the SteamOS
-            # system driver (Mesa 24.3, built 2025-05) under every engine
-            # configuration; run on the year-newer Mesa from the flatpak GL
-            # runtime instead. Their libs resolve after ours (appended last).
-            icd = LAUNCHER_DIR / "mesa-new-icd.json"
-            gl_lib = Path("/var/lib/flatpak/runtime/org.freedesktop.Platform.GL.default"
-                          "/x86_64/24.08/active/files/lib")
-            if icd.exists() and (gl_lib / "libvulkan_radeon.so").exists():
-                env["VK_DRIVER_FILES"] = str(icd)
-                env["LD_LIBRARY_PATH"] = env.get("LD_LIBRARY_PATH", "") + ":" + str(gl_lib)
-                env_notes.append("instant pop-in patch active: RADV_DEBUG=hang + newer Mesa driver")
         # Experiments survive stale launcher backends: extra env is read from
         # launcher-env.json at every PLAY press, not baked into this process.
         env_file = LAUNCHER_DIR / "launcher-env.json"
@@ -1991,11 +1957,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if path == "/api/patch":
             if body.get("id") == "skip_intro":
                 ok, msg = patch_skip_intro(bool(body.get("enable")))
-                return self._send(200, {"ok": ok, "msg": msg})
-            if body.get("id") == "instant_popin":
-                if game_running_pids():
-                    return self._send(200, {"ok": False, "msg": "close the game first"})
-                ok, msg = patch_instant_popin(bool(body.get("enable")))
                 return self._send(200, {"ok": ok, "msg": msg})
             return self._send(404, {"ok": False, "msg": "unknown patch"})
         if path == "/api/diagnostics":

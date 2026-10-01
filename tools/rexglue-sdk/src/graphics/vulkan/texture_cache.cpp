@@ -1179,7 +1179,10 @@ std::unique_ptr<TextureCache::Texture> VulkanTextureCache::CreateTexture(Texture
   bool native_resolve_destination =
       native_resolve_textures_enabled_ && native_resolve_format != VK_FORMAT_UNDEFINED &&
       key.tiled && key.dimension == xenos::DataDimension::k2DOrStacked &&
-      depth_or_array_size == 1 && !key.mip_max_level && !key.scaled_resolve &&
+      depth_or_array_size == 1 && !key.mip_max_level &&
+      // With draw resolution scaling, resolves write the scaled textures of
+      // resolved memory (at the scaled size, like the render targets).
+      key.scaled_resolve == IsDrawResolutionScaled() &&
       IsNativeResolveTextureFormat(key.format) &&
       IsColorAttachmentFormatSupported(native_resolve_format) &&
       IsColorAttachmentFormatSupported(formats[0]) &&
@@ -1273,7 +1276,7 @@ uint32_t VulkanTextureCache::FindNativeResolveTargets(uint32_t dest_base,
                                                       xenos::TextureFormat format,
                                                       xenos::Endian endian,
                                                       NativeResolveTarget* targets_out) {
-  if (!native_resolve_textures_enabled_ || IsDrawResolutionScaled()) {
+  if (!native_resolve_textures_enabled_) {
     return 0;
   }
   dest_base &= 0x1FFFFFFF;
@@ -1288,7 +1291,8 @@ uint32_t VulkanTextureCache::FindNativeResolveTargets(uint32_t dest_base,
     const TextureKey& key = texture.key();
     if (key.format != format || key.endianness != endian || !key.tiled ||
         key.dimension != xenos::DataDimension::k2DOrStacked || key.depth_or_array_size_minus_1 ||
-        key.signed_separate || key.scaled_resolve || (uint32_t(key.pitch) << 5) != dest_pitch_texels ||
+        key.signed_separate || key.scaled_resolve != IsDrawResolutionScaled() ||
+        (uint32_t(key.pitch) << 5) != dest_pitch_texels ||
         texture.GetGuestMipsSize() || texture.outdated_mask()) {
       return;
     }
@@ -1332,6 +1336,28 @@ void VulkanTextureCache::EndNativeResolveWrite(const NativeResolveTarget& target
   MarkTextureBaseWrittenByGpu(*static_cast<VulkanTexture*>(target.texture));
 }
 
+void VulkanTextureCache::AddScaledMemoryPending(void* texture, int32_t delta) {
+  static_cast<VulkanTexture*>(texture)->AddScaledMemoryPending(delta);
+}
+
+VkImageView VulkanTextureCache::BeginScaledMemoryWriteback(void* texture_ptr) {
+  auto& texture = *static_cast<VulkanTexture*>(texture_ptr);
+  texture.MarkAsUsed();
+  VulkanTexture::Usage old_usage = texture.SetUsage(VulkanTexture::Usage::kScaledMemoryWriteback);
+  if (old_usage != VulkanTexture::Usage::kScaledMemoryWriteback) {
+    VkPipelineStageFlags src_stage_mask, dst_stage_mask;
+    VkAccessFlags src_access_mask, dst_access_mask;
+    VkImageLayout old_layout, new_layout;
+    GetTextureUsageMasks(old_usage, src_stage_mask, src_access_mask, old_layout);
+    GetTextureUsageMasks(VulkanTexture::Usage::kScaledMemoryWriteback, dst_stage_mask,
+                         dst_access_mask, new_layout);
+    command_processor_.PushImageMemoryBarrier(
+        texture.image(), ui::vulkan::util::InitializeSubresourceRange(), src_stage_mask,
+        dst_stage_mask, src_access_mask, dst_access_mask, old_layout, new_layout);
+  }
+  return texture.GetNativeResolveView();
+}
+
 bool VulkanTextureCache::EnsureScaledResolveMemoryCommitted(uint32_t start_unscaled,
                                                             uint32_t length_unscaled,
                                                             uint32_t length_scaled_alignment_log2) {
@@ -1368,6 +1394,21 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
   }
   VulkanTexture& vulkan_texture = static_cast<VulkanTexture&>(texture);
   TextureKey texture_key = vulkan_texture.key();
+
+  // Resolved data the scaled resolve memory doesn't have yet (only in other
+  // textures written by native resolves) must be written back before loading
+  // from it - before anything here is bound, the write-back is a dispatch too.
+  if (texture_key.scaled_resolve && scaled_resolve_memory_flusher_) {
+    const texture_util::TextureGuestLayout& guest_layout = vulkan_texture.guest_layout();
+    if (load_base && guest_layout.base.level_data_extent_bytes) {
+      scaled_resolve_memory_flusher_(uint32_t(texture_key.base_page) << 12,
+                                     guest_layout.base.level_data_extent_bytes);
+    }
+    if (load_mips && guest_layout.mips_total_extent_bytes) {
+      scaled_resolve_memory_flusher_(uint32_t(texture_key.mip_page) << 12,
+                                     guest_layout.mips_total_extent_bytes);
+    }
+  }
 
   // Get the pipeline.
   const HostFormatPair& host_format_pair = GetHostFormatPair(texture_key);
@@ -2449,6 +2490,9 @@ void VulkanTextureCache::GetScaledResolveUsageMasks(VkPipelineStageFlags& stage_
   stage_mask_out = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
   access_mask_out = VK_ACCESS_SHADER_READ_BIT;
   if (write) {
+    // Resolves write it from compute shaders, native resolves from fragment
+    // shaders.
+    stage_mask_out |= VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
     access_mask_out |= VK_ACCESS_SHADER_WRITE_BIT;
   }
 }
@@ -3404,6 +3448,11 @@ void VulkanTextureCache::GetTextureUsageMasks(VulkanTexture::Usage usage,
       stage_mask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
       access_mask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
       layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+      break;
+    case VulkanTexture::Usage::kScaledMemoryWriteback:
+      stage_mask = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+      access_mask = VK_ACCESS_SHADER_READ_BIT;
+      layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
       break;
   }
 }

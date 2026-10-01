@@ -128,14 +128,14 @@ void VulkanGpuProfiler::Mark(DeferredCommandBuffer& command_buffer, Category nex
                                      current_slot_index_ * kMaxMarksPerFrame + mark);
 }
 
-void VulkanGpuProfiler::MarkDraw(DeferredCommandBuffer& command_buffer,
-                                 uint64_t vertex_shader_hash, uint64_t pixel_shader_hash) {
+void VulkanGpuProfiler::MarkKeyed(DeferredCommandBuffer& command_buffer, Category next,
+                                  uint64_t key_a, uint64_t key_b) {
   if (!current_ || current_->mark_count >= kMaxMarksPerFrame) {
     return;
   }
   uint32_t mark = current_->mark_count++;
-  current_->categories[mark] = Category::kDraw;
-  current_->draw_shaders[mark] = {vertex_shader_hash, pixel_shader_hash};
+  current_->categories[mark] = next;
+  current_->draw_shaders[mark] = {key_a, key_b};
   current_->draw_ordinals[mark] = ++current_->draw_count;
   command_buffer.CmdVkWriteTimestamp(VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, query_pool_,
                                      current_slot_index_ * kMaxMarksPerFrame + mark);
@@ -180,6 +180,7 @@ void VulkanGpuProfiler::FrameCompleted(uint64_t frame_index) {
       stats.ms += double(end - begin) * to_ms;
       if (!stats.count++) {
         stats.first_ordinal = slot.draw_ordinals[i];
+        stats.category = slot.categories[i];
       }
     }
   }
@@ -205,10 +206,17 @@ void VulkanGpuProfiler::FrameCompleted(uint64_t frame_index) {
     size_t shown = std::min(sorted.size(), size_t(30));
     for (size_t i = 0; i < shown; ++i) {
       const auto& [shaders, stats] = sorted[i];
-      REXGPU_INFO("[gpu-profile-draw] vs={:016X} ps={:016X} {:.3f}ms {:.1f} draws per frame, "
-                  "first draw #{}",
-                  shaders.first, shaders.second, stats.ms / frames, stats.count / frames,
-                  stats.first_ordinal);
+      if (stats.category == Category::kDraw) {
+        REXGPU_INFO("[gpu-profile-draw] vs={:016X} ps={:016X} {:.3f}ms {:.1f} draws per frame, "
+                    "first draw #{}",
+                    shaders.first, shaders.second, stats.ms / frames, stats.count / frames,
+                    stats.first_ordinal);
+      } else {
+        REXGPU_INFO("[gpu-profile-draw] {} key={:016X}:{:016X} {:.3f}ms {:.1f} per frame, "
+                    "first mark #{}",
+                    CategoryName(stats.category), shaders.first, shaders.second,
+                    stats.ms / frames, stats.count / frames, stats.first_ordinal);
+      }
     }
     draw_stats_.clear();
   }

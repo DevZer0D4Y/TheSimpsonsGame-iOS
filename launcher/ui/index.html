@@ -338,6 +338,25 @@
           </select>
         </div>
         <div class="field">
+          <label>Upscaling filter</label>
+          <select id="s-present_effect">
+            <option value="bilinear">Bilinear (default)</option>
+            <option value="fsr">AMD FSR 1 — sharper upscaling</option>
+            <option value="cas">AMD CAS — sharpening only</option>
+          </select>
+          <div class="hint">How the game's 720p image is scaled to your screen. FSR 1 gives the
+            crispest picture on 1080p and larger monitors. Restart needed.</div>
+        </div>
+        <div class="field">
+          <label>FSR sharpening</label>
+          <select id="s-present_fsr_sharpness_reduction">
+            <option value="0">Strong</option>
+            <option value="0.2">Normal</option>
+            <option value="0.5">Soft</option>
+            <option value="1">Very soft</option>
+          </select>
+        </div>
+        <div class="field">
           <label>Anti-aliasing</label>
           <select id="s-swap_post_effect">
             <option value="none">Off</option>
@@ -432,16 +451,6 @@
 
   <!-- ============================ PATCHES =========================== -->
   <section id="tab-patches" class="hidden">
-    <div class="callout warn" id="popin-warning">
-      <span class="tag">Warning</span>
-      <div><b>Steam Deck players:</b> the "Instant character pop-in" patch below is known to
-      <b>hang the GPU and crash the whole desktop session</b> on Steam Deck's AMD hardware —
-      this reproduces identically whether you're on SteamOS or Steam Deck's own Windows
-      dual-boot, so it isn't a one-off fluke. Leave it <b>OFF</b> unless you're specifically
-      testing it and are prepared for a hard crash (save your game and close other work
-      first). It's expected to work fine on most other GPUs/PCs — this is a known, actively
-      investigated compatibility issue, not something you're doing wrong.</div>
-    </div>
     <div class="card">
       <h2>GAME PATCHES</h2>
       <p class="muted">One-click tweaks applied to your installed copy. Everything is reversible.</p>
@@ -550,8 +559,7 @@
       <h3>Platform status</h3>
       <p class="muted">
         • <b>Linux / Steam Deck</b> — playable: menus, saves, video, full gameplay.<br>
-        • <b>Windows</b> — experimental, builds and boots via CI; shares the same GPU
-          compatibility caveat noted in the Patches tab on Steam Deck's own hardware.<br>
+        • <b>Windows</b> — experimental, builds and boots via CI.<br>
         • <b>Android</b> — planned, not started.
       </p>
       <h3>Credits</h3>
@@ -941,11 +949,6 @@ async function restoreSave(name){
 
 /* patches */
 async function togglePatch(id, enable){
-  if (id === "instant_popin" && enable) {
-    if (!confirm("This is known to HANG THE GPU and crash your whole desktop session on " +
-                 "Steam Deck hardware (SteamOS and Windows alike). Make sure everything else " +
-                 "is saved/closed first.\n\nEnable anyway?")) return;
-  }
   try {
     const r = await api.post("/api/patch", {id, enable});
     if (!r.ok) alert("Patch failed: " + (r.msg || r.error || "unknown error"));
@@ -1082,6 +1085,8 @@ async function loadSettings(){
   $("#s-present_letterbox").checked = v.present_letterbox;
   $("#s-resolution_scale").value = String(v.resolution_scale);
   $("#s-swap_post_effect").value = v.swap_post_effect || "none";
+  $("#s-present_effect").value = v.present_effect || "bilinear";
+  $("#s-present_fsr_sharpness_reduction").value = String(Number(v.present_fsr_sharpness_reduction));
   $("#s-anisotropic_override").value = String(v.anisotropic_override);
   $("#s-video_mode_refresh_rate").value = String(Math.round(v.video_mode_refresh_rate));
   $("#s-mnk_mode").checked = v.mnk_mode;
@@ -1107,6 +1112,8 @@ $("#savebtn").onclick = async () => {
     present_letterbox: $("#s-present_letterbox").checked,
     resolution_scale: Number($("#s-resolution_scale").value),
     swap_post_effect: $("#s-swap_post_effect").value,
+    present_effect: $("#s-present_effect").value,
+    present_fsr_sharpness_reduction: Number($("#s-present_fsr_sharpness_reduction").value),
     anisotropic_override: Number($("#s-anisotropic_override").value),
     video_mode_refresh_rate: Number($("#s-video_mode_refresh_rate").value),
     mnk_mode: $("#s-mnk_mode").checked,

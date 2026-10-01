@@ -13,9 +13,12 @@
 #include <array>
 #include <cstdint>
 #include <cstring>
+#include <deque>
 #include <functional>
 #include <memory>
 #include <unordered_map>
+#include <utility>
+#include <vector>
 
 #include <rex/graphics/flags.h>
 #include <rex/graphics/pipeline/render_target/cache.h>
@@ -108,6 +111,14 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   // pure-overhead transfer draws per frame) render identically without them.
   bool native_rt_mode() const { return native_rt_mode_; }
   bool native_resolve_enabled() const { return native_resolve_enabled_; }
+
+  // native_resolve_scaled_lazy_memory: color native resolves with draw
+  // resolution scaling leave the scaled resolve memory unwritten while their
+  // data is in the first target texture; these write it back when something is
+  // about to read that memory (unscaled range), or everything (before traces
+  // and cache clears).
+  void FlushPendingScaledResolveMemory(uint32_t start, uint32_t length);
+  void FlushAllPendingScaledResolveMemory();
 
   // Ownership-transfer draws elided since startup by the native mode - the
   // concrete measure of what this mode removes from the frame.
@@ -858,6 +869,13 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
     // xenos::Endian of the memory, bits 4:5.
     kNativeResolveFlagMemoryEndianShift = 4,
     kNativeResolveFlagMemory64bpp = 1u << 6,
+    // The memory is the scaled resolve buffer (with draw resolution scaling),
+    // bound from the resolve destination's base.
+    kNativeResolveFlagMemoryScaled = 1u << 7,
+    // Depth, with native_resolve_quad_stencil_capture_: also store the stencil
+    // of each 2x2 quad of host pixels of the rectangle, as one dword, to the
+    // buffer bound in place of the memory (not with kNativeResolveFlagWriteMemory).
+    kNativeResolveFlagStencilCapture = 1u << 8,
   };
   // How a source texel is packed into the texel bits, the same way as when
   // dumping the render target to the EDRAM.
@@ -877,6 +895,13 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
     // For kNativeResolveFlagWriteMemory: texel (0, 0) and the tiled pitch.
     uint32_t dest_base_dwords;
     uint32_t dest_pitch_texels;
+    // Draw resolution scale for kNativeResolveFlagMemoryScaled: x | (y << 8) |
+    // (log2 x << 16) | (log2 y << 20) | (both powers of two << 31).
+    uint32_t resolution_scale;
+    // For kNativeResolveFlagStencilCapture: the host pixel of the rectangle's
+    // origin (x | (y << 16), both even) and the quads per row.
+    uint32_t stencil_capture_origin;
+    uint32_t stencil_capture_pitch_quads;
   };
   struct NativeResolvePlan {
     VulkanRenderTarget* source = nullptr;
@@ -911,8 +936,16 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   // Records the texture writes (and with write_memory, the guest memory writes
   // in the first target's draw), and marks the textures as up to date - must be
   // called after the memory range has been marked as resolved.
+  // With draw resolution scaling, scaled_memory_descriptor_set (set 1 in place
+  // of the shared memory) binds the scaled resolve buffer from the
+  // destination's base for the memory writes.
+  // Without write_memory, stencil_capture_descriptor_set (a depth resolve's
+  // stencil capture in place of the shared memory) makes the first target's
+  // draw also capture the stencil (kNativeResolveFlagStencilCapture).
   void PerformNativeResolve(VulkanTextureCache& texture_cache, const NativeResolvePlan& plan,
-                            bool write_memory);
+                            bool write_memory,
+                            VkDescriptorSet scaled_memory_descriptor_set = VK_NULL_HANDLE,
+                            VkDescriptorSet stencil_capture_descriptor_set = VK_NULL_HANDLE);
 
   bool gamma_render_target_as_unorm16_ = false;
 
@@ -975,6 +1008,74 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   uint64_t direct_resolve_fallback_count_ = 0;
 
   bool native_resolve_enabled_ = false;
+  uint32_t native_resolve_shared_memory_binding_count_ = 0;
+  // Fragment shader quad subgroup operations are supported, and the depth
+  // native resolve shader captures the stencil with them.
+  bool native_resolve_quad_stencil_capture_ = false;
+
+  // A native resolve whose scaled resolve memory hasn't been written: the data
+  // is in the texture (kept alive while pending) - for color, in the raw bits
+  // the memory would hold; for depth, as the converted depth the texture
+  // samples, with the stencil the memory would also hold captured separately.
+  struct PendingScaledResolveMemory {
+    void* texture = nullptr;
+    uint32_t dest_base = 0;
+    uint32_t extent_start = 0;
+    uint32_t extent_length = 0;
+    uint32_t dest_pitch_texels = 0;
+    uint32_t x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+    uint32_t memory_flags = 0;
+    // Depth: the resolve's flags (depth format) and the index of the stencil
+    // capture (scaled_stencil_captures_), in 2x2 quads of host pixels per dword
+    // (written by the native resolve) or bytes (copied).
+    bool is_depth = false;
+    uint32_t flags = 0;
+    uint32_t stencil_capture = UINT32_MAX;
+    bool stencil_capture_quads = false;
+    // native_resolve_debug_verify_stencil_capture: a copied capture the
+    // write-back compares the quad capture with.
+    uint32_t verify_stencil_capture = UINT32_MAX;
+  };
+  std::vector<PendingScaledResolveMemory> pending_scaled_resolve_memory_;
+  VulkanTextureCache* pending_scaled_resolve_texture_cache_ = nullptr;
+  // Sampled image descriptor sets (descriptor_set_pool_sampled_image_) used by
+  // write-backs, with the submission using them, freed once it completes.
+  std::deque<std::pair<uint64_t, size_t>> scaled_memory_writeback_descriptors_;
+  VkShaderModule scaled_memory_writeback_shader_ = VK_NULL_HANDLE;
+  VkPipelineLayout scaled_memory_writeback_pipeline_layout_ = VK_NULL_HANDLE;
+  VkPipeline scaled_memory_writeback_pipeline_ = VK_NULL_HANDLE;
+  bool scaled_memory_writeback_pipeline_failed_ = false;
+  bool EnsureScaledMemoryWritebackPipeline();
+  // The depth write-back also reads the stencil capture (set 2).
+  VkShaderModule scaled_memory_writeback_depth_shader_ = VK_NULL_HANDLE;
+  VkPipelineLayout scaled_memory_writeback_depth_pipeline_layout_ = VK_NULL_HANDLE;
+  VkPipeline scaled_memory_writeback_depth_pipeline_ = VK_NULL_HANDLE;
+  bool scaled_memory_writeback_depth_pipeline_failed_ = false;
+  bool EnsureScaledMemoryWritebackDepthPipeline();
+  // The stencil of a lazily written depth resolve, one byte per host texel of
+  // the resolved rectangle, row by row.
+  struct ScaledStencilCapture {
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    VkDeviceSize size = 0;
+    bool in_use = false;
+  };
+  std::vector<ScaledStencilCapture> scaled_stencil_captures_;
+  // Index of a capture not held by a pending resolve, of at least `size` bytes
+  // (created if needed), or UINT32_MAX if there are too many. Captures are
+  // reused right away: the copy into one waits for earlier accesses to it.
+  uint32_t AcquireScaledStencilCapture(VkDeviceSize size);
+  void ReleaseScaledStencilCapture(uint32_t index);
+  // Copies the stencil of the resolved rectangle of the source to a capture.
+  void CaptureScaledResolveStencil(VulkanRenderTarget& source, uint32_t x0, uint32_t y0,
+                                   uint32_t x1, uint32_t y1, uint32_t capture_index);
+  // Releases what a pending resolve holds without writing it back.
+  void DropPendingScaledResolveMemory(const PendingScaledResolveMemory& pending);
+  // Records the write-back of one pending resolve and releases its texture.
+  void WriteBackPendingScaledResolveMemory(const PendingScaledResolveMemory& pending);
+  // Before a resolve writes [start, start + length): pending resolves it fully
+  // covers are dropped (superseded), partially overlapped ones written back.
+  void PrepareScaledResolveMemoryForResolve(uint32_t start, uint32_t length);
   VkShaderModule native_resolve_vertex_shader_ = VK_NULL_HANDLE;
   VkShaderModule native_resolve_fragment_shaders_[size_t(NativeResolveShader::kCount)] = {};
   VkPipelineLayout native_resolve_pipeline_layout_color_ = VK_NULL_HANDLE;

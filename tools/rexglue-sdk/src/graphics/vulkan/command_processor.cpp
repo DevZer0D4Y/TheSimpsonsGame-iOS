@@ -25,6 +25,7 @@
 #include <SPIRV/GlslangToSpv.h>
 #include <glslang/Public/ShaderLang.h>
 #include <rex/assert.h>
+#include <rex/chrono/clock.h>
 #include <rex/cvar.h>
 #include <rex/dbg.h>
 #include <rex/logging.h>
@@ -91,6 +92,19 @@ REXCVAR_DEFINE_BOOL(vulkan_dynamic_rendering, true, "GPU/Vulkan",
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 namespace rex::graphics::vulkan {
+
+// Host ticks spent building submission command buffers from the deferred
+// command buffer, in vkQueueSubmit for them, and in the per-frame memexport
+// readback, for the command processor's gpu_wait_stats log.
+std::atomic<uint64_t> g_submission_build_ticks{0};
+std::atomic<uint64_t> g_submission_submit_ticks{0};
+std::atomic<uint64_t> g_submission_count{0};
+std::atomic<uint64_t> g_memexport_readback_ticks{0};
+// Draws with the stencil test enabled, and those of them that can write the
+// stencil (non-zero write mask), for the gpu_wait_stats log.
+std::atomic<uint64_t> g_stencil_enabled_draws{0};
+std::atomic<uint64_t> g_stencil_write_draws{0};
+
 
 void RtDebugLogBeginFrame();
 
@@ -559,7 +573,8 @@ void main() {
 }
 
 bool CompileGlslToSpirvInternal(EShLanguage stage, std::string_view source,
-                                std::vector<uint32_t>& spirv_out, std::string& error_out) {
+                                std::vector<uint32_t>& spirv_out, std::string& error_out,
+                                bool spirv_1_3 = false) {
   static std::once_flag glslang_initialize_once;
   std::call_once(glslang_initialize_once, []() { glslang::InitializeProcess(); });
 
@@ -567,8 +582,11 @@ bool CompileGlslToSpirvInternal(EShLanguage stage, std::string_view source,
   glslang::TShader shader(stage);
   shader.setStrings(&source_c_str, 1);
   shader.setEnvInput(glslang::EShSourceGlsl, stage, glslang::EShClientVulkan, 450);
-  shader.setEnvClient(glslang::EShClientVulkan, glslang::EShTargetVulkan_1_0);
-  shader.setEnvTarget(glslang::EShTargetSpv, glslang::EShTargetSpv_1_0);
+  // SPIR-V 1.3 (Vulkan 1.1) for shaders using subgroup operations.
+  shader.setEnvClient(glslang::EShClientVulkan,
+                      spirv_1_3 ? glslang::EShTargetVulkan_1_1 : glslang::EShTargetVulkan_1_0);
+  shader.setEnvTarget(glslang::EShTargetSpv,
+                      spirv_1_3 ? glslang::EShTargetSpv_1_3 : glslang::EShTargetSpv_1_0);
 
   EShMessages messages = EShMessages(EShMsgSpvRules | EShMsgVulkanRules);
   if (!shader.parse(&kGlslangDefaultTBuiltInResource, 450, false, messages)) {
@@ -785,7 +803,7 @@ std::string VulkanCommandProcessor::GetWindowTitleText() const {
 bool VulkanCommandProcessor::CompileGlslToSpirv(VkShaderStageFlagBits stage,
                                                 std::string_view source,
                                                 std::vector<uint32_t>& spirv_out,
-                                                std::string& error_out) const {
+                                                std::string& error_out, bool spirv_1_3) const {
   EShLanguage glslang_stage;
   switch (stage) {
     case VK_SHADER_STAGE_VERTEX_BIT:
@@ -810,7 +828,7 @@ bool VulkanCommandProcessor::CompileGlslToSpirv(VkShaderStageFlagBits stage,
       error_out = fmt::format("Unsupported Vulkan shader stage mask {}", uint32_t(stage));
       return false;
   }
-  return CompileGlslToSpirvInternal(glslang_stage, source, spirv_out, error_out);
+  return CompileGlslToSpirvInternal(glslang_stage, source, spirv_out, error_out, spirv_1_3);
 }
 
 bool VulkanCommandProcessor::SetupContext() {
@@ -930,6 +948,21 @@ bool VulkanCommandProcessor::SetupContext() {
     REXGPU_ERROR(
         "Failed to create a Vulkan descriptor set layout for two storage "
         "buffers bound to the compute shader");
+    return false;
+  }
+  // Transient: a storage buffer for the guest shader stages.
+  VkDescriptorSetLayoutBinding descriptor_set_layout_binding_transient_guest =
+      descriptor_set_layout_binding_transient;
+  descriptor_set_layout_binding_transient_guest.stageFlags = guest_shader_stages;
+  descriptor_set_layout_create_info.bindingCount = 1;
+  descriptor_set_layout_create_info.pBindings = &descriptor_set_layout_binding_transient_guest;
+  if (dfn.vkCreateDescriptorSetLayout(
+          device, &descriptor_set_layout_create_info, nullptr,
+          &descriptor_set_layouts_single_transient_[size_t(
+              SingleTransientDescriptorLayout::kStorageBufferGuestShaders)]) != VK_SUCCESS) {
+    REXGPU_ERROR(
+        "Failed to create a Vulkan descriptor set layout for a storage buffer "
+        "bound to the guest shader stages");
     return false;
   }
 
@@ -1068,6 +1101,9 @@ bool VulkanCommandProcessor::SetupContext() {
     return false;
   }
   texture_cache_->SetNativeResolveTexturesEnabled(render_target_cache_->native_resolve_enabled());
+  texture_cache_->SetScaledResolveMemoryFlusher([this](uint32_t start, uint32_t length) {
+    render_target_cache_->FlushPendingScaledResolveMemory(start, length);
+  });
 
   // Shared memory and EDRAM common bindings.
   VkDescriptorPoolSize descriptor_pool_sizes[1];
@@ -2425,6 +2461,10 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
     return;
   }
 
+  if (shared_memory_) {
+    shared_memory_->OnGuestFrameEnd();
+  }
+
   // HAND PATCH: the accurate memexport readback happens once per frame here
   // (see PerformDeferredMemexportReadback) instead of draining the queue
   // mid-frame per draw.
@@ -3425,7 +3465,9 @@ VkDescriptorSet VulkanCommandProcessor::AllocateSingleTransientDescriptor(
     [[maybe_unused]] const VkDevice device = vulkan_device->device();
     bool is_storage_buffer =
         transient_descriptor_layout == SingleTransientDescriptorLayout::kStorageBufferCompute ||
-        transient_descriptor_layout == SingleTransientDescriptorLayout::kStorageBufferPairCompute;
+        transient_descriptor_layout == SingleTransientDescriptorLayout::kStorageBufferPairCompute ||
+        transient_descriptor_layout ==
+            SingleTransientDescriptorLayout::kStorageBufferGuestShaders;
     ui::vulkan::LinkedTypeDescriptorSetAllocator& transient_descriptor_allocator =
         is_storage_buffer ? transient_descriptor_allocator_storage_buffer_
                           : transient_descriptor_allocator_uniform_buffer_;
@@ -4248,7 +4290,10 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
         // without memory, a suspect for GPU hangs on the Steam Deck.
         vfetch_request_size = 4096;
       }
-      if (!shared_memory_->RequestRange(vfetch_constant.address << 2, vfetch_request_size)) {
+      // Vertex data is only read by this draw, so pages the game rewrites
+      // every frame may be uploaded without being watched.
+      if (!shared_memory_->RequestRange(vfetch_constant.address << 2, vfetch_request_size,
+                                        true)) {
         REXGPU_ERROR(
             "Failed to request vertex buffer at 0x{:08X} (size {}) in the shared "
             "memory",
@@ -4512,6 +4557,14 @@ void VulkanCommandProcessor::PerformDeferredMemexportReadback() {
   if (deferred_memexport_readback_ranges_.empty()) {
     return;
   }
+  uint64_t readback_start_tick = rex::chrono::Clock::QueryHostTickCount();
+  struct ReadbackTime {
+    uint64_t start_tick;
+    ~ReadbackTime() {
+      g_memexport_readback_ticks.fetch_add(rex::chrono::Clock::QueryHostTickCount() - start_tick,
+                                           std::memory_order_relaxed);
+    }
+  } readback_time{readback_start_tick};
   uint32_t total_size = 0;
   for (const draw_util::MemExportRange& range : deferred_memexport_readback_ranges_) {
     total_size += range.size_bytes;
@@ -5382,6 +5435,7 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
     return;
   }
 
+  const bool full_sync = await_submission >= GetCurrentSubmission();
   if (await_submission >= GetCurrentSubmission()) {
     if (submission_open_) {
       EndSubmission(false);
@@ -5409,10 +5463,13 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
     // everything before it on this queue has finished too -- the driver only
     // has to track and wake on one fence instead of N while the CPU is
     // already losing time in this stall.
+    uint64_t wait_start_tick = rex::chrono::Clock::QueryHostTickCount();
     VkResult wait_result = dfn.vkWaitForFences(
         device, 1,
         &submissions_in_flight_fences_[size_t(await_submission - submission_completed_) - 1],
         VK_TRUE, UINT64_MAX);
+    RecordHostGpuFenceWait(rex::chrono::Clock::QueryHostTickCount() - wait_start_tick,
+                           full_sync);
     if (wait_result == VK_SUCCESS) {
       fences_awaited += await_submission - submission_completed_;
     } else {
@@ -5681,6 +5738,14 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
 
+  // The cache clear at the end of this frame destroys the textures, which may
+  // hold resolved data the scaled resolve memory doesn't have yet - write it
+  // back in this submission.
+  if (is_swap && cache_clear_requested_ && submission_open_ && frame_open_ &&
+      render_target_cache_) {
+    render_target_cache_->FlushAllPendingScaledResolveMemory();
+  }
+
   if (is_swap && submission_open_ && frame_open_) {
     gpu_profiler_.EndFrame(deferred_command_buffer_);
   }
@@ -5836,7 +5901,11 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
       REXGPU_ERROR("Failed to begin a Vulkan command buffer");
       return false;
     }
+    uint64_t build_start_tick = rex::chrono::Clock::QueryHostTickCount();
     deferred_command_buffer_.Execute(command_buffer.buffer);
+    g_submission_build_ticks.fetch_add(
+        rex::chrono::Clock::QueryHostTickCount() - build_start_tick, std::memory_order_relaxed);
+    g_submission_count.fetch_add(1, std::memory_order_relaxed);
     if (dfn.vkEndCommandBuffer(command_buffer.buffer) != VK_SUCCESS) {
       REXGPU_ERROR("Failed to end a Vulkan command buffer");
       return false;
@@ -5868,7 +5937,10 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
     {
       ui::vulkan::VulkanDevice::Queue::Acquisition queue_acquisition =
           vulkan_device->AcquireQueue(vulkan_device->queue_family_graphics_compute(), 0);
+      uint64_t submit_start_tick = rex::chrono::Clock::QueryHostTickCount();
       submit_result = dfn.vkQueueSubmit(queue_acquisition.queue(), 1, &submit_info, fence);
+      g_submission_submit_ticks.fetch_add(
+          rex::chrono::Clock::QueryHostTickCount() - submit_start_tick, std::memory_order_relaxed);
     }
     if (submit_result != VK_SUCCESS) {
       REXGPU_ERROR("Failed to submit a Vulkan command buffer");
@@ -6259,6 +6331,10 @@ void VulkanCommandProcessor::UpdateDynamicState(const draw_util::ViewportInfo& v
       dynamic_stencil_reference_back_update_needed_ |=
           dynamic_stencil_reference_back_ != stencil_ref_mask_back.stencilref;
       dynamic_stencil_reference_back_ = stencil_ref_mask_back.stencilref;
+      g_stencil_enabled_draws.fetch_add(1, std::memory_order_relaxed);
+      if (stencil_ref_mask_front.stencilwritemask || stencil_ref_mask_back.stencilwritemask) {
+        g_stencil_write_draws.fetch_add(1, std::memory_order_relaxed);
+      }
     }
     // Using VK_STENCIL_FACE_FRONT_AND_BACK for higher safety when running on
     // the Vulkan portability subset without separateStencilMaskRef.

@@ -10,17 +10,32 @@
  */
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <utility>
 
 #include <rex/assert.h>
 #include <rex/bit.h>
+#include <rex/cvar.h>
 #include <rex/dbg.h>
 #include <rex/graphics/shared_memory.h>
 #include <rex/math.h>
 #include <rex/memory.h>
 
+REXCVAR_DEFINE_BOOL(gpu_stream_dynamic_pages, true, "GPU",
+                    "Upload vertex and index data in pages the game rewrites every frame on "
+                    "every use instead of write-protecting them after each upload (saves a "
+                    "protection change and a write fault per page per frame)");
+
 namespace rex::graphics {
+
+// Pages uploaded without being made valid (streamed), for the gpu_wait_stats
+// log. Also, summed over frames: the most uploads of one streamed page in a
+// frame, and how many pages were uploaded more than 8, 16, 32 and 63 times in
+// a frame.
+std::atomic<uint64_t> g_streamed_page_uploads{0};
+std::atomic<uint64_t> g_streamed_page_max_uploads{0};
+std::atomic<uint64_t> g_streamed_pages_over[4] = {};
 
 SharedMemory::SharedMemory(memory::Memory& memory) : memory_(memory) {
   page_size_log2_ = rex::log2_ceil(uint32_t(rex::memory::page_size()));
@@ -35,6 +50,11 @@ void SharedMemory::InitializeCommon() {
   system_page_flags_valid_.assign(num_system_page_flags_, 0);
   system_page_flags_valid_and_gpu_written_.assign(num_system_page_flags_, 0);
   valid_flags_.store(system_page_flags_valid_.data(), std::memory_order_release);
+  system_page_flags_streamed_.assign(num_system_page_flags_, 0);
+  system_page_flags_streamed_blocked_.assign(num_system_page_flags_, 0);
+  system_page_flags_faulted_.assign(num_system_page_flags_, 0);
+  system_page_flags_faulted_previous_.assign(num_system_page_flags_, 0);
+  streamed_page_uploads_this_frame_.assign(size_t(num_system_page_flags_) * 64, 0);
 
   memory_invalidation_callback_handle_ =
       memory_.RegisterPhysicalMemoryInvalidationCallback(MemoryInvalidationCallbackThunk, this);
@@ -90,7 +110,77 @@ void SharedMemory::ShutdownCommon() {
   system_page_flags_valid_.shrink_to_fit();
   system_page_flags_valid_and_gpu_written_.clear();
   system_page_flags_valid_and_gpu_written_.shrink_to_fit();
+  system_page_flags_streamed_.clear();
+  system_page_flags_streamed_.shrink_to_fit();
+  system_page_flags_streamed_blocked_.clear();
+  system_page_flags_streamed_blocked_.shrink_to_fit();
+  streamed_page_uploads_this_frame_.clear();
+  streamed_page_uploads_this_frame_.shrink_to_fit();
+  system_page_flags_faulted_.clear();
+  system_page_flags_faulted_.shrink_to_fit();
+  system_page_flags_faulted_previous_.clear();
+  system_page_flags_faulted_previous_.shrink_to_fit();
+  streamed_pages_active_ = false;
   num_system_page_flags_ = 0;
+}
+
+void SharedMemory::OnGuestFrameEnd() {
+  bool enabled = REXCVAR_GET(gpu_stream_dynamic_pages);
+  if (!enabled && !streamed_pages_active_) {
+    return;
+  }
+  auto global_lock = global_critical_region_.Acquire();
+  if (!num_system_page_flags_) {
+    return;
+  }
+  if (!enabled) {
+    // Switched off: streamed pages are watched normally from their next
+    // upload.
+    std::fill(system_page_flags_streamed_.begin(), system_page_flags_streamed_.end(), 0);
+    std::fill(system_page_flags_streamed_blocked_.begin(),
+              system_page_flags_streamed_blocked_.end(), 0);
+    std::fill(system_page_flags_faulted_.begin(), system_page_flags_faulted_.end(), 0);
+    std::fill(system_page_flags_faulted_previous_.begin(),
+              system_page_flags_faulted_previous_.end(), 0);
+    streamed_pages_active_ = false;
+    return;
+  }
+  streamed_pages_active_ = true;
+  // Streamed pages aren't protected, so they stop faulting; forget them now and
+  // then so pages the game stopped rewriting go back to being watched.
+  bool reset = ++streamed_pages_frames_ >= kStreamedPagesResetFrames;
+  if (reset) {
+    streamed_pages_frames_ = 0;
+  }
+  for (uint32_t i = 0; i < num_system_page_flags_; ++i) {
+    uint64_t faulted = system_page_flags_faulted_[i];
+    if (reset) {
+      system_page_flags_streamed_[i] = 0;
+      system_page_flags_streamed_blocked_[i] = 0;
+    } else {
+      system_page_flags_streamed_[i] |=
+          faulted & system_page_flags_faulted_previous_[i] & ~system_page_flags_streamed_blocked_[i];
+    }
+    system_page_flags_faulted_previous_[i] = faulted;
+    system_page_flags_faulted_[i] = 0;
+  }
+  uint32_t max_uploads = 0;
+  uint32_t over[4] = {};
+  for (uint8_t uploads : streamed_page_uploads_this_frame_) {
+    if (uploads > 8) {
+      max_uploads = std::max(max_uploads, uint32_t(uploads));
+      ++over[0];
+      over[1] += uploads > 16;
+      over[2] += uploads > 32;
+      over[3] += uploads >= kStreamedPageMaxUploadsPerFrame;
+    }
+  }
+  g_streamed_page_max_uploads.fetch_add(max_uploads, std::memory_order_relaxed);
+  for (uint32_t i = 0; i < 4; ++i) {
+    g_streamed_pages_over[i].fetch_add(over[i], std::memory_order_relaxed);
+  }
+  std::fill(streamed_page_uploads_this_frame_.begin(), streamed_page_uploads_this_frame_.end(),
+            uint8_t(0));
 }
 
 void SharedMemory::InvalidateAllPages() {
@@ -310,27 +400,77 @@ void SharedMemory::MakeRangeValid(uint32_t start, uint32_t length, bool written_
   uint32_t valid_block_first = valid_page_first >> 6;
   uint32_t valid_block_last = valid_page_last >> 6;
 
+  // In an upload for an allow_streamed request, streamed pages are neither
+  // made valid nor protected, so their next request uploads them again. Pages
+  // are only ever made valid together with being protected.
+  const bool skip_streamed = upload_allow_streamed_ && !written_by_gpu;
+  bool any_streamed = false;
   {
     auto global_lock = global_critical_region_.Acquire();
 
     for (uint32_t i = valid_block_first; i <= valid_block_last; ++i) {
-      uint64_t valid_bits = UINT64_MAX;
+      uint64_t range_bits = UINT64_MAX;
       if (i == valid_block_first) {
-        valid_bits &= ~((uint64_t(1) << (valid_page_first & 63)) - 1);
+        range_bits &= ~((uint64_t(1) << (valid_page_first & 63)) - 1);
       }
       if (i == valid_block_last && (valid_page_last & 63) != 63) {
-        valid_bits &= (uint64_t(1) << ((valid_page_last & 63) + 1)) - 1;
+        range_bits &= (uint64_t(1) << ((valid_page_last & 63) + 1)) - 1;
+      }
+      uint64_t valid_bits = range_bits;
+      if (skip_streamed) {
+        uint64_t streamed_bits = range_bits & system_page_flags_streamed_[i];
+        // Stop streaming pages uploaded too many times this frame - they're
+        // made valid and protected below like any other page.
+        uint64_t streamed_bits_remaining = streamed_bits;
+        uint32_t bit;
+        while (rex::bit_scan_forward(streamed_bits_remaining, &bit)) {
+          streamed_bits_remaining &= ~(uint64_t(1) << bit);
+          uint8_t& uploads = streamed_page_uploads_this_frame_[(i << 6) + bit];
+          if (uploads >= kStreamedPageMaxUploadsPerFrame) {
+            streamed_bits &= ~(uint64_t(1) << bit);
+            system_page_flags_streamed_[i] &= ~(uint64_t(1) << bit);
+            system_page_flags_streamed_blocked_[i] |= uint64_t(1) << bit;
+          } else {
+            ++uploads;
+          }
+        }
+        if (streamed_bits) {
+          any_streamed = true;
+          valid_bits &= ~streamed_bits;
+          g_streamed_page_uploads.fetch_add(rex::bit_count(streamed_bits),
+                                            std::memory_order_relaxed);
+        }
       }
       system_page_flags_valid_[i] |= valid_bits;
       uint64_t& gpu_written = system_page_flags_valid_and_gpu_written_[i];
-      gpu_written = written_by_gpu ? (gpu_written | valid_bits) : (gpu_written & ~valid_bits);
+      gpu_written = written_by_gpu ? (gpu_written | valid_bits) : (gpu_written & ~range_bits);
     }
   }
 
   if (memory_invalidation_callback_handle_) {
-    memory().EnablePhysicalMemoryAccessCallbacks(
-        valid_page_first << page_size_log2_,
-        (valid_page_last - valid_page_first + 1) << page_size_log2_, true, false);
+    if (!any_streamed) {
+      memory().EnablePhysicalMemoryAccessCallbacks(
+          valid_page_first << page_size_log2_,
+          (valid_page_last - valid_page_first + 1) << page_size_log2_, true, false);
+    } else {
+      // Protect only the runs of pages made valid above. The streamed set is
+      // only changed on this thread (OnGuestFrameEnd), so it's still the same.
+      uint32_t run_first = UINT32_MAX;
+      for (uint32_t page = valid_page_first; page <= valid_page_last + 1; ++page) {
+        bool protect_page =
+            page <= valid_page_last &&
+            !((system_page_flags_streamed_[page >> 6] >> (page & 63)) & 1);
+        if (protect_page) {
+          if (run_first == UINT32_MAX) {
+            run_first = page;
+          }
+        } else if (run_first != UINT32_MAX) {
+          memory().EnablePhysicalMemoryAccessCallbacks(
+              run_first << page_size_log2_, (page - run_first) << page_size_log2_, true, false);
+          run_first = UINT32_MAX;
+        }
+      }
+    }
   }
 }
 
@@ -356,7 +496,8 @@ void SharedMemory::UnlinkWatchRange(WatchRange* range) {
   watch_range_first_free_ = range;
 }
 
-bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, size_t count) {
+bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, size_t count,
+                                 bool allow_streamed) {
   if (ranges == nullptr || !count) {
     return true;
   }
@@ -378,7 +519,7 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
     if (!EnsureHostGpuMemoryAllocated(ranges[0].first, ranges[0].second)) {
       return false;
     }
-    return RequestValidatedRanges(ranges, 1, count);
+    return RequestValidatedRanges(ranges, 1, count, allow_streamed);
   }
 
   // Some texture or buffer is empty, for example - safe to draw in this case.
@@ -428,14 +569,16 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
     }
   }
 
-  return RequestValidatedRanges(merged_ranges.data(), merged_ranges.size(), count);
+  return RequestValidatedRanges(merged_ranges.data(), merged_ranges.size(), count,
+                                allow_streamed);
 }
 
 // Shared tail of RequestRanges: the input ranges are already validated,
 // merged and backed by host GPU memory. Split out so a single-range request
 // can reach it without building and sorting a vector first.
 bool SharedMemory::RequestValidatedRanges(const std::pair<uint32_t, uint32_t>* merged_ranges,
-                                          size_t merged_count, size_t original_count) {
+                                          size_t merged_count, size_t original_count,
+                                          bool allow_streamed) {
   // Fast path: if everything requested is already valid, nothing has to be
   // uploaded and the global lock can be skipped entirely. Reading the flags
   // without the lock is safe because the storage never moves and every writer
@@ -559,12 +702,15 @@ bool SharedMemory::RequestValidatedRanges(const std::pair<uint32_t, uint32_t>* m
     return true;
   }
 
-  return UploadRanges(upload_ranges_);
+  upload_allow_streamed_ = allow_streamed && streamed_pages_active_;
+  bool uploaded = UploadRanges(upload_ranges_);
+  upload_allow_streamed_ = false;
+  return uploaded;
 }
 
-bool SharedMemory::RequestRange(uint32_t start, uint32_t length) {
+bool SharedMemory::RequestRange(uint32_t start, uint32_t length, bool allow_streamed) {
   std::pair<uint32_t, uint32_t> range(start, length);
-  return RequestRanges(&range, 1);
+  return RequestRanges(&range, 1, allow_streamed);
 }
 
 std::pair<uint32_t, uint32_t> SharedMemory::MemoryInvalidationCallbackThunk(
@@ -587,6 +733,11 @@ std::pair<uint32_t, uint32_t> SharedMemory::MemoryInvalidationCallback(
   uint32_t block_last = page_last >> 6;
 
   auto global_lock = global_critical_region_.Acquire();
+
+  if (!exact_range && streamed_pages_active_) {
+    // A guest write fault - for picking the streamed pages.
+    system_page_flags_faulted_[page_first >> 6] |= uint64_t(1) << (page_first & 63);
+  }
 
   if (!exact_range) {
     // Check if a somewhat wider range (up to 256 KB with 4 KB pages) can be

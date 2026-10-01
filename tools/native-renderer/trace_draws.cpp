@@ -37,6 +37,7 @@ namespace {
 constexpr uint32_t kRegisterCount = 0x5004;
 
 struct Stats {
+  std::map<std::string, size_t> packets_by_name;
   size_t packets = 0;
   size_t register_writes = 0;
   size_t draws = 0;
@@ -183,19 +184,31 @@ int main(int argc, char** argv) {
     }
   }
 
+  size_t ib_draws_at_start = 0;
+  uint32_t ib_base = 0, ib_count = 0;
   while (p + sizeof(uint32_t) <= end) {
     auto type = *reinterpret_cast<const TraceCommandType*>(p);
     switch (type) {
-      case TraceCommandType::kPrimaryBufferStart:
+      case TraceCommandType::kPrimaryBufferStart: {
+        auto cmd = reinterpret_cast<const PrimaryBufferStartCommand*>(p);
+        std::printf("primary buffer %08X: %u dwords\n", cmd->base_ptr, cmd->count);
         p += sizeof(PrimaryBufferStartCommand);
         break;
+      }
       case TraceCommandType::kPrimaryBufferEnd:
         p += sizeof(PrimaryBufferEndCommand);
         break;
-      case TraceCommandType::kIndirectBufferStart:
+      case TraceCommandType::kIndirectBufferStart: {
+        auto cmd = reinterpret_cast<const IndirectBufferStartCommand*>(p);
+        ib_draws_at_start = stats.draws;
+        ib_base = cmd->base_ptr;
+        ib_count = cmd->count;
         p += sizeof(IndirectBufferStartCommand);
         break;
+      }
       case TraceCommandType::kIndirectBufferEnd:
+        std::printf("  indirect buffer %08X: %u dwords, %zu draws\n", ib_base, ib_count,
+                    stats.draws - ib_draws_at_start);
         p += sizeof(IndirectBufferEndCommand);
         break;
       case TraceCommandType::kPacketStart: {
@@ -237,6 +250,9 @@ int main(int argc, char** argv) {
             if (shader_type == 0) active_vs_hash = hash; else active_ps_hash = hash;
           }
         }
+        if (info.type_info) {
+          ++stats.packets_by_name[info.type_info->name];
+        }
         if (info.type_info && info.type_info->category == PacketCategory::kDraw) {
           ++stats.draws;
           ++stats.draws_by_packet[info.type_info->name];
@@ -250,6 +266,16 @@ int main(int argc, char** argv) {
             char buf[64];
             for (const auto& r : kDrawRegs) {
               std::snprintf(buf, sizeof(buf), ",\"%s\":\"%08X\"", r.name, regs[r.index]);
+              draws_out << buf;
+            }
+            // The draw's own VGT_DRAW_INITIATOR (primitive type, index count)
+            // travels in the packet: DRAW_INDX has the viz query dword first,
+            // DRAW_INDX_2 starts with it.
+            uint32_t draw_opcode = (head >> 8) & 0x7F;
+            uint32_t initiator_offset = draw_opcode == 0x22 ? 8 : 4;
+            if (cmd->count * 4 >= initiator_offset + 4) {
+              std::snprintf(buf, sizeof(buf), ",\"initiator\":\"%08X\"",
+                            be32(packet_ptr + initiator_offset));
               draws_out << buf;
             }
             draws_out << "}\n";
@@ -340,6 +366,10 @@ int main(int argc, char** argv) {
               stats.register_writes, stats.swaps);
   std::printf("memory reads: %zu (%llu MB)  writes: %zu\n", stats.memory_reads,
               (unsigned long long)(stats.memory_read_bytes >> 20), stats.memory_writes);
+  std::printf("packets by type:\n");
+  for (const auto& [name, count] : stats.packets_by_name) {
+    std::printf("  %-28s %zu\n", name.c_str(), count);
+  }
   std::printf("draws: %zu\n", stats.draws);
   for (const auto& [name, count] : stats.draws_by_packet) {
     std::printf("  %-24s %zu\n", name.c_str(), count);

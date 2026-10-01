@@ -10,6 +10,7 @@
  */
 
 #include <algorithm>
+#include <bit>
 #include <cmath>
 #include <cstdlib>
 #include <optional>
@@ -81,6 +82,37 @@ REXCVAR_DEFINE_BOOL(native_resolve_single_pass, true, "GPU/Vulkan",
                     "instead of dumping the render target to the EDRAM buffer and resolving it")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
+REXCVAR_DEFINE_BOOL(native_resolve_debug_skip_scaled_memory, false, "GPU/Vulkan",
+                    "Measurement only, unsafe: with draw resolution scaling, native resolves keep "
+                    "the textures up to date but don't write the scaled resolve memory at all "
+                    "(anything later reading that memory gets stale data)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+REXCVAR_DEFINE_BOOL(native_resolve_scaled_lazy_memory, true, "GPU/Vulkan",
+                    "With draw resolution scaling, color native resolves write the scaled resolve "
+                    "memory only when something is about to read it (from the texture they "
+                    "wrote), instead of in every resolve")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+REXCVAR_DEFINE_BOOL(native_resolve_scaled_lazy_depth, true, "GPU/Vulkan",
+                    "With native_resolve_scaled_lazy_memory, depth native resolves also write the "
+                    "scaled resolve memory only when something is about to read it (their "
+                    "stencil is kept in a separate capture until then)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+REXCVAR_DEFINE_BOOL(native_resolve_debug_verify_stencil_capture, false, "GPU/Vulkan",
+                    "Verification only: lazily written depth resolves capture the stencil both in "
+                    "the resolve and by a copy, and write-backs store zero depth wherever the two "
+                    "differ (visible in textures reloaded from the memory with "
+                    "native_resolve_debug_reload)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+REXCVAR_DEFINE_BOOL(native_resolve_scaled_single_pass, true, "GPU/Vulkan",
+                    "With draw resolution scaling, native resolves also write the scaled resolve "
+                    "buffer in the same pass, instead of the render target being dumped to the "
+                    "EDRAM buffer and resolved to it")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
 REXCVAR_DEFINE_INT32(native_resolve_mask, 3, "GPU/Vulkan",
                      "Native resolve sources to write directly: 1 = depth, 2 = color, 3 = both "
                      "(diagnostic)");
@@ -132,6 +164,11 @@ REXCVAR_DEFINE_STRING(render_target_path_vulkan, "native", "GPU/Vulkan",
 //     "GPU");
 
 namespace rex::graphics::vulkan {
+
+// Resolve clears of depth with a non-zero stencil value, for the command
+// processor's gpu_wait_stats log.
+std::atomic<uint64_t> g_stencil_nonzero_clears{0};
+
 
 namespace {
 // Frames left to log transfers/resolves for; -1 until the first frame reads the cvar.
@@ -1516,6 +1553,20 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
     return true;
   }
 
+  if (command_processor_.gpu_profiler().per_draw()) {
+    // Key: copying depth (bit 60), destination format and base; rectangle
+    // size, color clear (bit 1) and depth clear (bit 0).
+    command_processor_.gpu_profiler().MarkKeyed(
+        command_processor_.deferred_command_buffer(), VulkanGpuProfiler::Category::kResolve,
+        (uint64_t(resolve_info.IsCopyingDepth()) << 60) |
+            (uint64_t(resolve_info.copy_dest_info.copy_dest_format) << 40) |
+            resolve_info.copy_dest_base,
+        (uint64_t(resolve_info.coordinate_info.width_div_8) * 8 << 48) |
+            (uint64_t(resolve_info.height_div_8) * 8 << 32) |
+            (uint32_t(resolve_info.rb_copy_control.color_clear_enable) << 1) |
+            uint32_t(resolve_info.rb_copy_control.depth_clear_enable));
+  }
+
   const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
@@ -1523,6 +1574,11 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
 
   // Copying.
   bool copied = false;
+  // Resolved data still only in textures, in the range about to be written.
+  if (resolve_info.copy_dest_extent_length && !pending_scaled_resolve_memory_.empty()) {
+    PrepareScaledResolveMemoryForResolve(resolve_info.copy_dest_extent_start,
+                                         resolve_info.copy_dest_extent_length);
+  }
   // Textures sampling the destination must be found while their data still
   // matches memory, before the resolved range is invalidated.
   NativeResolvePlan native_resolve_plan;
@@ -1536,7 +1592,174 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
       REXCVAR_GET(native_resolve_single_pass) &&
       GetNativeResolvePipeline(native_resolve_plan.shader,
                                native_resolve_plan.targets[0].format) != VK_NULL_HANDLE;
-  if (resolve_info.copy_dest_extent_length && native_resolve_single_pass) {
+  if (resolve_info.copy_dest_extent_length && native_resolve_single_pass &&
+      draw_resolution_scaled) {
+    // The first target's draw writes the scaled resolve buffer, bound from the
+    // destination's base (the address the scaled resolve shaders use).
+    uint32_t bytes_per_block_log2 =
+        (native_resolve_plan.memory_flags & kNativeResolveFlagMemory64bpp) ? 3 : 2;
+    uint32_t dest_range_unscaled = resolve_info.copy_dest_extent_start +
+                                   resolve_info.copy_dest_extent_length -
+                                   native_resolve_plan.dest_base;
+    uint64_t dest_base_scaled, dest_range_scaled, dest_use_start_scaled, dest_use_length_scaled;
+    VkDescriptorSet scaled_memory_descriptor_set = VK_NULL_HANDLE;
+    if (resolve_info.copy_dest_extent_start >= native_resolve_plan.dest_base &&
+        texture_cache.GetScaledResolveRange(native_resolve_plan.dest_base, dest_range_unscaled,
+                                            bytes_per_block_log2, dest_base_scaled,
+                                            dest_range_scaled) &&
+        texture_cache.GetScaledResolveRange(
+            resolve_info.copy_dest_extent_start, resolve_info.copy_dest_extent_length,
+            bytes_per_block_log2, dest_use_start_scaled, dest_use_length_scaled) &&
+        texture_cache.CommitScaledResolveRange(native_resolve_plan.dest_base, dest_range_unscaled,
+                                               bytes_per_block_log2)) {
+      scaled_memory_descriptor_set = command_processor_.AllocateSingleTransientDescriptor(
+          VulkanCommandProcessor::SingleTransientDescriptorLayout::kStorageBufferGuestShaders);
+    }
+    // The memory is written from the first target only if something reads it
+    // before it's replaced. Color targets hold the raw bits the memory would;
+    // depth targets hold converted depth (invertible) but no stencil, which is
+    // captured separately.
+    bool lazy_memory = REXCVAR_GET(native_resolve_scaled_lazy_memory);
+    uint32_t stencil_capture = UINT32_MAX;
+    bool stencil_capture_quads = false;
+    VkDescriptorSet stencil_capture_descriptor_set = VK_NULL_HANDLE;
+    uint32_t verify_stencil_capture = UINT32_MAX;
+    if (lazy_memory && native_resolve_plan.shader == NativeResolveShader::kDepth) {
+      // Copying the stencil to a buffer needs a single-sampled image.
+      lazy_memory = REXCVAR_GET(native_resolve_scaled_lazy_depth) &&
+                    native_resolve_plan.source->key().msaa_samples == xenos::MsaaSamples::k1X &&
+                    EnsureScaledMemoryWritebackDepthPipeline();
+      if (lazy_memory) {
+        uint32_t host_x0 = native_resolve_plan.x0 * draw_resolution_scale_x();
+        uint32_t host_y0 = native_resolve_plan.y0 * draw_resolution_scale_y();
+        uint32_t host_width =
+            (native_resolve_plan.x1 - native_resolve_plan.x0) * draw_resolution_scale_x();
+        uint32_t host_height =
+            (native_resolve_plan.y1 - native_resolve_plan.y0) * draw_resolution_scale_y();
+        VkDeviceSize capture_size = VkDeviceSize(host_width) * host_height;
+        stencil_capture = AcquireScaledStencilCapture(capture_size);
+        lazy_memory = stencil_capture != UINT32_MAX;
+        // The resolve draw captures whole 2x2 quads.
+        stencil_capture_quads = lazy_memory && native_resolve_quad_stencil_capture_ &&
+                                !((host_x0 | host_y0 | host_width | host_height) & 1);
+        if (stencil_capture_quads) {
+          stencil_capture_descriptor_set = command_processor_.AllocateSingleTransientDescriptor(
+              VulkanCommandProcessor::SingleTransientDescriptorLayout::kStorageBufferGuestShaders);
+          if (stencil_capture_descriptor_set != VK_NULL_HANDLE) {
+            VkDescriptorBufferInfo capture_buffer_info;
+            capture_buffer_info.buffer = scaled_stencil_captures_[stencil_capture].buffer;
+            capture_buffer_info.offset = 0;
+            capture_buffer_info.range = VK_WHOLE_SIZE;
+            VkWriteDescriptorSet capture_write;
+            capture_write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            capture_write.pNext = nullptr;
+            capture_write.dstSet = stencil_capture_descriptor_set;
+            capture_write.dstBinding = 0;
+            capture_write.dstArrayElement = 0;
+            capture_write.descriptorCount = 1;
+            capture_write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            capture_write.pImageInfo = nullptr;
+            capture_write.pBufferInfo = &capture_buffer_info;
+            capture_write.pTexelBufferView = nullptr;
+            dfn.vkUpdateDescriptorSets(device, 1, &capture_write, 0, nullptr);
+            // Earlier write-backs may still read it, earlier captures write it.
+            command_processor_.PushBufferMemoryBarrier(
+                capture_buffer_info.buffer, 0, VK_WHOLE_SIZE,
+                VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT |
+                    VK_ACCESS_SHADER_WRITE_BIT,
+                VK_ACCESS_SHADER_WRITE_BIT, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
+                false);
+          } else {
+            stencil_capture_quads = false;
+          }
+        }
+        if (stencil_capture_quads && REXCVAR_GET(native_resolve_debug_verify_stencil_capture)) {
+          verify_stencil_capture = AcquireScaledStencilCapture(capture_size);
+        }
+      }
+    }
+    if (lazy_memory) {
+      texture_cache.MarkRangeAsResolved(resolve_info.copy_dest_extent_start,
+                                        resolve_info.copy_dest_extent_length);
+      written_address_out = resolve_info.copy_dest_extent_start;
+      written_length_out = resolve_info.copy_dest_extent_length;
+      PerformNativeResolve(texture_cache, native_resolve_plan, false, VK_NULL_HANDLE,
+                           stencil_capture_descriptor_set);
+      if (stencil_capture_quads) {
+        command_processor_.PushBufferMemoryBarrier(
+            scaled_stencil_captures_[stencil_capture].buffer, 0, VK_WHOLE_SIZE,
+            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT, VK_QUEUE_FAMILY_IGNORED,
+            VK_QUEUE_FAMILY_IGNORED, false);
+      } else if (stencil_capture != UINT32_MAX) {
+        CaptureScaledResolveStencil(*native_resolve_plan.source, native_resolve_plan.x0,
+                                    native_resolve_plan.y0, native_resolve_plan.x1,
+                                    native_resolve_plan.y1, stencil_capture);
+      }
+      if (verify_stencil_capture != UINT32_MAX) {
+        CaptureScaledResolveStencil(*native_resolve_plan.source, native_resolve_plan.x0,
+                                    native_resolve_plan.y0, native_resolve_plan.x1,
+                                    native_resolve_plan.y1, verify_stencil_capture);
+      }
+      PendingScaledResolveMemory& pending = pending_scaled_resolve_memory_.emplace_back();
+      pending.is_depth = stencil_capture != UINT32_MAX;
+      pending.flags = native_resolve_plan.flags;
+      pending.stencil_capture = stencil_capture;
+      pending.stencil_capture_quads = stencil_capture_quads;
+      pending.verify_stencil_capture = verify_stencil_capture;
+      pending.texture = native_resolve_plan.targets[0].texture;
+      pending.dest_base = native_resolve_plan.dest_base;
+      pending.extent_start = resolve_info.copy_dest_extent_start;
+      pending.extent_length = resolve_info.copy_dest_extent_length;
+      pending.dest_pitch_texels = native_resolve_plan.dest_pitch_texels;
+      pending.x0 = native_resolve_plan.x0;
+      pending.y0 = native_resolve_plan.y0;
+      pending.x1 = native_resolve_plan.x1;
+      pending.y1 = native_resolve_plan.y1;
+      pending.memory_flags = native_resolve_plan.memory_flags;
+      texture_cache.AddScaledMemoryPending(pending.texture, 1);
+      pending_scaled_resolve_texture_cache_ = &texture_cache;
+      copied = true;
+    } else if (REXCVAR_GET(native_resolve_debug_skip_scaled_memory)) {
+      texture_cache.MarkRangeAsResolved(resolve_info.copy_dest_extent_start,
+                                        resolve_info.copy_dest_extent_length);
+      written_address_out = resolve_info.copy_dest_extent_start;
+      written_length_out = resolve_info.copy_dest_extent_length;
+      PerformNativeResolve(texture_cache, native_resolve_plan, false);
+      copied = true;
+    } else if (scaled_memory_descriptor_set != VK_NULL_HANDLE) {
+      VkDescriptorBufferInfo scaled_memory_buffer_info;
+      scaled_memory_buffer_info.buffer = texture_cache.scaled_resolve_buffer();
+      scaled_memory_buffer_info.offset = dest_base_scaled;
+      scaled_memory_buffer_info.range = dest_range_scaled;
+      VkWriteDescriptorSet scaled_memory_write;
+      scaled_memory_write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+      scaled_memory_write.pNext = nullptr;
+      scaled_memory_write.dstSet = scaled_memory_descriptor_set;
+      scaled_memory_write.dstBinding = 0;
+      scaled_memory_write.dstArrayElement = 0;
+      scaled_memory_write.descriptorCount = 1;
+      scaled_memory_write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+      scaled_memory_write.pImageInfo = nullptr;
+      scaled_memory_write.pBufferInfo = &scaled_memory_buffer_info;
+      scaled_memory_write.pTexelBufferView = nullptr;
+      dfn.vkUpdateDescriptorSets(device, 1, &scaled_memory_write, 0, nullptr);
+      texture_cache.UseScaledResolveBufferForWrite(dest_use_start_scaled, dest_use_length_scaled);
+      texture_cache.MarkRangeAsResolved(resolve_info.copy_dest_extent_start,
+                                        resolve_info.copy_dest_extent_length);
+      written_address_out = resolve_info.copy_dest_extent_start;
+      written_length_out = resolve_info.copy_dest_extent_length;
+      PerformNativeResolve(texture_cache, native_resolve_plan, true, scaled_memory_descriptor_set);
+      copied = true;
+    } else {
+      REXGPU_ERROR(
+          "VulkanRenderTargetCache: Failed to obtain the scaled resolve destination "
+          "memory region");
+    }
+  } else if (resolve_info.copy_dest_extent_length && native_resolve_single_pass) {
     if (shared_memory.RequestRange(resolve_info.copy_dest_extent_start,
                                    resolve_info.copy_dest_extent_length)) {
       texture_cache.MarkRangeAsResolved(resolve_info.copy_dest_extent_start,
@@ -1706,6 +1929,9 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
   bool cleared = false;
   bool clear_depth = resolve_info.IsClearingDepth();
   bool clear_color = resolve_info.IsClearingColor();
+  if (clear_depth && (resolve_info.rb_depth_clear & 0xFF)) {
+    g_stencil_nonzero_clears.fetch_add(1, std::memory_order_relaxed);
+  }
   if (clear_depth || clear_color) {
     switch (GetPath()) {
       case Path::kHostRenderTargets: {
@@ -6915,6 +7141,9 @@ layout(push_constant) uniform XeNativeResolveConstants {
   uint xe_native_resolve_packing;
   uint xe_native_resolve_dest_base_dwords;
   uint xe_native_resolve_dest_pitch;
+  uint xe_native_resolve_scale;
+  uint xe_native_resolve_stencil_capture_origin;
+  uint xe_native_resolve_stencil_capture_pitch_quads;
 };
 layout(location = 0) out uvec4 xe_native_resolve_output;
 layout(set = 1, binding = 0) buffer XeSharedMemory {
@@ -6944,6 +7173,11 @@ void XeSharedMemoryStore(uint address_dwords, uint value) {
   }
 #endif
 }
+)";
+
+// Addressing shared with the scaled memory write-back compute shader; uses
+// xe_native_resolve_dest_pitch and xe_native_resolve_scale.
+constexpr char kNativeResolveAddressingFunctions[] = R"(
 // Xenos 2D tiled texture addressing, in bytes.
 int XeTiledOffset2D(int x, int y, uint pitch, uint bytes_per_block_log2) {
   int macro = ((x >> 5) + (y >> 5) * int(pitch >> 5)) << (bytes_per_block_log2 + 7u);
@@ -6961,14 +7195,62 @@ uint XeEndianSwap32(uint value, uint endian) {
   }
   return value;
 }
-// Stores the texel's words where the EDRAM resolve would write them.
-void XeNativeResolveStoreMemory(uvec2 words) {
+// Byte offset of host texel (x, y) of a scaled texture of resolved memory in
+// the scaled resolve buffer, from the texture's base, in the layout this
+// runtime's scaled resolve and texture load shaders use: host texels are in
+// groups of 16 bytes of a row (4 texels at 32bpp, 2 at 64bpp), and the scale x
+// scale host groups of each guest group are stored column-major at the guest
+// group's tiled address times the scale area. (Newer Xenia uses taller groups;
+// the layout must match the resolve_*_scaled shaders built into this runtime.)
+// xe_native_resolve_scale: x | (y << 8) | (log2 x << 16) | (log2 y << 20), and
+// bit 31 when both are powers of two (then shifts replace the divisions, which
+// GPUs have no instruction for).
+uint XeNativeResolveScaledOffset(ivec2 host_texel, uint bytes_per_block_log2) {
+  uvec2 scale = uvec2(xe_native_resolve_scale & 0xFFu, (xe_native_resolve_scale >> 8u) & 0xFFu);
+  uint group_texels_log2 = 4u - bytes_per_block_log2;
+  uvec2 position = uvec2(host_texel);
+  uvec2 host_group = uvec2(position.x >> group_texels_log2, position.y);
+  uvec2 guest_group, host_group_in_guest_group;
+  if ((xe_native_resolve_scale & 0x80000000u) != 0u) {
+    uvec2 scale_log2 = uvec2((xe_native_resolve_scale >> 16u) & 0xFu,
+                             (xe_native_resolve_scale >> 20u) & 0xFu);
+    guest_group = host_group >> scale_log2;
+    host_group_in_guest_group = host_group & (scale - 1u);
+  } else {
+    guest_group = host_group / scale;
+    host_group_in_guest_group = host_group - guest_group * scale;
+  }
+  uvec2 guest_group_origin = uvec2(guest_group.x << group_texels_log2, guest_group.y);
+  uint host_group_index = host_group_in_guest_group.x * scale.y + host_group_in_guest_group.y;
+  uint guest_offset = uint(XeTiledOffset2D(int(guest_group_origin.x), int(guest_group_origin.y),
+                                           xe_native_resolve_dest_pitch, bytes_per_block_log2));
+  return guest_offset * (scale.x * scale.y) + (host_group_index << 4u) +
+         ((position.x & ((1u << group_texels_log2) - 1u)) << bytes_per_block_log2);
+}
+)";
+
+constexpr char kNativeResolveFragmentShaderFunctions[] = R"(
+bool XeNativeResolveMemoryIs64bpp() {
+  return (xe_native_resolve_flags & 64u) != 0u;
+}
+// Dword address in the bound memory of this fragment's texel.
+uint XeNativeResolveMemoryAddress() {
   ivec2 texel = ivec2(gl_FragCoord.xy);
-  bool is_64bpp = (xe_native_resolve_flags & 64u) != 0u;
+  uint bytes_per_block_log2 = XeNativeResolveMemoryIs64bpp() ? 3u : 2u;
+  if ((xe_native_resolve_flags & 128u) != 0u) {
+    return XeNativeResolveScaledOffset(texel, bytes_per_block_log2) >> 2u;
+  }
+  return xe_native_resolve_dest_base_dwords +
+         (uint(XeTiledOffset2D(texel.x, texel.y, xe_native_resolve_dest_pitch,
+                               bytes_per_block_log2)) >> 2u);
+}
+// Stores the fragment's texel where the EDRAM resolve would write it. (Each
+// fragment writing its own texel measured faster than one fragment per 16 bytes
+// writing the whole run.)
+void XeNativeResolveStoreMemory(uvec2 words) {
+  bool is_64bpp = XeNativeResolveMemoryIs64bpp();
   uint endian = (xe_native_resolve_flags >> 4u) & 3u;
-  uint address = xe_native_resolve_dest_base_dwords +
-                 (uint(XeTiledOffset2D(texel.x, texel.y, xe_native_resolve_dest_pitch,
-                                       is_64bpp ? 3u : 2u)) >> 2u);
+  uint address = XeNativeResolveMemoryAddress();
   XeSharedMemoryStore(address, XeEndianSwap32(words.x, endian));
   if (is_64bpp) {
     XeSharedMemoryStore(address + 1u, XeEndianSwap32(words.y, endian));
@@ -6994,8 +7276,8 @@ uint XeNativeResolveSwap(uint bits) {
 
 constexpr char kNativeResolveColorFloatBody[] = R"(
 layout(set = 0, binding = 0) uniform texture2D xe_native_resolve_source;
-void main() {
-  vec4 color = texelFetch(xe_native_resolve_source, XeNativeResolveSourceCoord(), 0);
+uvec2 XeNativeResolvePack(ivec2 source_coord) {
+  vec4 color = texelFetch(xe_native_resolve_source, source_coord, 0);
   uvec2 bits;
   if (xe_native_resolve_packing == 0u) {
     uvec4 c = uvec4(color * 255.0 + 0.5);
@@ -7010,6 +7292,11 @@ void main() {
     bits = floatBitsToUint(color.rg);
   }
   bits.x = XeNativeResolveSwap(bits.x);
+  return bits;
+}
+void main() {
+  ivec2 source_coord = XeNativeResolveSourceCoord();
+  uvec2 bits = XeNativeResolvePack(source_coord);
   xe_native_resolve_output = uvec4(bits, 0u, 0u);
   if (XeNativeResolveWritesMemory()) {
     XeNativeResolveStoreMemory(bits);
@@ -7020,11 +7307,15 @@ void main() {
 // Ownership transfer views of float render targets are integer to keep NaNs.
 constexpr char kNativeResolveColorUintBody[] = R"(
 layout(set = 0, binding = 0) uniform utexture2D xe_native_resolve_source;
+uvec2 XeNativeResolvePack(ivec2 source_coord) {
+  uvec4 u = texelFetch(xe_native_resolve_source, source_coord, 0);
+  return xe_native_resolve_packing == 4u
+             ? uvec2((u.x & 0xFFFFu) | (u.y << 16u), (u.z & 0xFFFFu) | (u.w << 16u))
+             : u.xy;
+}
 void main() {
-  uvec4 u = texelFetch(xe_native_resolve_source, XeNativeResolveSourceCoord(), 0);
-  uvec2 bits = xe_native_resolve_packing == 4u
-                   ? uvec2((u.x & 0xFFFFu) | (u.y << 16u), (u.z & 0xFFFFu) | (u.w << 16u))
-                   : u.xy;
+  ivec2 source_coord = XeNativeResolveSourceCoord();
+  uvec2 bits = XeNativeResolvePack(source_coord);
   xe_native_resolve_output = uvec4(bits, 0u, 0u);
   if (XeNativeResolveWritesMemory()) {
     XeNativeResolveStoreMemory(bits);
@@ -7059,29 +7350,180 @@ float XeFloat20e4To32(uint f24) {
   }
   return uintBitsToFloat(((exponent + 112u) << 23u) | (mantissa << 3u));
 }
+uint XeNativeResolveDepth24(ivec2 source_coord) {
+  float depth = texelFetch(xe_native_resolve_source, source_coord, 0).r;
+  if ((xe_native_resolve_flags & 2u) != 0u) {
+    return XeHostDepthTo20e4(floatBitsToUint(depth), (xe_native_resolve_flags & 4u) != 0u);
+  }
+  return uint(roundEven(depth * 16777215.0));
+}
+uvec2 XeNativeResolveMemoryWords(ivec2 source_coord, uint depth24) {
+  uint stencil = texelFetch(xe_native_resolve_stencil, source_coord, 0).r & 0xFFu;
+  return uvec2((depth24 << 8u) | stencil, 0u);
+}
+#if XE_NATIVE_RESOLVE_STENCIL_CAPTURE
+// Stores the stencil of this 2x2 quad of host pixels as one dword: (x, y),
+// (x + 1, y), (x, y + 1), (x + 1, y + 1) from the low byte, which is the order
+// of the invocations of a fragment shader quad. The first invocation is at even
+// coordinates on the hardware (not required by Vulkan, so checked here, and
+// verified with native_resolve_debug_verify_stencil_capture).
+void XeNativeResolveCaptureStencil(ivec2 source_coord) {
+  uint stencil = texelFetch(xe_native_resolve_stencil, source_coord, 0).r & 0xFFu;
+  uint quad_stencil = subgroupQuadBroadcast(stencil, 0u) |
+                      (subgroupQuadBroadcast(stencil, 1u) << 8u) |
+                      (subgroupQuadBroadcast(stencil, 2u) << 16u) |
+                      (subgroupQuadBroadcast(stencil, 3u) << 24u);
+  uvec2 position = uvec2(gl_FragCoord.xy);
+  if ((gl_SubgroupInvocationID & 3u) == 0u && ((position.x | position.y) & 1u) == 0u) {
+    uvec2 origin = uvec2(xe_native_resolve_stencil_capture_origin & 0xFFFFu,
+                         xe_native_resolve_stencil_capture_origin >> 16u);
+    uvec2 quad = (position - origin) >> 1u;
+    XeSharedMemoryStore(quad.y * xe_native_resolve_stencil_capture_pitch_quads + quad.x,
+                        quad_stencil);
+  }
+}
+#endif
 void main() {
   ivec2 source_coord = XeNativeResolveSourceCoord();
-  float depth = texelFetch(xe_native_resolve_source, source_coord, 0).r;
-  uint depth24;
+#if XE_NATIVE_RESOLVE_STENCIL_CAPTURE
+  if ((xe_native_resolve_flags & 256u) != 0u) {
+    XeNativeResolveCaptureStencil(source_coord);
+  }
+#endif
+  uint depth24 = XeNativeResolveDepth24(source_coord);
   float result;
   if ((xe_native_resolve_flags & 2u) != 0u) {
-    depth24 = XeHostDepthTo20e4(floatBitsToUint(depth), (xe_native_resolve_flags & 4u) != 0u);
     result = XeFloat20e4To32(depth24);
   } else {
-    depth24 = uint(roundEven(depth * 16777215.0));
     result = float(depth24 + (depth24 >> 23u)) * 5.96046448e-08;
   }
   xe_native_resolve_output = uvec4(floatBitsToUint(result), 0u, 0u, 0u);
   if (XeNativeResolveWritesMemory()) {
-    uint stencil = texelFetch(xe_native_resolve_stencil, source_coord, 0).r & 0xFFu;
-    XeNativeResolveStoreMemory(uvec2((depth24 << 8u) | stencil, 0u));
+    XeNativeResolveStoreMemory(XeNativeResolveMemoryWords(source_coord, depth24));
   }
 }
 )";
 
+// Writes a texture a native resolve wrote (its raw bits view) to the scaled
+// resolve memory, where the resolve would have written it
+// (native_resolve_scaled_lazy_memory). One invocation per host texel of the
+// resolved rectangle; the memory is bound from the destination's base.
+constexpr char kScaledMemoryWritebackShaderHeader[] = R"(#version 450
+#extension GL_EXT_samplerless_texture_functions : require
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+layout(push_constant) uniform XeScaledMemoryWritebackConstants {
+  uvec2 xe_writeback_origin;
+  uvec2 xe_writeback_size;
+  uint xe_native_resolve_flags;
+  uint xe_native_resolve_dest_pitch;
+  uint xe_native_resolve_scale;
+  // Depth write-back: the native resolve flags (bit 1 = float24 depth).
+  uint xe_writeback_depth_flags;
+};
+layout(set = 0, binding = 0) uniform utexture2D xe_writeback_source;
+layout(set = 1, binding = 0) buffer XeWritebackMemory {
+  uint data[];
+} xe_writeback_memory;
+)";
+constexpr char kScaledMemoryWritebackShaderMain[] = R"(
+void main() {
+  uvec2 position = gl_GlobalInvocationID.xy;
+  if (any(greaterThanEqual(position, xe_writeback_size))) {
+    return;
+  }
+  ivec2 texel = ivec2(xe_writeback_origin + position);
+  uvec4 bits = texelFetch(xe_writeback_source, texel, 0);
+  bool is_64bpp = (xe_native_resolve_flags & 64u) != 0u;
+  uint endian = (xe_native_resolve_flags >> 4u) & 3u;
+  uint address = XeNativeResolveScaledOffset(texel, is_64bpp ? 3u : 2u) >> 2u;
+  xe_writeback_memory.data[address] = XeEndianSwap32(bits.x, endian);
+  if (is_64bpp) {
+    xe_writeback_memory.data[address + 1u] = XeEndianSwap32(bits.y, endian);
+  }
+}
+)";
+
+// Depth: the texture holds the depth converted as the depth native resolve
+// converts it (exactly invertible), and the stencil the memory also holds is
+// in the capture (set 2), one byte per texel of the rectangle, row by row.
+constexpr char kScaledMemoryWritebackDepthShaderMain[] = R"(
+layout(set = 2, binding = 0) buffer XeWritebackStencil {
+  uint data[];
+} xe_writeback_stencil;
+// With native_resolve_debug_verify_stencil_capture, the copied capture.
+layout(set = 3, binding = 0) buffer XeWritebackStencilVerify {
+  uint data[];
+} xe_writeback_stencil_verify;
+uint XeWritebackStencilByte(uint stencil_word, uint byte_index) {
+  return (stencil_word >> (byte_index << 3u)) & 0xFFu;
+}
+// Inverse of XeFloat20e4To32 of the native resolve (exact for its results).
+uint XeFloat32To20e4(uint f32) {
+  if (f32 == 0u) {
+    return 0u;
+  }
+  uint exponent = f32 >> 23u;
+  uint mantissa = (f32 >> 3u) & 0xFFFFFu;
+  if (exponent >= 113u) {
+    return ((exponent - 112u) << 20u) | mantissa;
+  }
+  return (mantissa | 0x100000u) >> (113u - exponent);
+}
+void main() {
+  uvec2 position = gl_GlobalInvocationID.xy;
+  if (any(greaterThanEqual(position, xe_writeback_size))) {
+    return;
+  }
+  ivec2 texel = ivec2(xe_writeback_origin + position);
+  uint depth_bits = texelFetch(xe_writeback_source, texel, 0).x;
+  uint depth24;
+  if ((xe_writeback_depth_flags & 2u) != 0u) {
+    depth24 = XeFloat32To20e4(depth_bits);
+  } else {
+    // Inverse of float(depth24 + (depth24 >> 23)) * 2^-24.
+    uint value = uint(uintBitsToFloat(depth_bits) * 16777216.0);
+    depth24 = value >= 0x800000u ? value - 1u : value;
+  }
+  uint stencil_index = position.y * xe_writeback_size.x + position.x;
+  uint stencil;
+  if ((xe_writeback_depth_flags & 256u) != 0u) {
+    // A dword per 2x2 quad, captured by the native resolve.
+    stencil = XeWritebackStencilByte(
+        xe_writeback_stencil.data[(position.y >> 1u) * (xe_writeback_size.x >> 1u) +
+                                  (position.x >> 1u)],
+        ((position.y & 1u) << 1u) | (position.x & 1u));
+  } else {
+    // Copied, a byte per texel.
+    stencil = XeWritebackStencilByte(xe_writeback_stencil.data[stencil_index >> 2u],
+                                     stencil_index & 3u);
+  }
+  if ((xe_writeback_depth_flags & 512u) != 0u &&
+      XeWritebackStencilByte(xe_writeback_stencil_verify.data[stencil_index >> 2u],
+                             stencil_index & 3u) != stencil) {
+    // Visible in textures reloaded from the memory.
+    depth24 = 0u;
+  }
+  uint endian = (xe_native_resolve_flags >> 4u) & 3u;
+  uint address = XeNativeResolveScaledOffset(texel, 2u) >> 2u;
+  xe_writeback_memory.data[address] = XeEndianSwap32((depth24 << 8u) | stencil, endian);
+}
+)";
+
+struct ScaledMemoryWritebackConstants {
+  uint32_t origin_x;
+  uint32_t origin_y;
+  uint32_t size_x;
+  uint32_t size_y;
+  uint32_t flags;
+  uint32_t dest_pitch_texels;
+  uint32_t resolution_scale;
+  uint32_t depth_flags;
+};
+
 }  // namespace
 
 bool VulkanRenderTargetCache::InitializeNativeResolve(uint32_t shared_memory_binding_count) {
+  native_resolve_shared_memory_binding_count_ = shared_memory_binding_count;
   const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
   if (!REXCVAR_GET(vulkan_dynamic_rendering) || !vulkan_device->properties().dynamicRendering) {
     REXGPU_INFO("VulkanRenderTargetCache: native resolves need dynamic rendering, disabled");
@@ -7090,10 +7532,28 @@ bool VulkanRenderTargetCache::InitializeNativeResolve(uint32_t shared_memory_bin
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
 
-  auto compile = [&](VkShaderStageFlagBits stage, const std::string& source) -> VkShaderModule {
+  // The depth native resolve captures the stencil for lazy scaled memory with
+  // fragment shader quad subgroup operations (Vulkan 1.1).
+  native_resolve_quad_stencil_capture_ = false;
+  if (vulkan_device->properties().apiVersion >= VK_MAKE_API_VERSION(0, 1, 1, 0) &&
+      vulkan_device->vulkan_instance()->functions().vkGetPhysicalDeviceProperties2) {
+    VkPhysicalDeviceSubgroupProperties subgroup_properties = {
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
+    VkPhysicalDeviceProperties2 properties_2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+    properties_2.pNext = &subgroup_properties;
+    vulkan_device->vulkan_instance()->functions().vkGetPhysicalDeviceProperties2(
+        vulkan_device->physical_device(), &properties_2);
+    native_resolve_quad_stencil_capture_ =
+        (subgroup_properties.supportedStages & VK_SHADER_STAGE_FRAGMENT_BIT) &&
+        (subgroup_properties.supportedOperations & VK_SUBGROUP_FEATURE_BASIC_BIT) &&
+        (subgroup_properties.supportedOperations & VK_SUBGROUP_FEATURE_QUAD_BIT);
+  }
+
+  auto compile = [&](VkShaderStageFlagBits stage, const std::string& source,
+                     bool spirv_1_3 = false) -> VkShaderModule {
     std::vector<uint32_t> spirv;
     std::string error;
-    if (!command_processor_.CompileGlslToSpirv(stage, source, spirv, error)) {
+    if (!command_processor_.CompileGlslToSpirv(stage, source, spirv, error, spirv_1_3)) {
       REXGPU_ERROR("VulkanRenderTargetCache: failed to compile a native resolve shader: {}",
                    error);
       return VK_NULL_HANDLE;
@@ -7116,9 +7576,28 @@ bool VulkanRenderTargetCache::InitializeNativeResolve(uint32_t shared_memory_bin
                   shared_memory_binding_count_log2);
   bool shaders_created = native_resolve_vertex_shader_ != VK_NULL_HANDLE;
   for (size_t i = 0; i < size_t(NativeResolveShader::kCount); ++i) {
-    native_resolve_fragment_shaders_[i] =
-        compile(VK_SHADER_STAGE_FRAGMENT_BIT,
-                fragment_prefix + kNativeResolveFragmentShaderHeader + fragment_bodies[i]);
+    std::string fragment_source = std::string(kNativeResolveFragmentShaderHeader) +
+                                  kNativeResolveAddressingFunctions +
+                                  kNativeResolveFragmentShaderFunctions + fragment_bodies[i];
+    if (i == size_t(NativeResolveShader::kDepth) && native_resolve_quad_stencil_capture_) {
+      native_resolve_fragment_shaders_[i] =
+          compile(VK_SHADER_STAGE_FRAGMENT_BIT,
+                  fragment_prefix +
+                      "#extension GL_KHR_shader_subgroup_basic : require\n"
+                      "#extension GL_KHR_shader_subgroup_quad : require\n"
+                      "#define XE_NATIVE_RESOLVE_STENCIL_CAPTURE 1\n" +
+                      fragment_source,
+                  true);
+      if (native_resolve_fragment_shaders_[i] == VK_NULL_HANDLE) {
+        REXGPU_WARN("VulkanRenderTargetCache: depth native resolves capture the stencil by "
+                    "copying instead");
+        native_resolve_quad_stencil_capture_ = false;
+      }
+    }
+    if (native_resolve_fragment_shaders_[i] == VK_NULL_HANDLE) {
+      native_resolve_fragment_shaders_[i] =
+          compile(VK_SHADER_STAGE_FRAGMENT_BIT, fragment_prefix + fragment_source);
+    }
     shaders_created &= native_resolve_fragment_shaders_[i] != VK_NULL_HANDLE;
   }
   if (!shaders_created) {
@@ -7184,6 +7663,25 @@ void VulkanRenderTargetCache::ShutdownNativeResolve() {
   const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
+  pending_scaled_resolve_memory_.clear();
+  scaled_memory_writeback_descriptors_.clear();
+  for (ScaledStencilCapture& capture : scaled_stencil_captures_) {
+    ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyBuffer, device, capture.buffer);
+    ui::vulkan::util::DestroyAndNullHandle(dfn.vkFreeMemory, device, capture.memory);
+  }
+  scaled_stencil_captures_.clear();
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device,
+                                         scaled_memory_writeback_depth_pipeline_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipelineLayout, device,
+                                         scaled_memory_writeback_depth_pipeline_layout_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyShaderModule, device,
+                                         scaled_memory_writeback_depth_shader_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device,
+                                         scaled_memory_writeback_pipeline_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipelineLayout, device,
+                                         scaled_memory_writeback_pipeline_layout_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyShaderModule, device,
+                                         scaled_memory_writeback_shader_);
   for (const auto& pipeline_pair : native_resolve_pipelines_) {
     if (pipeline_pair.second != VK_NULL_HANDLE) {
       dfn.vkDestroyPipeline(device, pipeline_pair.second, nullptr);
@@ -7303,13 +7801,419 @@ VkPipeline VulkanRenderTargetCache::GetNativeResolvePipeline(NativeResolveShader
   return pipeline;
 }
 
+bool VulkanRenderTargetCache::EnsureScaledMemoryWritebackPipeline() {
+  if (scaled_memory_writeback_pipeline_ != VK_NULL_HANDLE) {
+    return true;
+  }
+  if (scaled_memory_writeback_pipeline_failed_) {
+    return false;
+  }
+  scaled_memory_writeback_pipeline_failed_ = true;
+  const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  std::vector<uint32_t> spirv;
+  std::string error;
+  if (!command_processor_.CompileGlslToSpirv(
+          VK_SHADER_STAGE_COMPUTE_BIT,
+          std::string(kScaledMemoryWritebackShaderHeader) + kNativeResolveAddressingFunctions +
+              kScaledMemoryWritebackShaderMain,
+          spirv, error)) {
+    REXGPU_ERROR("VulkanRenderTargetCache: failed to compile the scaled memory write-back "
+                 "shader: {}",
+                 error);
+    return false;
+  }
+  scaled_memory_writeback_shader_ = ui::vulkan::util::CreateShaderModule(
+      vulkan_device, spirv.data(), sizeof(uint32_t) * spirv.size());
+  if (scaled_memory_writeback_shader_ == VK_NULL_HANDLE) {
+    return false;
+  }
+  VkDescriptorSetLayout set_layouts[] = {
+      descriptor_set_layout_sampled_image_,
+      command_processor_.GetSingleTransientDescriptorLayout(
+          VulkanCommandProcessor::SingleTransientDescriptorLayout::kStorageBufferCompute),
+  };
+  VkPushConstantRange push_constant_range;
+  push_constant_range.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+  push_constant_range.offset = 0;
+  push_constant_range.size = sizeof(ScaledMemoryWritebackConstants);
+  VkPipelineLayoutCreateInfo pipeline_layout_create_info;
+  pipeline_layout_create_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+  pipeline_layout_create_info.pNext = nullptr;
+  pipeline_layout_create_info.flags = 0;
+  pipeline_layout_create_info.setLayoutCount = uint32_t(rex::countof(set_layouts));
+  pipeline_layout_create_info.pSetLayouts = set_layouts;
+  pipeline_layout_create_info.pushConstantRangeCount = 1;
+  pipeline_layout_create_info.pPushConstantRanges = &push_constant_range;
+  if (dfn.vkCreatePipelineLayout(device, &pipeline_layout_create_info, nullptr,
+                                 &scaled_memory_writeback_pipeline_layout_) != VK_SUCCESS) {
+    scaled_memory_writeback_pipeline_layout_ = VK_NULL_HANDLE;
+    return false;
+  }
+  scaled_memory_writeback_pipeline_ = ui::vulkan::util::CreateComputePipeline(
+      vulkan_device, scaled_memory_writeback_pipeline_layout_, scaled_memory_writeback_shader_);
+  if (scaled_memory_writeback_pipeline_ == VK_NULL_HANDLE) {
+    return false;
+  }
+  scaled_memory_writeback_pipeline_failed_ = false;
+  return true;
+}
+
+bool VulkanRenderTargetCache::EnsureScaledMemoryWritebackDepthPipeline() {
+  if (scaled_memory_writeback_depth_pipeline_ != VK_NULL_HANDLE) {
+    return true;
+  }
+  if (scaled_memory_writeback_depth_pipeline_failed_) {
+    return false;
+  }
+  scaled_memory_writeback_depth_pipeline_failed_ = true;
+  const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  std::vector<uint32_t> spirv;
+  std::string error;
+  if (!command_processor_.CompileGlslToSpirv(
+          VK_SHADER_STAGE_COMPUTE_BIT,
+          std::string(kScaledMemoryWritebackShaderHeader) + kNativeResolveAddressingFunctions +
+              kScaledMemoryWritebackDepthShaderMain,
+          spirv, error)) {
+    REXGPU_ERROR("VulkanRenderTargetCache: failed to compile the scaled memory depth write-back "
+                 "shader: {}",
+                 error);
+    return false;
+  }
+  scaled_memory_writeback_depth_shader_ = ui::vulkan::util::CreateShaderModule(
+      vulkan_device, spirv.data(), sizeof(uint32_t) * spirv.size());
+  if (scaled_memory_writeback_depth_shader_ == VK_NULL_HANDLE) {
+    return false;
+  }
+  VkDescriptorSetLayout storage_buffer_layout =
+      command_processor_.GetSingleTransientDescriptorLayout(
+          VulkanCommandProcessor::SingleTransientDescriptorLayout::kStorageBufferCompute);
+  VkDescriptorSetLayout set_layouts[] = {
+      descriptor_set_layout_sampled_image_,
+      storage_buffer_layout,
+      storage_buffer_layout,
+      storage_buffer_layout,
+  };
+  VkPushConstantRange push_constant_range;
+  push_constant_range.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+  push_constant_range.offset = 0;
+  push_constant_range.size = sizeof(ScaledMemoryWritebackConstants);
+  VkPipelineLayoutCreateInfo pipeline_layout_create_info;
+  pipeline_layout_create_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+  pipeline_layout_create_info.pNext = nullptr;
+  pipeline_layout_create_info.flags = 0;
+  pipeline_layout_create_info.setLayoutCount = uint32_t(rex::countof(set_layouts));
+  pipeline_layout_create_info.pSetLayouts = set_layouts;
+  pipeline_layout_create_info.pushConstantRangeCount = 1;
+  pipeline_layout_create_info.pPushConstantRanges = &push_constant_range;
+  if (dfn.vkCreatePipelineLayout(device, &pipeline_layout_create_info, nullptr,
+                                 &scaled_memory_writeback_depth_pipeline_layout_) != VK_SUCCESS) {
+    scaled_memory_writeback_depth_pipeline_layout_ = VK_NULL_HANDLE;
+    return false;
+  }
+  scaled_memory_writeback_depth_pipeline_ = ui::vulkan::util::CreateComputePipeline(
+      vulkan_device, scaled_memory_writeback_depth_pipeline_layout_,
+      scaled_memory_writeback_depth_shader_);
+  if (scaled_memory_writeback_depth_pipeline_ == VK_NULL_HANDLE) {
+    return false;
+  }
+  scaled_memory_writeback_depth_pipeline_failed_ = false;
+  return true;
+}
+
+uint32_t VulkanRenderTargetCache::AcquireScaledStencilCapture(VkDeviceSize size) {
+  size = rex::align(size, VkDeviceSize(4));
+  uint32_t best = UINT32_MAX;
+  for (uint32_t i = 0; i < uint32_t(scaled_stencil_captures_.size()); ++i) {
+    const ScaledStencilCapture& capture = scaled_stencil_captures_[i];
+    if (capture.in_use || capture.size < size) {
+      continue;
+    }
+    if (best == UINT32_MAX || capture.size < scaled_stencil_captures_[best].size) {
+      best = i;
+    }
+  }
+  if (best == UINT32_MAX) {
+    // Pending resolves are replaced by the next frame's resolves of the same
+    // memory, so only a few are held at once; past this, resolve eagerly.
+    constexpr size_t kMaxCaptures = 16;
+    if (scaled_stencil_captures_.size() >= kMaxCaptures) {
+      return UINT32_MAX;
+    }
+    ScaledStencilCapture capture;
+    // Rounded up so resolves of similar sizes can share captures.
+    capture.size = rex::align(size, VkDeviceSize(1) << 20);
+    if (!ui::vulkan::util::CreateDedicatedAllocationBuffer(
+            command_processor_.GetVulkanDevice(), capture.size,
+            VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+            ui::vulkan::util::MemoryPurpose::kDeviceLocal, capture.buffer, capture.memory)) {
+      REXGPU_ERROR("VulkanRenderTargetCache: failed to create a {} byte stencil capture buffer",
+                   capture.size);
+      return UINT32_MAX;
+    }
+    best = uint32_t(scaled_stencil_captures_.size());
+    scaled_stencil_captures_.push_back(capture);
+  }
+  scaled_stencil_captures_[best].in_use = true;
+  return best;
+}
+
+void VulkanRenderTargetCache::ReleaseScaledStencilCapture(uint32_t index) {
+  if (index < scaled_stencil_captures_.size()) {
+    scaled_stencil_captures_[index].in_use = false;
+  }
+}
+
+void VulkanRenderTargetCache::CaptureScaledResolveStencil(VulkanRenderTarget& source, uint32_t x0,
+                                                          uint32_t y0, uint32_t x1, uint32_t y1,
+                                                          uint32_t capture_index) {
+  const ScaledStencilCapture& capture = scaled_stencil_captures_[capture_index];
+  uint32_t scale_x = draw_resolution_scale_x(), scale_y = draw_resolution_scale_y();
+  command_processor_.EndRenderPass();
+  // The capture may still be read by the write-back of an earlier resolve, or
+  // be being written by an earlier capture.
+  command_processor_.PushBufferMemoryBarrier(
+      capture.buffer, 0, VK_WHOLE_SIZE,
+      VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+      VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT,
+      VK_ACCESS_TRANSFER_WRITE_BIT, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, false);
+  command_processor_.PushImageMemoryBarrier(
+      source.image(),
+      ui::vulkan::util::InitializeSubresourceRange(VK_IMAGE_ASPECT_DEPTH_BIT |
+                                                   VK_IMAGE_ASPECT_STENCIL_BIT),
+      source.current_stage_mask(), VK_PIPELINE_STAGE_TRANSFER_BIT, source.current_access_mask(),
+      VK_ACCESS_TRANSFER_READ_BIT, source.current_layout(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+  source.SetUsage(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+                  VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+  command_processor_.SubmitBarriers(true);
+  // The resolved texel (x, y) of the target is the source's host pixel (x, y).
+  VkBufferImageCopy region = {};
+  region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_STENCIL_BIT;
+  region.imageSubresource.layerCount = 1;
+  region.imageOffset.x = int32_t(x0 * scale_x);
+  region.imageOffset.y = int32_t(y0 * scale_y);
+  region.imageExtent.width = (x1 - x0) * scale_x;
+  region.imageExtent.height = (y1 - y0) * scale_y;
+  region.imageExtent.depth = 1;
+  command_processor_.deferred_command_buffer().CmdVkCopyImageToBuffer(
+      source.image(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, capture.buffer, 1, &region);
+  command_processor_.PushBufferMemoryBarrier(
+      capture.buffer, 0, VK_WHOLE_SIZE, VK_PIPELINE_STAGE_TRANSFER_BIT,
+      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+      VK_ACCESS_SHADER_READ_BIT, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, false);
+}
+
+void VulkanRenderTargetCache::DropPendingScaledResolveMemory(
+    const PendingScaledResolveMemory& pending) {
+  pending_scaled_resolve_texture_cache_->AddScaledMemoryPending(pending.texture, -1);
+  if (pending.stencil_capture != UINT32_MAX) {
+    ReleaseScaledStencilCapture(pending.stencil_capture);
+  }
+  if (pending.verify_stencil_capture != UINT32_MAX) {
+    ReleaseScaledStencilCapture(pending.verify_stencil_capture);
+  }
+}
+
+void VulkanRenderTargetCache::WriteBackPendingScaledResolveMemory(
+    const PendingScaledResolveMemory& pending) {
+  VulkanTextureCache& texture_cache = *pending_scaled_resolve_texture_cache_;
+  bool written = false;
+  if (pending.is_depth ? EnsureScaledMemoryWritebackDepthPipeline()
+                       : EnsureScaledMemoryWritebackPipeline()) {
+    const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
+    const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+    const VkDevice device = vulkan_device->device();
+    uint32_t bytes_per_block_log2 =
+        (pending.memory_flags & kNativeResolveFlagMemory64bpp) ? 3 : 2;
+    uint32_t dest_range_unscaled =
+        pending.extent_start + pending.extent_length - pending.dest_base;
+    uint64_t dest_base_scaled, dest_range_scaled, dest_use_start_scaled, dest_use_length_scaled;
+    VkDescriptorSet memory_descriptor_set = VK_NULL_HANDLE;
+    if (texture_cache.GetScaledResolveRange(pending.dest_base, dest_range_unscaled,
+                                            bytes_per_block_log2, dest_base_scaled,
+                                            dest_range_scaled) &&
+        texture_cache.GetScaledResolveRange(pending.extent_start, pending.extent_length,
+                                            bytes_per_block_log2, dest_use_start_scaled,
+                                            dest_use_length_scaled) &&
+        texture_cache.CommitScaledResolveRange(pending.dest_base, dest_range_unscaled,
+                                               bytes_per_block_log2)) {
+      memory_descriptor_set = command_processor_.AllocateSingleTransientDescriptor(
+          VulkanCommandProcessor::SingleTransientDescriptorLayout::kStorageBufferCompute);
+    }
+    VkDescriptorSet stencil_descriptor_set = VK_NULL_HANDLE;
+    VkDescriptorSet stencil_verify_descriptor_set = VK_NULL_HANDLE;
+    if (pending.is_depth && memory_descriptor_set != VK_NULL_HANDLE) {
+      stencil_descriptor_set = command_processor_.AllocateSingleTransientDescriptor(
+          VulkanCommandProcessor::SingleTransientDescriptorLayout::kStorageBufferCompute);
+      stencil_verify_descriptor_set = command_processor_.AllocateSingleTransientDescriptor(
+          VulkanCommandProcessor::SingleTransientDescriptorLayout::kStorageBufferCompute);
+      if (stencil_descriptor_set == VK_NULL_HANDLE ||
+          stencil_verify_descriptor_set == VK_NULL_HANDLE) {
+        memory_descriptor_set = VK_NULL_HANDLE;
+      }
+    }
+    // Sampled image descriptor sets of completed write-backs can be reused.
+    uint64_t completed_submission = command_processor_.GetCompletedSubmission();
+    while (!scaled_memory_writeback_descriptors_.empty() &&
+           scaled_memory_writeback_descriptors_.front().first <= completed_submission) {
+      descriptor_set_pool_sampled_image_->Free(scaled_memory_writeback_descriptors_.front().second);
+      scaled_memory_writeback_descriptors_.pop_front();
+    }
+    size_t source_descriptor_index = descriptor_set_pool_sampled_image_->Allocate();
+    if (memory_descriptor_set != VK_NULL_HANDLE && source_descriptor_index != SIZE_MAX) {
+      VkDescriptorSet source_descriptor_set =
+          descriptor_set_pool_sampled_image_->Get(source_descriptor_index);
+      scaled_memory_writeback_descriptors_.emplace_back(command_processor_.GetCurrentSubmission(),
+                                                        source_descriptor_index);
+      VkImageView source_view = texture_cache.BeginScaledMemoryWriteback(pending.texture);
+      VkDescriptorImageInfo source_image_info;
+      source_image_info.sampler = VK_NULL_HANDLE;
+      source_image_info.imageView = source_view;
+      source_image_info.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+      VkDescriptorBufferInfo memory_buffer_info;
+      memory_buffer_info.buffer = texture_cache.scaled_resolve_buffer();
+      memory_buffer_info.offset = dest_base_scaled;
+      memory_buffer_info.range = dest_range_scaled;
+      VkDescriptorBufferInfo stencil_buffer_info, stencil_verify_buffer_info;
+      if (pending.is_depth) {
+        stencil_buffer_info.buffer = scaled_stencil_captures_[pending.stencil_capture].buffer;
+        stencil_buffer_info.offset = 0;
+        stencil_buffer_info.range = VK_WHOLE_SIZE;
+        // Without verification, bound but not read.
+        stencil_verify_buffer_info = stencil_buffer_info;
+        if (pending.verify_stencil_capture != UINT32_MAX) {
+          stencil_verify_buffer_info.buffer =
+              scaled_stencil_captures_[pending.verify_stencil_capture].buffer;
+        }
+      }
+      VkWriteDescriptorSet writes[4];
+      for (VkWriteDescriptorSet& write : writes) {
+        write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        write.pNext = nullptr;
+        write.dstBinding = 0;
+        write.dstArrayElement = 0;
+        write.descriptorCount = 1;
+        write.pImageInfo = nullptr;
+        write.pBufferInfo = nullptr;
+        write.pTexelBufferView = nullptr;
+      }
+      writes[0].dstSet = source_descriptor_set;
+      writes[0].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+      writes[0].pImageInfo = &source_image_info;
+      writes[1].dstSet = memory_descriptor_set;
+      writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+      writes[1].pBufferInfo = &memory_buffer_info;
+      writes[2].dstSet = stencil_descriptor_set;
+      writes[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+      writes[2].pBufferInfo = &stencil_buffer_info;
+      writes[3].dstSet = stencil_verify_descriptor_set;
+      writes[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+      writes[3].pBufferInfo = &stencil_verify_buffer_info;
+      dfn.vkUpdateDescriptorSets(device, pending.is_depth ? 4 : 2, writes, 0, nullptr);
+
+      texture_cache.UseScaledResolveBufferForWrite(dest_use_start_scaled, dest_use_length_scaled);
+      command_processor_.EndRenderPass();
+      command_processor_.SubmitBarriers(true);
+      DeferredCommandBuffer& command_buffer = command_processor_.deferred_command_buffer();
+      VkPipelineLayout pipeline_layout = pending.is_depth
+                                             ? scaled_memory_writeback_depth_pipeline_layout_
+                                             : scaled_memory_writeback_pipeline_layout_;
+      command_processor_.BindExternalComputePipeline(pending.is_depth
+                                                         ? scaled_memory_writeback_depth_pipeline_
+                                                         : scaled_memory_writeback_pipeline_);
+      VkDescriptorSet descriptor_sets[] = {source_descriptor_set, memory_descriptor_set,
+                                           stencil_descriptor_set, stencil_verify_descriptor_set};
+      command_buffer.CmdVkBindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_layout, 0,
+                                             pending.is_depth ? 4 : 2, descriptor_sets, 0,
+                                             nullptr);
+      uint32_t scale_x = draw_resolution_scale_x(), scale_y = draw_resolution_scale_y();
+      ScaledMemoryWritebackConstants constants;
+      constants.origin_x = pending.x0 * scale_x;
+      constants.origin_y = pending.y0 * scale_y;
+      constants.size_x = (pending.x1 - pending.x0) * scale_x;
+      constants.size_y = (pending.y1 - pending.y0) * scale_y;
+      constants.flags = pending.memory_flags;
+      constants.dest_pitch_texels = pending.dest_pitch_texels;
+      uint32_t scale_x_log2 = uint32_t(std::countr_zero(scale_x));
+      uint32_t scale_y_log2 = uint32_t(std::countr_zero(scale_y));
+      bool powers_of_two = (scale_x & (scale_x - 1)) == 0 && (scale_y & (scale_y - 1)) == 0;
+      constants.resolution_scale = scale_x | (scale_y << 8) | (scale_x_log2 << 16) |
+                                   (scale_y_log2 << 20) | (powers_of_two ? (1u << 31) : 0u);
+      constants.depth_flags = pending.flags;
+      if (pending.stencil_capture_quads) {
+        constants.depth_flags |= 256;
+      }
+      if (pending.verify_stencil_capture != UINT32_MAX) {
+        constants.depth_flags |= 512;
+      }
+      command_buffer.CmdVkPushConstants(pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                                        sizeof(constants), &constants);
+      command_buffer.CmdVkDispatch((constants.size_x + 7) / 8, (constants.size_y + 7) / 8, 1);
+      written = true;
+    } else if (source_descriptor_index != SIZE_MAX) {
+      descriptor_set_pool_sampled_image_->Free(source_descriptor_index);
+    }
+  }
+  if (!written) {
+    REXGPU_ERROR(
+        "VulkanRenderTargetCache: failed to write resolved data back to the scaled resolve "
+        "memory at {:08X}",
+        pending.extent_start);
+  }
+  DropPendingScaledResolveMemory(pending);
+}
+
+void VulkanRenderTargetCache::PrepareScaledResolveMemoryForResolve(uint32_t start,
+                                                                   uint32_t length) {
+  uint64_t end = uint64_t(start) + length;
+  for (size_t i = 0; i < pending_scaled_resolve_memory_.size();) {
+    PendingScaledResolveMemory& pending = pending_scaled_resolve_memory_[i];
+    uint64_t pending_end = uint64_t(pending.extent_start) + pending.extent_length;
+    if (pending.extent_start >= end || pending_end <= start) {
+      ++i;
+      continue;
+    }
+    if (start <= pending.extent_start && end >= pending_end) {
+      // Replaced entirely by the new resolve.
+      DropPendingScaledResolveMemory(pending);
+    } else {
+      WriteBackPendingScaledResolveMemory(pending);
+    }
+    pending_scaled_resolve_memory_.erase(pending_scaled_resolve_memory_.begin() + i);
+  }
+}
+
+void VulkanRenderTargetCache::FlushPendingScaledResolveMemory(uint32_t start, uint32_t length) {
+  uint64_t end = uint64_t(start) + length;
+  for (size_t i = 0; i < pending_scaled_resolve_memory_.size();) {
+    const PendingScaledResolveMemory& pending = pending_scaled_resolve_memory_[i];
+    uint64_t pending_end = uint64_t(pending.extent_start) + pending.extent_length;
+    if (pending.extent_start >= end || pending_end <= start) {
+      ++i;
+      continue;
+    }
+    WriteBackPendingScaledResolveMemory(pending);
+    pending_scaled_resolve_memory_.erase(pending_scaled_resolve_memory_.begin() + i);
+  }
+}
+
+void VulkanRenderTargetCache::FlushAllPendingScaledResolveMemory() {
+  for (const PendingScaledResolveMemory& pending : pending_scaled_resolve_memory_) {
+    WriteBackPendingScaledResolveMemory(pending);
+  }
+  pending_scaled_resolve_memory_.clear();
+}
+
 bool VulkanRenderTargetCache::PrepareNativeResolve(const draw_util::ResolveInfo& resolve_info,
                                                    VulkanTextureCache& texture_cache,
                                                    NativeResolvePlan& plan) {
   plan.target_count = 0;
   plan.source = nullptr;
   if (!native_resolve_enabled_ || !resolve_info.copy_dest_extent_length ||
-      IsDrawResolutionScaled() || resolve_info.copy_dest_info.copy_dest_array) {
+      resolve_info.copy_dest_info.copy_dest_array) {
     return false;
   }
   if (int32_t ab_frames = REXCVAR_GET(native_resolve_ab_frames); ab_frames > 0) {
@@ -7475,14 +8379,28 @@ bool VulkanRenderTargetCache::PrepareNativeResolve(const draw_util::ResolveInfo&
   if (!is_depth && xenos::IsColorRenderTargetFormat64bpp(source_key.GetColorFormat())) {
     plan.memory_flags |= kNativeResolveFlagMemory64bpp;
   }
+  // With draw resolution scaling, the resolved memory is the scaled resolve
+  // buffer, written by the regular resolve; the native draws then only keep
+  // the textures up to date (so they aren't reloaded from that buffer).
+  // With native_resolve_scaled_single_pass, the first target's draw writes the
+  // scaled resolve buffer instead, through a single storage buffer descriptor
+  // standing in for the shared memory (so only with one shared memory binding).
+  bool can_write_memory_here =
+      !IsDrawResolutionScaled() || (REXCVAR_GET(native_resolve_scaled_single_pass) &&
+                                    native_resolve_shared_memory_binding_count_ == 1);
   plan.can_write_memory =
-      plan.targets[0].width >= x1 && plan.targets[0].height >= y1;
+      can_write_memory_here && plan.targets[0].width >= x1 && plan.targets[0].height >= y1;
+  if (IsDrawResolutionScaled()) {
+    plan.memory_flags |= kNativeResolveFlagMemoryScaled;
+  }
   return true;
 }
 
 void VulkanRenderTargetCache::PerformNativeResolve(VulkanTextureCache& texture_cache,
                                                    const NativeResolvePlan& plan,
-                                                   bool write_memory) {
+                                                   bool write_memory,
+                                                   VkDescriptorSet scaled_memory_descriptor_set,
+                                                   VkDescriptorSet stencil_capture_descriptor_set) {
   if (!plan.source || !plan.target_count) {
     return;
   }
@@ -7491,7 +8409,19 @@ void VulkanRenderTargetCache::PerformNativeResolve(VulkanTextureCache& texture_c
 
   VulkanGpuProfiler& gpu_profiler = command_processor_.gpu_profiler();
   DeferredCommandBuffer& command_buffer = command_processor_.deferred_command_buffer();
-  gpu_profiler.Mark(command_buffer, VulkanGpuProfiler::Category::kNativeResolve);
+  if (gpu_profiler.per_draw()) {
+    // Key: shader, memory writes (bit 52, scaled 48), targets and destination;
+    // rectangle size and first target format.
+    gpu_profiler.MarkKeyed(
+        command_buffer, VulkanGpuProfiler::Category::kNativeResolve,
+        (uint64_t(plan.shader) << 56) | (uint64_t(write_memory) << 52) |
+            (uint64_t(scaled_memory_descriptor_set != VK_NULL_HANDLE) << 48) |
+            (uint64_t(plan.target_count) << 40) | plan.dest_base,
+        (uint64_t(plan.x1 - plan.x0) << 48) | (uint64_t(plan.y1 - plan.y0) << 32) |
+            uint32_t(plan.targets[0].format));
+  } else {
+    gpu_profiler.Mark(command_buffer, VulkanGpuProfiler::Category::kNativeResolve);
+  }
 
   // Usually already readable after being dumped for the resolve.
   VkPipelineStageFlags source_stage_mask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
@@ -7512,9 +8442,12 @@ void VulkanRenderTargetCache::PerformNativeResolve(VulkanTextureCache& texture_c
 
   VkPipelineLayout pipeline_layout = is_depth ? native_resolve_pipeline_layout_depth_
                                               : native_resolve_pipeline_layout_color_;
+  bool capture_stencil = !write_memory && stencil_capture_descriptor_set != VK_NULL_HANDLE;
   VkDescriptorSet descriptor_sets[] = {
       source.GetDescriptorSetTransferSource(),
-      command_processor_.shared_memory_and_edram_descriptor_set(),
+      scaled_memory_descriptor_set != VK_NULL_HANDLE ? scaled_memory_descriptor_set
+      : capture_stencil ? stencil_capture_descriptor_set
+                        : command_processor_.shared_memory_and_edram_descriptor_set(),
   };
   NativeResolveConstants constants;
   constants.source_offset_x = 0;
@@ -7522,6 +8455,16 @@ void VulkanRenderTargetCache::PerformNativeResolve(VulkanTextureCache& texture_c
   constants.packing = plan.packing;
   constants.dest_base_dwords = plan.dest_base >> 2;
   constants.dest_pitch_texels = plan.dest_pitch_texels;
+  {
+    uint32_t scale_x = draw_resolution_scale_x(), scale_y = draw_resolution_scale_y();
+    uint32_t scale_x_log2 = uint32_t(std::countr_zero(scale_x));
+    uint32_t scale_y_log2 = uint32_t(std::countr_zero(scale_y));
+    bool powers_of_two = (scale_x & (scale_x - 1)) == 0 && (scale_y & (scale_y - 1)) == 0;
+    constants.resolution_scale = scale_x | (scale_y << 8) | (scale_x_log2 << 16) |
+                                 (scale_y_log2 << 20) | (powers_of_two ? (1u << 31) : 0u);
+    constants.stencil_capture_origin = (plan.x0 * scale_x) | ((plan.y0 * scale_y) << 16);
+    constants.stencil_capture_pitch_quads = ((plan.x1 - plan.x0) * scale_x) >> 1;
+  }
 
   bool written[VulkanTextureCache::kMaxNativeResolveTargets] = {};
   for (uint32_t i = 0; i < plan.target_count; ++i) {
@@ -7538,23 +8481,28 @@ void VulkanRenderTargetCache::PerformNativeResolve(VulkanTextureCache& texture_c
     }
     texture_cache.BeginNativeResolveWrite(target);
     command_processor_.EndRenderPass();
-    native_resolve_framebuffer_.host_extent.width = target.width;
-    native_resolve_framebuffer_.host_extent.height = target.height;
+    // Guest texels to host pixels: scaled render targets and scaled textures
+    // of resolved memory have the same scale, so host texel (x, y) of the
+    // target is host pixel (x, y) of the source.
+    uint32_t scale_x = draw_resolution_scale_x();
+    uint32_t scale_y = draw_resolution_scale_y();
+    native_resolve_framebuffer_.host_extent.width = target.width * scale_x;
+    native_resolve_framebuffer_.host_extent.height = target.height * scale_y;
     command_processor_.SubmitBarriersAndEnterRenderTargetCacheRenderPass(
         VK_NULL_HANDLE, &native_resolve_framebuffer_, target.view, false);
     VkViewport viewport;
-    viewport.x = float(plan.x0);
-    viewport.y = float(plan.y0);
-    viewport.width = float(x1 - plan.x0);
-    viewport.height = float(y1 - plan.y0);
+    viewport.x = float(plan.x0 * scale_x);
+    viewport.y = float(plan.y0 * scale_y);
+    viewport.width = float((x1 - plan.x0) * scale_x);
+    viewport.height = float((y1 - plan.y0) * scale_y);
     viewport.minDepth = 0.0f;
     viewport.maxDepth = 1.0f;
     command_processor_.SetViewport(viewport);
     VkRect2D scissor;
-    scissor.offset.x = int32_t(plan.x0);
-    scissor.offset.y = int32_t(plan.y0);
-    scissor.extent.width = x1 - plan.x0;
-    scissor.extent.height = y1 - plan.y0;
+    scissor.offset.x = int32_t(plan.x0 * scale_x);
+    scissor.offset.y = int32_t(plan.y0 * scale_y);
+    scissor.extent.width = (x1 - plan.x0) * scale_x;
+    scissor.extent.height = (y1 - plan.y0) * scale_y;
     command_processor_.SetScissor(scissor);
     command_processor_.BindExternalGraphicsPipeline(pipeline);
     command_buffer.CmdVkBindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout, 0,
@@ -7563,6 +8511,9 @@ void VulkanRenderTargetCache::PerformNativeResolve(VulkanTextureCache& texture_c
     constants.flags = plan.flags;
     if (write_memory && i == 0) {
       constants.flags |= plan.memory_flags;
+    }
+    if (capture_stencil && i == 0) {
+      constants.flags |= kNativeResolveFlagStencilCapture;
     }
     command_buffer.CmdVkPushConstants(pipeline_layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0,
                                       sizeof(constants), &constants);

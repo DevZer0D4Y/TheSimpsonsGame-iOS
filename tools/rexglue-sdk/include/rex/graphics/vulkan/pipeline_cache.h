@@ -341,6 +341,14 @@ class VulkanPipelineCache {
   // Can be called from multiple threads.
   bool TranslateAnalyzedShader(SpirvShaderTranslator& translator,
                                VulkanShader::VulkanTranslation& translation);
+  // Creates the shader module and registers the texture and sampler binding
+  // layouts of a translation, whether translated now or served precompiled.
+  bool SetUpTranslatedShader(VulkanShader::VulkanTranslation& translation);
+  // The directory of the ahead-of-time shader set (aot_shader_path) made for
+  // the current draw resolution scale and render target path, or empty.
+  std::filesystem::path FindAotShaderSet() const;
+  // Serves a translation from the ahead-of-time shader set if it has it.
+  bool TryLoadAotTranslation(VulkanShader::VulkanTranslation& translation, const char* stage);
 
   void WritePipelineRenderTargetDescription(reg::RB_BLENDCONTROL blend_control, uint32_t write_mask,
                                             PipelineRenderTarget& render_target_out) const;
@@ -444,9 +452,10 @@ class VulkanPipelineCache {
   // Ahead-of-time shader serving statistics for the shutdown log.
   size_t aot_hits_ = 0;
   size_t aot_misses_ = 0;
-  // Whether the ahead-of-time shader set matches kTranslatedModuleVersion
-  // (-1 until checked).
-  int aot_version_matches_ = -1;
+  // The ahead-of-time shader set usable with this renderer configuration
+  // (see FindAotShaderSet), empty if none; looked up on first use.
+  std::filesystem::path aot_set_dir_;
+  bool aot_set_checked_ = false;
   // vkCreateGraphicsPipelines calls actually issued this session. With a warm
   // persistent driver cache these are cheap replays rather than full compiles;
   // a count that keeps climbing during play is what stutter looks like.
