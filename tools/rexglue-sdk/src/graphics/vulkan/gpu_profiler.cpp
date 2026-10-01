@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <cstring>
 
 #include <rex/cvar.h>
 #include <rex/graphics/vulkan/deferred_command_buffer.h>
@@ -87,7 +88,9 @@ bool VulkanGpuProfiler::Initialize(const ui::vulkan::VulkanDevice* vulkan_device
   slots_.assign(frames_in_flight, FrameSlot());
   results_.resize(kMaxMarksPerFrame);
   log_interval_frames_ = uint32_t(interval);
-  per_draw_ = REXCVAR_GET(gpu_profile_draws) || std::getenv("REX_GPU_PROFILE_DRAWS") != nullptr;
+  const char* per_draw_env = std::getenv("REX_GPU_PROFILE_DRAWS");
+  per_draw_ = REXCVAR_GET(gpu_profile_draws) || per_draw_env != nullptr;
+  per_render_target_ = per_draw_env != nullptr && std::strcmp(per_draw_env, "rt") == 0;
   REXGPU_INFO("GPU profiler: logging GPU time per category{} every {} frames",
               per_draw_ ? " and per draw" : "", interval);
   return true;
@@ -206,7 +209,13 @@ void VulkanGpuProfiler::FrameCompleted(uint64_t frame_index) {
     size_t shown = std::min(sorted.size(), size_t(30));
     for (size_t i = 0; i < shown; ++i) {
       const auto& [shaders, stats] = sorted[i];
-      if (stats.category == Category::kDraw) {
+      if (stats.category == Category::kDraw && per_render_target_) {
+        REXGPU_INFO("[gpu-profile-rt] surface={:08X} depth={:08X} color0={:08X} mask={:08X} "
+                    "{:.3f}ms {:.1f} draws per frame, first draw #{}",
+                    uint32_t(shaders.first >> 32), uint32_t(shaders.first),
+                    uint32_t(shaders.second >> 32), uint32_t(shaders.second), stats.ms / frames,
+                    stats.count / frames, stats.first_ordinal);
+      } else if (stats.category == Category::kDraw) {
         REXGPU_INFO("[gpu-profile-draw] vs={:016X} ps={:016X} {:.3f}ms {:.1f} draws per frame, "
                     "first draw #{}",
                     shaders.first, shaders.second, stats.ms / frames, stats.count / frames,

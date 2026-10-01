@@ -53,6 +53,9 @@ class VulkanGpuProfiler {
   // With gpu_profile_draws, starts a draw interval charged to the draw's
   // shader pair, so the log can rank shader pairs by GPU time.
   bool per_draw() const { return per_draw_; }
+  // With REX_GPU_PROFILE_DRAWS=rt, draws are charged to their render target
+  // bindings instead of their shaders, to rank render passes by GPU time.
+  bool per_render_target() const { return per_render_target_; }
   void MarkDraw(DeferredCommandBuffer& command_buffer, uint64_t vertex_shader_hash,
                 uint64_t pixel_shader_hash) {
     MarkKeyed(command_buffer, Category::kDraw, vertex_shader_hash, pixel_shader_hash);
@@ -107,6 +110,7 @@ class VulkanGpuProfiler {
   std::array<double, size_t(Category::kCount)> accumulated_ms_{};
   std::array<uint32_t, size_t(Category::kCount)> accumulated_marks_{};
   bool per_draw_ = false;
+  bool per_render_target_ = false;
   std::unordered_map<std::pair<uint64_t, uint64_t>, DrawStats, ShaderPairHash> draw_stats_;
   std::vector<uint64_t> results_;
 };

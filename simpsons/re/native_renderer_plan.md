@@ -6,12 +6,16 @@ cache, texture cache, shared-memory mirror machinery) in the shipped build.
 
 ## Design
 
+The target architecture. It is reached by converting the existing Vulkan backend piece by
+piece (see Approach below) rather than as a separate `graphics/native/` processor, but the
+components are the same.
+
 ```text
 recompiled game + statically linked XDK D3D (untouched)
   -> XDK command segments (PM4) in guest memory, kicked through the primary ring
   -> CommandProcessor base: packet decoding, register file, guest sync contract
      (fences, interrupts, WAIT_REG_MEM, swap, gamma ramp)
-  -> NativeCommandProcessor (graphics/native/): IssueDraw / IssueCopy / IssueSwap
+  -> native command processing: IssueDraw / IssueCopy / IssueSwap
        surfaces   host render targets keyed by EDRAM base + format + size + samples,
                   overlap model for aliasing (clear or reinterpret on rebind)
        resolves   copies into host textures keyed by guest address + format + size,
@@ -58,37 +62,57 @@ constants, MSAA sample counts, resolve tiling when the guest reads resolved memo
 Device layout matches the Conan-era XDK notes (command segment write pointer at
 device+0x30).
 
-## Milestones
+## Approach (since 2026-10-01)
 
-1. Skeleton: NativeGraphicsSystem boots with no Xenia GPU components; guest sync
-   contract holds (menus respond, audio, no hangs) with a black screen.
-2. Menus and 2D: textures, blending, rect/quad lists.
-3. Gameplay: 3D, depth/stencil, surface aliasing, resolves, post chain.
-4. Parity: frame-by-frame A/B against the legacy renderer on scripted scenes; memexport
-   skinning (characters).
-5. Performance pass; native becomes the only renderer.
-6. Windows check; Android port.
+The Vulkan backend is converted in place: one emulation piece at a time is replaced by a
+native one, each step verified bit-identical on the captured frames and shippable on its own,
+instead of building a separate renderer next to it. Stages, in order:
+
+1. **Shaders ahead of time** - done. Every shader the game uses is translated before play;
+   the runtime serves `native_shaders/` (hand-written natives) and `native_shaders/translated/`
+   (exported translations, used only when the translator source hash and the GPU configuration
+   match the ones they were made with). Nothing is translated during play in the captured scenes.
+2. **Native resolves everywhere** - done for every resolve in the captured scenes. Resolves
+   into textures are drawn directly (lazy memory write-back at 2x); resolves no texture reads
+   yet write the memory directly from the render target. The EDRAM buffer dump and compute
+   resolve remain only as the fallback for unsupported cases (MSAA sources, exponent bias,
+   gamma, non-bitwise-equivalent formats).
+3. **Render targets as surfaces** - next. Host render targets sized by use instead of EDRAM
+   row coverage, a resolution scale per target, no EDRAM address limits on size. Unlocks any
+   aspect ratio and resolution (with game-side camera and HUD changes), per-target resolution
+   (shadow maps), less memory, fewer transfers.
+4. **Geometry without emulation tricks** - rectangle lists and point sprites without geometry
+   shaders (Mali GPUs on Android have none), real vertex and index buffers instead of shaders
+   reading the guest memory mirror.
+5. **Memory** - no full guest memory mirror on the GPU and no write watching; textures and
+   buffers uploaded when the game loads or changes them (hooks on its resource code).
+6. Removing the emulation paths, Windows check, Android port.
 
 ## Validation
 
-`tools/bench/autorun.py` drives the game unattended (injected pad input, engine
-screenshots, perf, GPU clock/power, audio dropouts through a null sink). Legacy vs native
-screenshots at the same guest frame are the parity gate.
-
-## State (2026-09-28)
-
-- Native resolves: a resolve from a 1x host render target is drawn straight into the textures
-  that sample the destination, writing the exact texel bits (integer view) the texture would
-  load from the resolved memory. Bit-exact against the EDRAM path on 10 captured frames (menus,
-  gameplay, pause); 8-12% less GPU time per frame. The EDRAM resolve still runs to keep guest
-  memory coherent; skipping it (with writeback on demand) is the next step.
 - Offline A/B: `tools/bench/replay_ab.py` replays captured frames through renderer variants
   headlessly, diffs the images and reports GPU time per category. Build the replayer with
   `tools/native-renderer/build_trace_reference.sh`.
-- Captures: `autorun.py` `trace <label>` grabs a frame trace from a running game unattended.
-- Character pop-in: character draws that read absent (all-zero) morph streams are vetoed on
-  Vulkan (and would only run without rasterization when admitted). Rasterizing them renders the
-  characters correctly on llvmpipe, but hung the Deck's GPU when replayed on it; the cause is not
-  found yet. Never test those draws on the real GPU without a plan for a GPU reset.
-- The precompiled shader set (`aot_shader_path`) is keyed by shader hash and variant only;
-  regenerate it after any translator change or the game keeps serving the old modules.
+- Captures: `tools/bench/autorun.py` drives the game unattended (injected pad input, engine
+  screenshots, perf, GPU clock/power) and `trace <label>` grabs a frame trace.
+- New GPU-visible code runs on llvmpipe first (`VK_ICD_FILENAMES=.../lvp_icd.x86_64.json`):
+  a GPU fault on the Steam Deck resets the GPU and can black out the session. llvmpipe can
+  replay 1x traces but not 2x ones yet.
+- Debug modes that prove exactness: `native_resolve_debug_reload` (textures reload from the
+  memory native resolves write), `native_resolve_debug_memory_only_all` (every resolve writes
+  only the memory), `native_resolve_debug_verify_stencil_capture`.
+
+## State (2026-10-01)
+
+- Shaders: `aot_export_path` exports runtime translations in the served format;
+  `TRACE_SHADER_STORAGE=<cache>:45410809` makes the replayer load a shader storage the way the
+  game does at boot; `tools/native-renderer/build_translated_set.sh` builds
+  `translated_shaders.tar.xz` (about 1 MB, both scales, with the plain / level 0 texture
+  variants), which the release workflow unpacks into `native_shaders/`.
+- EDRAM transfers: transfers into render targets cleared right after binding are held back
+  over consecutive clears and done only outside the cleared area (the shadow map pass: 0.7 ms
+  at 2x down to almost nothing).
+- Stencil: depth resolves of an area whose stencil is known to be uniform (cleared, not
+  written since) can skip capturing it (`native_resolve_uniform_stencil`, about 1 ms at 2x);
+  off until its write-back path is validated.
+- GPU time per frame on the Steam Deck, t09 gameplay trace: about 6.3 ms at 1x, 14.2 ms at 2x.

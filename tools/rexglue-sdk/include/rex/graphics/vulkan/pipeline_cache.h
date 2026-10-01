@@ -347,8 +347,22 @@ class VulkanPipelineCache {
   // The directory of the ahead-of-time shader set (aot_shader_path) made for
   // the current draw resolution scale and render target path, or empty.
   std::filesystem::path FindAotShaderSet() const;
+  // The base directory of ahead-of-time shader sets (aot_shader_path, or
+  // native_shaders next to the executable), empty if there is none.
+  std::filesystem::path GetAotShaderRoot() const;
+  // Everything besides the draw resolution scale the translator's output
+  // depends on (device features, render target path, 2x MSAA support), as
+  // translated sets record it (translator_configuration.txt).
+  std::string GetTranslatorConfiguration() const;
+  // The set of modules exported from runtime translations (translated/ in the
+  // ahead-of-time shader root), used only if made with exactly this
+  // translator version and configuration, or empty.
+  std::filesystem::path FindTranslatedShaderSet() const;
   // Serves a translation from the ahead-of-time shader set if it has it.
   bool TryLoadAotTranslation(VulkanShader::VulkanTranslation& translation, const char* stage);
+  // With aot_export_path, writes a runtime translation to the ahead-of-time
+  // shader set there, in the format TryLoadAotTranslation serves.
+  void ExportAotTranslation(const VulkanShader::VulkanTranslation& translation);
 
   void WritePipelineRenderTargetDescription(reg::RB_BLENDCONTROL blend_control, uint32_t write_mask,
                                             PipelineRenderTarget& render_target_out) const;
@@ -455,7 +469,13 @@ class VulkanPipelineCache {
   // The ahead-of-time shader set usable with this renderer configuration
   // (see FindAotShaderSet), empty if none; looked up on first use.
   std::filesystem::path aot_set_dir_;
+  std::filesystem::path translated_set_dir_;
   bool aot_set_checked_ = false;
+  // aot_export_path: translations may be exported from several threads (the
+  // shader storage is translated by worker threads).
+  std::mutex aot_export_mutex_;
+  bool aot_export_dir_ready_ = false;
+  size_t aot_exported_ = 0;
   // vkCreateGraphicsPipelines calls actually issued this session. With a warm
   // persistent driver cache these are cheap replays rather than full compiles;
   // a count that keeps climbing during play is what stutter looks like.

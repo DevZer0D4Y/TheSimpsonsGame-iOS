@@ -72,6 +72,11 @@ REXCVAR_DEFINE_BOOL(native_rt_skip_overwritten_transfers, true, "GPU/Vulkan",
                     "Native renderer: skip EDRAM ownership transfers into the parts of render "
                     "targets that the current draw (a clear) overwrites entirely");
 
+REXCVAR_DEFINE_BOOL(native_rt_defer_overwritten_transfers, true, "GPU/Vulkan",
+                    "Native renderer: with native_rt_skip_overwritten_transfers, hold the rest "
+                    "of such transfers back while the following draws keep clearing the same "
+                    "render targets, and skip what they clear too");
+
 REXCVAR_DEFINE_BOOL(native_resolve, true, "GPU/Vulkan",
                     "Native renderer: draw resolved render targets directly into the textures "
                     "that sample them instead of reloading those textures from guest memory")
@@ -99,6 +104,20 @@ REXCVAR_DEFINE_BOOL(native_resolve_scaled_lazy_depth, true, "GPU/Vulkan",
                     "scaled resolve memory only when something is about to read it (their "
                     "stencil is kept in a separate capture until then)")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+REXCVAR_DEFINE_BOOL(native_resolve_memory_only, true, "GPU/Vulkan",
+                    "Native resolves whose destination no texture samples yet write the resolved "
+                    "memory directly from the render target, instead of dumping it to the EDRAM "
+                    "buffer and resolving from there");
+
+REXCVAR_DEFINE_BOOL(native_resolve_debug_memory_only_all, false, "GPU/Vulkan",
+                    "Debug: perform every native resolve as a memory-only one, so the textures "
+                    "sampling the destinations reload from the memory it writes (verifies it)");
+
+REXCVAR_DEFINE_BOOL(native_resolve_uniform_stencil, false, "GPU/Vulkan",
+                    "Native resolves with draw resolution scaling: track where depth render "
+                    "targets have one stencil value (cleared by a draw, not written since), and "
+                    "don't capture the stencil of depth resolves inside such an area");
 
 REXCVAR_DEFINE_BOOL(native_resolve_debug_verify_stencil_capture, false, "GPU/Vulkan",
                     "Verification only: lazily written depth resolves capture the stencil both in "
@@ -1277,6 +1296,14 @@ void VulkanRenderTargetCache::ClearCache() {
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
 
+  // Held back transfers reference render targets the common ClearCache
+  // destroys.
+  deferred_transfer_targets_ = 0;
+  for (std::vector<Transfer>& transfers : deferred_transfers_) {
+    transfers.clear();
+  }
+  std::memset(deferred_transfer_bindings_, 0, sizeof(deferred_transfer_bindings_));
+
   // Framebuffer objects must be destroyed because they reference views of
   // attachment images, which may be removed by the common ClearCache.
   last_update_framebuffer_ = VK_NULL_HANDLE;
@@ -1405,6 +1432,8 @@ void VulkanRenderTargetCache::InitializeTraceCompleteDownloads() {
 }
 
 void VulkanRenderTargetCache::RestoreEdramSnapshot(const void* snapshot) {
+  FlushDeferredTransfers();
+  ++uniform_stencil_generation_;
   if (IsDrawResolutionScaled()) {
     // No 1:1 mapping.
     return;
@@ -1511,6 +1540,9 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
                                       uint32_t& written_address_out, uint32_t& written_length_out) {
   written_address_out = 0;
   written_length_out = 0;
+
+  // The resolve reads the render targets.
+  FlushDeferredTransfers();
 
   bool draw_resolution_scaled = IsDrawResolutionScaled();
 
@@ -1619,11 +1651,14 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
     // before it's replaced. Color targets hold the raw bits the memory would;
     // depth targets hold converted depth (invertible) but no stencil, which is
     // captured separately.
-    bool lazy_memory = REXCVAR_GET(native_resolve_scaled_lazy_memory);
+    bool lazy_memory =
+        REXCVAR_GET(native_resolve_scaled_lazy_memory) && !native_resolve_plan.memory_only;
     uint32_t stencil_capture = UINT32_MAX;
     bool stencil_capture_quads = false;
     VkDescriptorSet stencil_capture_descriptor_set = VK_NULL_HANDLE;
     uint32_t verify_stencil_capture = UINT32_MAX;
+    bool stencil_uniform = false;
+    uint32_t stencil_uniform_value = 0;
     if (lazy_memory && native_resolve_plan.shader == NativeResolveShader::kDepth) {
       // Copying the stencil to a buffer needs a single-sampled image.
       lazy_memory = REXCVAR_GET(native_resolve_scaled_lazy_depth) &&
@@ -1637,10 +1672,22 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
         uint32_t host_height =
             (native_resolve_plan.y1 - native_resolve_plan.y0) * draw_resolution_scale_y();
         VkDeviceSize capture_size = VkDeviceSize(host_width) * host_height;
-        stencil_capture = AcquireScaledStencilCapture(capture_size);
-        lazy_memory = stencil_capture != UINT32_MAX;
+        stencil_uniform = GetUniformStencil(*native_resolve_plan.source, native_resolve_plan.x0,
+                                            native_resolve_plan.y0, native_resolve_plan.x1,
+                                            native_resolve_plan.y1, stencil_uniform_value);
+        if (stencil_uniform) {
+          // The write-back stores the known stencil. With verification, a copied
+          // capture to compare it with.
+          if (REXCVAR_GET(native_resolve_debug_verify_stencil_capture)) {
+            verify_stencil_capture = AcquireScaledStencilCapture(capture_size);
+          }
+        } else {
+          stencil_capture = AcquireScaledStencilCapture(capture_size);
+          lazy_memory = stencil_capture != UINT32_MAX;
+        }
         // The resolve draw captures whole 2x2 quads.
-        stencil_capture_quads = lazy_memory && native_resolve_quad_stencil_capture_ &&
+        stencil_capture_quads = stencil_capture != UINT32_MAX &&
+                                native_resolve_quad_stencil_capture_ &&
                                 !((host_x0 | host_y0 | host_width | host_height) & 1);
         if (stencil_capture_quads) {
           stencil_capture_descriptor_set = command_processor_.AllocateSingleTransientDescriptor(
@@ -1705,10 +1752,12 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
                                     native_resolve_plan.y1, verify_stencil_capture);
       }
       PendingScaledResolveMemory& pending = pending_scaled_resolve_memory_.emplace_back();
-      pending.is_depth = stencil_capture != UINT32_MAX;
+      pending.is_depth = native_resolve_plan.shader == NativeResolveShader::kDepth;
       pending.flags = native_resolve_plan.flags;
       pending.stencil_capture = stencil_capture;
       pending.stencil_capture_quads = stencil_capture_quads;
+      pending.stencil_uniform = stencil_uniform;
+      pending.stencil_uniform_value = stencil_uniform_value;
       pending.verify_stencil_capture = verify_stencil_capture;
       pending.texture = native_resolve_plan.targets[0].texture;
       pending.dest_base = native_resolve_plan.dest_base;
@@ -1723,7 +1772,8 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
       texture_cache.AddScaledMemoryPending(pending.texture, 1);
       pending_scaled_resolve_texture_cache_ = &texture_cache;
       copied = true;
-    } else if (REXCVAR_GET(native_resolve_debug_skip_scaled_memory)) {
+    } else if (REXCVAR_GET(native_resolve_debug_skip_scaled_memory) &&
+               !native_resolve_plan.memory_only) {
       texture_cache.MarkRangeAsResolved(resolve_info.copy_dest_extent_start,
                                         resolve_info.copy_dest_extent_length);
       written_address_out = resolve_info.copy_dest_extent_start;
@@ -2028,17 +2078,61 @@ bool VulkanRenderTargetCache::Update(bool is_rasterization_done,
           last_update_accumulated_render_targets();
 
       const std::vector<Transfer>* transfers = last_update_transfers();
+      bool any_transfers = false;
+      for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets && !any_transfers; ++i) {
+        any_transfers = !transfers[i].empty();
+      }
+      if (RtDebugLogActive() && any_transfers) {
+        std::string bindings;
+        for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
+          RenderTarget* render_target = depth_and_color_render_targets[i];
+          if (!render_target) {
+            continue;
+          }
+          RenderTargetKey key = render_target->key();
+          bindings += fmt::format(" {}(base={} pitch={} msaa={} {})", i ? "color" : "depth",
+                                  uint32_t(key.base_tiles), uint32_t(key.pitch_tiles_at_32bpp),
+                                  1u << uint32_t(key.msaa_samples),
+                                  RtFormatName(key.is_depth, key.resource_format));
+        }
+        REXGPU_INFO("[rt-debug] bind with transfers:{}", bindings);
+      }
+      bool skip_overwritten_transfers =
+          native_rt_mode_ && REXCVAR_GET(native_rt_skip_overwritten_transfers);
+      if (deferred_transfer_targets_) {
+        // Still held back if this draw clears all of the render targets the
+        // transfers go to, next to or over what was cleared before.
+        bool keep_deferring = false;
+        if (!any_transfers && skip_overwritten_transfers &&
+            !std::memcmp(deferred_transfer_bindings_, depth_and_color_render_targets,
+                         sizeof(deferred_transfer_bindings_))) {
+          Transfer::Rectangle rectangle;
+          bool exact_edges;
+          uint32_t overwritten = GetDrawOverwrittenRenderTargets(
+              normalized_depth_control, normalized_color_mask, vertex_shader, rectangle,
+              &exact_edges);
+          keep_deferring = exact_edges &&
+                           (overwritten & deferred_transfer_targets_) == deferred_transfer_targets_ &&
+                           MergeTransferCutout(deferred_transfer_cutout_, rectangle);
+          if (keep_deferring && RtDebugLogActive()) {
+            REXGPU_INFO("[rt-debug] transfers still held back, cleared ({},{}) {}x{}",
+                        deferred_transfer_cutout_.x_pixels, deferred_transfer_cutout_.y_pixels,
+                        deferred_transfer_cutout_.width_pixels,
+                        deferred_transfer_cutout_.height_pixels);
+          }
+        }
+        if (!keep_deferring) {
+          FlushDeferredTransfers();
+        }
+      }
+
       Transfer::Rectangle overwrite_rectangle;
       uint32_t overwritten_render_targets = 0;
-      if (native_rt_mode_ && REXCVAR_GET(native_rt_skip_overwritten_transfers)) {
-        bool any_transfers = false;
-        for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets && !any_transfers; ++i) {
-          any_transfers = !transfers[i].empty();
-        }
-        if (any_transfers) {
-          overwritten_render_targets = GetDrawOverwrittenRenderTargets(
-              normalized_depth_control, normalized_color_mask, vertex_shader, overwrite_rectangle);
-        }
+      bool overwrite_exact_edges = false;
+      if (skip_overwritten_transfers && any_transfers) {
+        overwritten_render_targets = GetDrawOverwrittenRenderTargets(
+            normalized_depth_control, normalized_color_mask, vertex_shader, overwrite_rectangle,
+            &overwrite_exact_edges);
       }
       if (overwritten_render_targets) {
         // What this draw overwrites doesn't need the previous owner's data.
@@ -2049,6 +2143,7 @@ bool VulkanRenderTargetCache::Update(bool is_rasterization_done,
         RenderTarget* kept_render_targets[1 + xenos::kMaxColorRenderTargets] = {};
         RenderTarget* cut_render_targets[1 + xenos::kMaxColorRenderTargets] = {};
         uint32_t dropped_count = 0;
+        uint32_t cut_targets = 0;
         for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
           RenderTarget* render_target = depth_and_color_render_targets[i];
           if (!render_target || transfers[i].empty()) {
@@ -2071,21 +2166,54 @@ bool VulkanRenderTargetCache::Update(bool is_rasterization_done,
           }
           if (!cut_transfers[i].empty()) {
             cut_render_targets[i] = render_target;
+            cut_targets |= uint32_t(1) << i;
+          }
+        }
+        // The rest can wait in case the following draws are clears too. The
+        // held back transfers then go only where nothing has been drawn, so the
+        // clears must have exact edges, and the transfers' sources mustn't be
+        // drawn to meanwhile.
+        bool defer = cut_targets && overwrite_exact_edges &&
+                     REXCVAR_GET(native_rt_defer_overwritten_transfers);
+        for (uint32_t i = 0; defer && i < 1 + xenos::kMaxColorRenderTargets; ++i) {
+          for (const Transfer& transfer : cut_transfers[i]) {
+            for (uint32_t j = 0; j < 1 + xenos::kMaxColorRenderTargets; ++j) {
+              RenderTarget* bound = depth_and_color_render_targets[j];
+              if (bound && (transfer.source == bound || transfer.host_depth_source == bound)) {
+                defer = false;
+              }
+            }
           }
         }
         if (RtDebugLogActive()) {
           REXGPU_INFO(
-              "[rt-debug] draw overwrites rts {:#x} in ({},{}) {}x{}: {} transfers dropped",
+              "[rt-debug] draw overwrites rts {:#x} in ({},{}) {}x{}: {} transfers dropped{}",
               overwritten_render_targets, overwrite_rectangle.x_pixels, overwrite_rectangle.y_pixels,
-              overwrite_rectangle.width_pixels, overwrite_rectangle.height_pixels, dropped_count);
+              overwrite_rectangle.width_pixels, overwrite_rectangle.height_pixels, dropped_count,
+              defer ? ", the rest held back" : "");
         }
         PerformTransfersAndResolveClears(1 + xenos::kMaxColorRenderTargets, kept_render_targets,
                                          kept_transfers.data());
-        PerformTransfersAndResolveClears(1 + xenos::kMaxColorRenderTargets, cut_render_targets,
-                                         cut_transfers.data(), nullptr, &overwrite_rectangle);
+        if (defer) {
+          deferred_transfer_targets_ = cut_targets;
+          std::memcpy(deferred_transfer_bindings_, depth_and_color_render_targets,
+                      sizeof(deferred_transfer_bindings_));
+          for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
+            deferred_transfers_[i] = std::move(cut_transfers[i]);
+          }
+          deferred_transfer_cutout_ = overwrite_rectangle;
+        } else {
+          PerformTransfersAndResolveClears(1 + xenos::kMaxColorRenderTargets, cut_render_targets,
+                                           cut_transfers.data(), nullptr, &overwrite_rectangle);
+        }
       } else {
         PerformTransfersAndResolveClears(1 + xenos::kMaxColorRenderTargets,
                                          depth_and_color_render_targets, transfers);
+      }
+
+      if (native_rt_mode_ && depth_and_color_render_targets[0]) {
+        UpdateUniformStencil(*static_cast<VulkanRenderTarget*>(depth_and_color_render_targets[0]),
+                             normalized_depth_control, normalized_color_mask, vertex_shader);
       }
 
       if (depth_and_color_render_targets[0]) {
@@ -5263,6 +5391,19 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
   DeferredCommandBuffer& command_buffer = command_processor_.deferred_command_buffer();
 
   bool resolve_clear_needed = render_target_resolve_clear_values && resolve_clear_rectangle;
+  for (uint32_t i = 0; i < render_target_count; ++i) {
+    RenderTarget* render_target = render_targets[i];
+    if (!render_target || !render_target->key().is_depth) {
+      continue;
+    }
+    auto& vulkan_render_target = *static_cast<VulkanRenderTarget*>(render_target);
+    if (resolve_clear_needed) {
+      vulkan_render_target.uniform_stencil().generation = 0;
+    } else if (render_target_transfers && !render_target_transfers[i].empty()) {
+      ForgetUniformStencilWrittenByTransfers(vulkan_render_target, render_target_transfers[i],
+                                             resolve_clear_rectangle);
+    }
+  }
   // GPU time attribution: everything recorded until the function returns is
   // EDRAM ownership-transfer / resolve-clear work.
   struct TransferProfileScope {
@@ -6930,9 +7071,165 @@ namespace {
 constexpr uint64_t kXdkClearVertexShaderHash = 0x0A6D1DD7767FDF27;
 }  // namespace
 
+void VulkanRenderTargetCache::FlushDeferredTransfers() {
+  if (!deferred_transfer_targets_) {
+    return;
+  }
+  std::array<std::vector<Transfer>, 1 + xenos::kMaxColorRenderTargets> cut_transfers;
+  RenderTarget* cut_render_targets[1 + xenos::kMaxColorRenderTargets] = {};
+  uint32_t dropped_count = 0;
+  for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
+    if (!(deferred_transfer_targets_ & (uint32_t(1) << i))) {
+      continue;
+    }
+    RenderTarget* render_target = deferred_transfer_bindings_[i];
+    RenderTargetKey key = render_target->key();
+    for (const Transfer& transfer : deferred_transfers_[i]) {
+      Transfer::Rectangle rectangles[Transfer::kMaxRectanglesWithCutout];
+      if (transfer.GetRectangles(key.base_tiles, key.GetPitchTiles(), key.msaa_samples,
+                                 key.Is64bpp(), rectangles, &deferred_transfer_cutout_)) {
+        cut_transfers[i].push_back(transfer);
+      } else {
+        ++dropped_count;
+      }
+    }
+    deferred_transfers_[i].clear();
+    if (!cut_transfers[i].empty()) {
+      cut_render_targets[i] = render_target;
+    }
+  }
+  deferred_transfer_targets_ = 0;
+  if (RtDebugLogActive()) {
+    REXGPU_INFO("[rt-debug] held back transfers performed around ({},{}) {}x{}, {} dropped",
+                deferred_transfer_cutout_.x_pixels, deferred_transfer_cutout_.y_pixels,
+                deferred_transfer_cutout_.width_pixels, deferred_transfer_cutout_.height_pixels,
+                dropped_count);
+  }
+  PerformTransfersAndResolveClears(1 + xenos::kMaxColorRenderTargets, cut_render_targets,
+                                   cut_transfers.data(), nullptr, &deferred_transfer_cutout_);
+}
+
+bool VulkanRenderTargetCache::MergeTransferCutout(Transfer::Rectangle& accumulated,
+                                                  const Transfer::Rectangle& rectangle) {
+  uint32_t ax0 = accumulated.x_pixels, ax1 = ax0 + accumulated.width_pixels;
+  uint32_t ay0 = accumulated.y_pixels, ay1 = ay0 + accumulated.height_pixels;
+  uint32_t bx0 = rectangle.x_pixels, bx1 = bx0 + rectangle.width_pixels;
+  uint32_t by0 = rectangle.y_pixels, by1 = by0 + rectangle.height_pixels;
+  if (bx0 >= ax0 && bx1 <= ax1 && by0 >= ay0 && by1 <= ay1) {
+    return true;
+  }
+  if ((ax0 >= bx0 && ax1 <= bx1 && ay0 >= by0 && ay1 <= by1) ||
+      (ay0 == by0 && ay1 == by1 && bx0 <= ax1 && bx1 >= ax0) ||
+      (ax0 == bx0 && ax1 == bx1 && by0 <= ay1 && by1 >= ay0)) {
+    uint32_t x0 = std::min(ax0, bx0), y0 = std::min(ay0, by0);
+    accumulated.x_pixels = x0;
+    accumulated.y_pixels = y0;
+    accumulated.width_pixels = std::max(ax1, bx1) - x0;
+    accumulated.height_pixels = std::max(ay1, by1) - y0;
+    return true;
+  }
+  return false;
+}
+
+void VulkanRenderTargetCache::UpdateUniformStencil(VulkanRenderTarget& depth_render_target,
+                                                   reg::RB_DEPTHCONTROL normalized_depth_control,
+                                                   uint32_t normalized_color_mask,
+                                                   const Shader& vertex_shader) {
+  VulkanRenderTarget::UniformStencil& uniform = depth_render_target.uniform_stencil();
+  const RegisterFile& regs = register_file();
+  auto stencil_ref_mask = regs.Get<reg::RB_STENCILREFMASK>();
+  reg::RB_STENCILREFMASK stencil_ref_mask_bf;
+  stencil_ref_mask_bf.value = regs[XE_GPU_REG_RB_STENCILREFMASK_BF];
+  Transfer::Rectangle rectangle;
+  bool exact_edges;
+  if ((GetDrawOverwrittenRenderTargets(normalized_depth_control, normalized_color_mask,
+                                       vertex_shader, rectangle, &exact_edges) &
+       1) &&
+      exact_edges) {
+    // The stencil in the rectangle is replaced with the reference value.
+    uint32_t value = stencil_ref_mask.stencilref;
+    if (normalized_depth_control.backface_enable && stencil_ref_mask_bf.stencilref != value) {
+      uniform.generation = 0;
+      return;
+    }
+    if (uniform.generation == uniform_stencil_generation_ && uniform.value == value &&
+        MergeTransferCutout(uniform.rectangle, rectangle)) {
+      return;
+    }
+    uniform.rectangle = rectangle;
+    uniform.value = value;
+    uniform.generation = uniform_stencil_generation_;
+    return;
+  }
+  if (!normalized_depth_control.stencil_enable) {
+    return;
+  }
+  bool writes_stencil = stencil_ref_mask.stencilwritemask &&
+                        (normalized_depth_control.stencilfail != xenos::StencilOp::kKeep ||
+                         normalized_depth_control.stencilzfail != xenos::StencilOp::kKeep ||
+                         normalized_depth_control.stencilzpass != xenos::StencilOp::kKeep);
+  if (normalized_depth_control.backface_enable) {
+    writes_stencil |= stencil_ref_mask_bf.stencilwritemask &&
+                      (normalized_depth_control.stencilfail_bf != xenos::StencilOp::kKeep ||
+                       normalized_depth_control.stencilzfail_bf != xenos::StencilOp::kKeep ||
+                       normalized_depth_control.stencilzpass_bf != xenos::StencilOp::kKeep);
+  }
+  if (writes_stencil) {
+    // Anywhere the draw covers.
+    uniform.generation = 0;
+  }
+}
+
+void VulkanRenderTargetCache::ForgetUniformStencilWrittenByTransfers(
+    VulkanRenderTarget& depth_render_target, const std::vector<Transfer>& transfers,
+    const Transfer::Rectangle* cutout) {
+  VulkanRenderTarget::UniformStencil& uniform = depth_render_target.uniform_stencil();
+  if (uniform.generation != uniform_stencil_generation_) {
+    return;
+  }
+  const Transfer::Rectangle& known = uniform.rectangle;
+  RenderTargetKey key = depth_render_target.key();
+  for (const Transfer& transfer : transfers) {
+    Transfer::Rectangle rectangles[Transfer::kMaxRectanglesWithCutout];
+    uint32_t rectangle_count = transfer.GetRectangles(
+        key.base_tiles, key.GetPitchTiles(), key.msaa_samples, key.Is64bpp(), rectangles, cutout);
+    for (uint32_t i = 0; i < rectangle_count; ++i) {
+      const Transfer::Rectangle& written = rectangles[i];
+      if (written.x_pixels < known.x_pixels + known.width_pixels &&
+          known.x_pixels < written.x_pixels + written.width_pixels &&
+          written.y_pixels < known.y_pixels + known.height_pixels &&
+          known.y_pixels < written.y_pixels + written.height_pixels) {
+        uniform.generation = 0;
+        return;
+      }
+    }
+  }
+}
+
+bool VulkanRenderTargetCache::GetUniformStencil(VulkanRenderTarget& depth_render_target,
+                                                uint32_t x0, uint32_t y0, uint32_t x1,
+                                                uint32_t y1, uint32_t& value_out) {
+  if (!REXCVAR_GET(native_resolve_uniform_stencil)) {
+    return false;
+  }
+  const VulkanRenderTarget::UniformStencil& uniform = depth_render_target.uniform_stencil();
+  if (uniform.generation != uniform_stencil_generation_ || x0 < uniform.rectangle.x_pixels ||
+      y0 < uniform.rectangle.y_pixels ||
+      x1 > uniform.rectangle.x_pixels + uniform.rectangle.width_pixels ||
+      y1 > uniform.rectangle.y_pixels + uniform.rectangle.height_pixels) {
+    return false;
+  }
+  value_out = uniform.value;
+  return true;
+}
+
 uint32_t VulkanRenderTargetCache::GetDrawOverwrittenRenderTargets(
     reg::RB_DEPTHCONTROL normalized_depth_control, uint32_t normalized_color_mask,
-    const Shader& vertex_shader, Transfer::Rectangle& rectangle_out) const {
+    const Shader& vertex_shader, Transfer::Rectangle& rectangle_out,
+    bool* exact_edges_out) const {
+  if (exact_edges_out) {
+    *exact_edges_out = false;
+  }
   const RegisterFile& regs = register_file();
   if (vertex_shader.ucode_data_hash() != kXdkClearVertexShaderHash) {
     return 0;
@@ -7022,6 +7319,15 @@ uint32_t VulkanRenderTargetCache::GetDrawOverwrittenRenderTargets(
     REXGPU_INFO("[rt-debug] clear vertices (1/256 px): ({},{}) ({},{}) ({},{}) msaa={}",
                 x_fixed[0], y_fixed[0], x_fixed[1], y_fixed[1], x_fixed[2], y_fixed[2],
                 1u << uint32_t(surface_info.msaa_samples));
+  }
+  if (exact_edges_out) {
+    // Edges on pixel boundaries: the same pixels (and all of their samples, or
+    // none) are covered at any resolution scale.
+    bool exact_edges = true;
+    for (uint32_t i = 0; i < 3; ++i) {
+      exact_edges &= !(x_fixed[i] & 0xFF) && !(y_fixed[i] & 0xFF);
+    }
+    *exact_edges_out = exact_edges;
   }
   // The rectangle covers the bounding box of the vertices only if they are
   // three distinct corners of an axis-aligned rectangle.
@@ -8006,6 +8312,27 @@ void VulkanRenderTargetCache::CaptureScaledResolveStencil(VulkanRenderTarget& so
       VK_ACCESS_SHADER_READ_BIT, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, false);
 }
 
+void VulkanRenderTargetCache::FillScaledStencilCapture(uint32_t capture_index, uint32_t value,
+                                                       VkDeviceSize size) {
+  const ScaledStencilCapture& capture = scaled_stencil_captures_[capture_index];
+  command_processor_.EndRenderPass();
+  // The capture may still be read by the write-back of an earlier resolve, or
+  // be being written by an earlier capture.
+  command_processor_.PushBufferMemoryBarrier(
+      capture.buffer, 0, VK_WHOLE_SIZE,
+      VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+      VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT,
+      VK_ACCESS_TRANSFER_WRITE_BIT, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, false);
+  command_processor_.SubmitBarriers(true);
+  command_processor_.deferred_command_buffer().CmdVkFillBuffer(
+      capture.buffer, 0, std::min(rex::align(size, VkDeviceSize(4)), capture.size),
+      (value & 0xFF) * 0x01010101u);
+  command_processor_.PushBufferMemoryBarrier(
+      capture.buffer, 0, VK_WHOLE_SIZE, VK_PIPELINE_STAGE_TRANSFER_BIT,
+      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+      VK_ACCESS_SHADER_READ_BIT, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, false);
+}
+
 void VulkanRenderTargetCache::DropPendingScaledResolveMemory(
     const PendingScaledResolveMemory& pending) {
   pending_scaled_resolve_texture_cache_->AddScaledMemoryPending(pending.texture, -1);
@@ -8018,11 +8345,40 @@ void VulkanRenderTargetCache::DropPendingScaledResolveMemory(
 }
 
 void VulkanRenderTargetCache::WriteBackPendingScaledResolveMemory(
-    const PendingScaledResolveMemory& pending) {
+    const PendingScaledResolveMemory& pending_resolve) {
   VulkanTextureCache& texture_cache = *pending_scaled_resolve_texture_cache_;
   bool written = false;
-  if (pending.is_depth ? EnsureScaledMemoryWritebackDepthPipeline()
-                       : EnsureScaledMemoryWritebackPipeline()) {
+  // Holds the capture filled for a uniform stencil, released with the rest.
+  PendingScaledResolveMemory pending = pending_resolve;
+  bool stencil_buffers_valid = true;
+  if (pending.is_depth) {
+    VkDeviceSize stencil_bytes =
+        (VkDeviceSize(pending.x1 - pending.x0) * draw_resolution_scale_x() *
+             (pending.y1 - pending.y0) * draw_resolution_scale_y() +
+         3) &
+        ~VkDeviceSize(3);
+    if (pending.stencil_uniform && pending.stencil_capture == UINT32_MAX) {
+      pending.stencil_capture = AcquireScaledStencilCapture(stencil_bytes);
+      pending.stencil_capture_quads = false;
+      if (pending.stencil_capture != UINT32_MAX) {
+        FillScaledStencilCapture(pending.stencil_capture, pending.stencil_uniform_value,
+                                 stencil_bytes);
+      }
+    }
+    // The stencil buffers the write-back reads must exist and cover the
+    // rectangle (a byte per host texel) - out of bounds reads fault the GPU.
+    if (pending.stencil_capture == UINT32_MAX) {
+      stencil_buffers_valid = false;
+    }
+    for (uint32_t capture : {pending.stencil_capture, pending.verify_stencil_capture}) {
+      if (capture != UINT32_MAX && (capture >= scaled_stencil_captures_.size() ||
+                                    scaled_stencil_captures_[capture].size < stencil_bytes)) {
+        stencil_buffers_valid = false;
+      }
+    }
+  }
+  if (stencil_buffers_valid && (pending.is_depth ? EnsureScaledMemoryWritebackDepthPipeline()
+                                                 : EnsureScaledMemoryWritebackPipeline())) {
     const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
     const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
     const VkDevice device = vulkan_device->device();
@@ -8087,6 +8443,8 @@ void VulkanRenderTargetCache::WriteBackPendingScaledResolveMemory(
         if (pending.verify_stencil_capture != UINT32_MAX) {
           stencil_verify_buffer_info.buffer =
               scaled_stencil_captures_[pending.verify_stencil_capture].buffer;
+          stencil_verify_buffer_info.offset = 0;
+          stencil_verify_buffer_info.range = VK_WHOLE_SIZE;
         }
       }
       VkWriteDescriptorSet writes[4];
@@ -8212,6 +8570,7 @@ bool VulkanRenderTargetCache::PrepareNativeResolve(const draw_util::ResolveInfo&
                                                    NativeResolvePlan& plan) {
   plan.target_count = 0;
   plan.source = nullptr;
+  plan.memory_only = false;
   if (!native_resolve_enabled_ || !resolve_info.copy_dest_extent_length ||
       resolve_info.copy_dest_info.copy_dest_array) {
     return false;
@@ -8356,13 +8715,23 @@ bool VulkanRenderTargetCache::PrepareNativeResolve(const draw_util::ResolveInfo&
       resolve_info.copy_dest_base_raw, dest_pitch,
       xenos::TextureFormat(resolve_info.copy_dest_info.copy_dest_format),
       xenos::Endian(dest_endian), found);
-  for (uint32_t i = 0; i < found_count; ++i) {
+  bool memory_only_all = REXCVAR_GET(native_resolve_debug_memory_only_all);
+  for (uint32_t i = 0; i < found_count && !memory_only_all; ++i) {
     if (found[i].width > x0 && found[i].height > y0) {
       plan.targets[plan.target_count++] = found[i];
     }
   }
   if (!plan.target_count) {
-    return false;
+    if (!REXCVAR_GET(native_resolve_memory_only) && !memory_only_all) {
+      return false;
+    }
+    // A stand-in target covering the rectangle, with no image: the draw only
+    // writes the memory, which textures sampling the destination later load.
+    plan.targets[0] = VulkanTextureCache::NativeResolveTarget();
+    plan.targets[0].width = x1;
+    plan.targets[0].height = y1;
+    plan.target_count = 1;
+    plan.memory_only = true;
   }
   plan.source = source;
   plan.shader = shader;
@@ -8479,7 +8848,9 @@ void VulkanRenderTargetCache::PerformNativeResolve(VulkanTextureCache& texture_c
       // Stays outdated, and will be reloaded from the resolved memory.
       continue;
     }
-    texture_cache.BeginNativeResolveWrite(target);
+    if (target.texture) {
+      texture_cache.BeginNativeResolveWrite(target);
+    }
     command_processor_.EndRenderPass();
     // Guest texels to host pixels: scaled render targets and scaled textures
     // of resolved memory have the same scale, so host texel (x, y) of the
@@ -8525,7 +8896,7 @@ void VulkanRenderTargetCache::PerformNativeResolve(VulkanTextureCache& texture_c
   uint32_t written_count = 0;
   bool debug_reload = REXCVAR_GET(native_resolve_debug_reload);
   for (uint32_t i = 0; i < plan.target_count; ++i) {
-    if (written[i]) {
+    if (written[i] && plan.targets[i].texture) {
       if (!debug_reload) {
         texture_cache.EndNativeResolveWrite(plan.targets[i]);
       }
@@ -8534,8 +8905,13 @@ void VulkanRenderTargetCache::PerformNativeResolve(VulkanTextureCache& texture_c
   }
   native_resolve_texture_write_count_ += written_count;
   if (RtDebugLogActive()) {
-    REXGPU_INFO("[rt-debug] native resolve wrote {} of {} textures", written_count,
-                plan.target_count);
+    if (plan.memory_only) {
+      REXGPU_INFO("[rt-debug] native resolve wrote only the memory{}",
+                  written[0] ? "" : " - FAILED");
+    } else {
+      REXGPU_INFO("[rt-debug] native resolve wrote {} of {} textures", written_count,
+                  plan.target_count);
+    }
   }
   gpu_profiler.Mark(command_buffer, VulkanGpuProfiler::Category::kResolve);
 }

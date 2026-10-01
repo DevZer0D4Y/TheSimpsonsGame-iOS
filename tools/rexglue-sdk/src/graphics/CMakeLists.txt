@@ -108,6 +108,31 @@ endif()
 add_library(rexgraphics OBJECT ${REXGRAPHICS_SOURCES})
 add_library(rex::graphics ALIAS rexgraphics)
 
+# A hash of the shader translator's sources, which sets of shaders exported
+# from runtime translations record and are checked against.
+file(GLOB REX_TRANSLATOR_HASH_INPUTS
+    ${CMAKE_CURRENT_SOURCE_DIR}/pipeline/shader/*.cpp
+    ${REXGLUE_ROOT}/include/rex/graphics/pipeline/shader/*.h
+)
+list(APPEND REX_TRANSLATOR_HASH_INPUTS
+    ${CMAKE_CURRENT_SOURCE_DIR}/format/ucode.cpp
+    ${REXGLUE_ROOT}/include/rex/graphics/format/ucode.h
+    ${REXGLUE_ROOT}/include/rex/graphics/xenos.h
+)
+string(REPLACE ";" "|" REX_TRANSLATOR_HASH_INPUTS_ARG "${REX_TRANSLATOR_HASH_INPUTS}")
+set(REX_TRANSLATOR_HASH_HEADER ${CMAKE_CURRENT_BINARY_DIR}/generated/rex/graphics/translator_hash.h)
+add_custom_command(
+    OUTPUT ${REX_TRANSLATOR_HASH_HEADER}
+    COMMAND ${CMAKE_COMMAND} -DOUTPUT=${REX_TRANSLATOR_HASH_HEADER}
+            "-DINPUTS=${REX_TRANSLATOR_HASH_INPUTS_ARG}"
+            -P ${REXGLUE_ROOT}/cmake/translator_hash.cmake
+    DEPENDS ${REX_TRANSLATOR_HASH_INPUTS} ${REXGLUE_ROOT}/cmake/translator_hash.cmake
+    COMMENT "Hashing the shader translator sources"
+    VERBATIM
+)
+target_sources(rexgraphics PRIVATE ${REX_TRANSLATOR_HASH_HEADER})
+target_include_directories(rexgraphics PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/generated)
+
 target_include_directories(rexgraphics PUBLIC
     $<BUILD_INTERFACE:${REXGLUE_ROOT}/include>
     $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
