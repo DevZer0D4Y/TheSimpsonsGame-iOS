@@ -257,7 +257,131 @@ void main() {
   uint count = bitfieldExtract(loop_constant, 0, 8);
   int loop_address = int(bitfieldExtract(loop_constant, 8, 8));
   int loop_step = bitfieldExtract(int(loop_constant), 16, 8);
-  for (uint i = 0u; i < count; ++i) {
+  uint i = 0u;
+#if XE_TEXTURES_LEVEL0
+  // The taps of 4 iterations are fetched together, before the search checks
+  // any of them (their coordinates depend only on the constants and the
+  // pixel), so their latencies overlap. Only pixels still searching fetch;
+  // taps past the one that ends a pixel's search go unused. (Only without
+  // gradients, which the other variants take at each fetch.)
+  for (; i + 4u <= count; i += 4u) {
+    vec4 taps[4];
+    if (r1.w == 0.0) {
+      for (int j = 0; j < 4; ++j) {
+        // 14-17 for the tap's offset.
+        precise float rcp_x = 1.0 / C(49).x;
+        precise float rcp_y = 1.0 / C(48).x;
+        vec4 offset = C(20 + loop_address + j * loop_step);
+        precise float offset_x = MulZ(rcp_x, offset.x);
+        precise float offset_y = MulZ(rcp_y, offset.y);
+        precise float tap_y = MulZ(offset_y, C(50).x) + r0.y;
+        precise float tap_x = MulZ(offset_x, C(50).x) + r0.x;
+        // 18 with the coordinates swapped back.
+        taps[j] = Fetch0(vec2(tap_x, tap_y));
+      }
+    }
+    for (int j = 0; j < 4; ++j) {
+      // 13: setp_eq r1.w
+      p0 = r1.w == 0.0;
+      ps = p0 ? 0.0 : 1.0;
+      if (p0) {
+        // 14, 15: rcp r2.x, c49.x; rcp r2.y, c48.x
+        ps = 1.0 / C(49).x;
+        r2.x = ps;
+        ps = 1.0 / C(48).x;
+        r2.y = ps;
+        // 16: mul r2.xy, r2.xy, c[20+aL].xy
+        vec4 offset = C(20 + loop_address);
+        {
+          precise float x = MulZ(r2.x, offset.x);
+          precise float y = MulZ(r2.y, offset.y);
+          r2.x = x;
+          r2.y = y;
+        }
+        // 17: mad r2.xy, r2.yx, c50.xx, r0.yx
+        {
+          precise float x = MulZ(r2.y, C(50).x) + r0.y;
+          precise float y = MulZ(r2.x, C(50).x) + r0.x;
+          r2.x = x;
+          r2.y = y;
+        }
+        // 18: tfetch2D r2, r2.yx, tf0
+        r2 = taps[j];
+        // 19: sge r4.yz, r2.zw, c255.xy + maxs r2.xx
+        {
+          float y = Sge(r2.z, C(255).x);
+          float z = Sge(r2.w, C(255).y);
+          ps = r2.x;
+          r4.y = y;
+          r4.z = z;
+        }
+        // 20: mad r1.w, -r4.y, c254.z, r2.z
+        r1.w = MulZ(-r4.y, C(254).z) + r2.z;
+        // 21: add_sat r4.w, r0.w, r4.z + adds_prev r3.x, -r1.y
+        {
+          precise float sum = r0.w + r4.z;
+          float v = Sat(sum);
+          precise float s = -r1.y + ps;
+          ps = s;
+          r4.w = v;
+          r3.x = ps;
+        }
+        // 22: sge r4.x, |r3.x|, c255.w
+        r4.x = Sge(abs(r3.x), C(255).w);
+        // 23: add r3, -r4.xzyw, c255.zzzz
+        {
+          precise vec4 v = -vec4(r4.x, r4.z, r4.y, r4.w) + vec4(C(255).z);
+          r3 = v;
+        }
+        // 24: sge r1.w, r1.w, c254.y + maxs r3.zz
+        {
+          float v = Sge(r1.w, C(254).y);
+          ps = r3.z;
+          r1.w = v;
+        }
+        // 25: mad r1.w, r3.y, r1.w, r2.y
+        r1.w = MulZ(r3.y, r1.w) + r2.y;
+        // 26: add r1.w, r1.w, -r1.z + muls_prev r1.x, r1.x
+        {
+          precise float v = r1.w + -r1.z;
+          ps = MulZ(r1.x, ps);
+          r1.w = v;
+          r1.x = ps;
+        }
+        // 27: add_sat r2.x, r0.z, r1.x
+        {
+          precise float sum = r0.z + r1.x;
+          r2.x = Sat(sum);
+        }
+        // 28: mul r1.w, r1.x, |r1.w| + maxs r2.xx
+        {
+          precise float v = MulZ(r1.x, abs(r1.w));
+          ps = r2.x;
+          r1.w = v;
+        }
+        // 29: sge r2.x, r1.w, c255.w + muls_prev r1.w, r4.x
+        {
+          float v = Sge(r1.w, C(255).w);
+          ps = MulZ(r4.x, ps);
+          r2.x = v;
+          r1.w = ps;
+        }
+        // 30: add r2.x, -r1.w, r2.x + muls r2.y, r3.wx
+        {
+          precise float v = -r1.w + r2.x;
+          ps = MulZ(r3.w, r3.x);
+          r2.x = v;
+          r2.y = ps;
+        }
+        // 31: mad r1.w, r2.y, r2.x, r1.w
+        r1.w = MulZ(r2.y, r2.x) + r1.w;
+      }
+      loop_address += loop_step;
+      loop_address += loop_step;
+    }
+  }
+#endif
+  for (; i < count; ++i) {
     // 13: setp_eq r1.w
     p0 = r1.w == 0.0;
     ps = p0 ? 0.0 : 1.0;
@@ -353,6 +477,7 @@ void main() {
       // 31: mad r1.w, r2.y, r2.x, r1.w
       r1.w = MulZ(r2.y, r2.x) + r1.w;
     }
+    loop_address += loop_step;
     loop_address += loop_step;
   }
 

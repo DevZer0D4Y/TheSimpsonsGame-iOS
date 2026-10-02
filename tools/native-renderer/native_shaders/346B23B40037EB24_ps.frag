@@ -268,6 +268,44 @@ DEFINE_FETCH(Fetch2, xe_texture2_2d_u, xe_texture2_2d_s, xe_sampler2_fff)
 DEFINE_FETCH(Fetch3, xe_texture3_2d_u, xe_texture3_2d_s, xe_sampler3_fff)
 DEFINE_FETCH(Fetch4, xe_texture4_2d_u, xe_texture4_2d_s, xe_sampler4_fff)
 
+// The taps fetched at once in the level 0 variant's loops (they run 10 times
+// in this game).
+#ifndef XE_TAP_BATCH
+#define XE_TAP_BATCH 5u
+#endif
+
+// The rest of the first loop's body after its fetch into r4.
+#define LOOP_1_BODY                                                  \
+  /* 85: add r1.yzw, r4.yzw, r1.wzy + addsc r1.x, c254.w, r1.x */   \
+  {                                                                  \
+    precise vec3 v = r4.yzw + r1.wzy;                                \
+    ps = c254.w + r1.x;                                              \
+    r1.yzw = v;                                                      \
+    r1.x = ps;                                                       \
+  }                                                                  \
+  /* 86: max r7.yzw, r1.wzy, r1.wzy + maxs r4.xx */                 \
+  r7.yzw = r1.wzy;                                                   \
+  ps = r4.x;                                                         \
+  /* 87: max r1.yzw, r1.wzy, r1.wzy + adds_prev r7.x, r7.x */       \
+  r1.yzw = r1.wzy;                                                   \
+  ps = r7.x + ps;                                                    \
+  r7.x = ps;
+
+// The rest of the second loop's body after its fetch into r7.
+#define LOOP_2_BODY                                                  \
+  /* 96: max r6.zw, r4.zw, r4.zw + maxs r6.y, r8.yy */              \
+  r6.zw = r4.zw;                                                     \
+  ps = r8.y;                                                         \
+  r6.y = ps;                                                         \
+  /* 97: add r6, r7.xwyz, r6.xywz */                                 \
+  r6 = r7.xwyz + r6.xywz;                                            \
+  /* 98: max r8.xy, r6.yy, r6.yy */                                  \
+  r8.xy = r6.yy;                                                     \
+  /* 99: max r4, r6.wzwz, r6.wzwz + addsc r0.z, c254.w, r0.z */     \
+  r4 = r6.wzwz;                                                      \
+  ps = c254.w + r0.z;                                                \
+  r0.z = ps;
+
 void main() {
   uint sign_modes_0_3 = xe_texture_swizzled_signs[0].x;
   FetchState tf0 = DecodeFetch(0u, xe_fetch_constants[0].z, xe_fetch_constants[1].x,
@@ -509,25 +547,35 @@ void main() {
     r0.z = MulZ(-r0.z, c252.w) + r0.x;
     // loop i16 with (!p0) break: p0 holds, so it runs its full count.
     uint loop_count = bitfieldExtract(xe_loop_constants[4].x, 0, 8);
-    for (uint i = 0u; i < loop_count; ++i) {
+    uint i = 0u;
+#if XE_TEXTURES_LEVEL0
+    // Taps in batches: the coordinates don't depend on what is fetched, so a
+    // batch is fetched before the loop body uses any of it, and the latencies
+    // of its fetches overlap. The body then runs in the original order. (Only
+    // without gradients, which the other variants take at each fetch.)
+    for (; i + XE_TAP_BATCH <= loop_count; i += XE_TAP_BATCH) {
+      vec4 taps[XE_TAP_BATCH];
+      precise float tap_r1_x = r1.x;
+      for (uint j = 0u; j < XE_TAP_BATCH; ++j) {
+        precise float tap_x = MulZ(r5.z, tap_r1_x) + r0.z;
+        taps[j] = Fetch4(vec2(tap_x, r0.y), tf4);
+        tap_r1_x = c254.w + tap_r1_x;
+      }
+      for (uint j = 0u; j < XE_TAP_BATCH; ++j) {
+        // 83
+        r0.w = MulZ(r5.z, r1.x) + r0.z;
+        // 84
+        r4 = taps[j];
+        LOOP_1_BODY
+      }
+    }
+#endif
+    for (; i < loop_count; ++i) {
       // 83: mad r0.w, r5.z, r1.x, r0.z
       r0.w = MulZ(r5.z, r1.x) + r0.z;
       // 84: tfetch2D r4, r0.wy, tf4
       r4 = Fetch4(r0.wy, tf4);
-      // 85: add r1.yzw, r4.yzw, r1.wzy + addsc r1.x, c254.w, r1.x
-      {
-        precise vec3 v = r4.yzw + r1.wzy;
-        ps = c254.w + r1.x;
-        r1.yzw = v;
-        r1.x = ps;
-      }
-      // 86: max r7.yzw, r1.wzy, r1.wzy + maxs r4.xx
-      r7.yzw = r1.wzy;
-      ps = r4.x;
-      // 87: max r1.yzw, r1.wzy, r1.wzy + adds_prev r7.x, r7.x
-      r1.yzw = r1.wzy;
-      ps = r7.x + ps;
-      r7.x = ps;
+      LOOP_1_BODY
     }
     // 88: sgt r1, -|r0.x|, c252.x
     r1 = vec4(Sgt(-abs(r0.x), c252.x));
@@ -555,23 +603,32 @@ void main() {
     r0.y = MulZ(-r0.w, c252.w) + r0.y;
     // loop i16 with (!p0) break, as above.
     loop_count = bitfieldExtract(xe_loop_constants[4].x, 0, 8);
-    for (uint i = 0u; i < loop_count; ++i) {
+    i = 0u;
+#if XE_TEXTURES_LEVEL0
+    // In batches like the first loop.
+    for (; i + XE_TAP_BATCH <= loop_count; i += XE_TAP_BATCH) {
+      vec4 taps[XE_TAP_BATCH];
+      precise float tap_r0_z = r0.z;
+      for (uint j = 0u; j < XE_TAP_BATCH; ++j) {
+        precise float tap_y = MulZ(r5.y, tap_r0_z) + r0.y;
+        taps[j] = Fetch4(vec2(r0.x, tap_y), tf4);
+        tap_r0_z = c254.w + tap_r0_z;
+      }
+      for (uint j = 0u; j < XE_TAP_BATCH; ++j) {
+        // 94
+        r0.w = MulZ(r5.y, r0.z) + r0.y;
+        // 95
+        r7 = taps[j];
+        LOOP_2_BODY
+      }
+    }
+#endif
+    for (; i < loop_count; ++i) {
       // 94: mad r0.w, r5.y, r0.z, r0.y
       r0.w = MulZ(r5.y, r0.z) + r0.y;
       // 95: tfetch2D r7, r0.xw, tf4
       r7 = Fetch4(r0.xw, tf4);
-      // 96: max r6.zw, r4.zw, r4.zw + maxs r6.y, r8.yy
-      r6.zw = r4.zw;
-      ps = r8.y;
-      r6.y = ps;
-      // 97: add r6, r7.xwyz, r6.xywz
-      r6 = r7.xwyz + r6.xywz;
-      // 98: max r8.xy, r6.yy, r6.yy
-      r8.xy = r6.yy;
-      // 99: max r4, r6.wzwz, r6.wzwz + addsc r0.z, c254.w, r0.z
-      r4 = r6.wzwz;
-      ps = c254.w + r0.z;
-      r0.z = ps;
+      LOOP_2_BODY
     }
     // 100: max r8.yz, r4.xy, r4.xy + maxs r8.w, r6.xx
     r8.yz = r4.xy;
