@@ -223,7 +223,24 @@ void main() {
   precise vec3 sum;
   if (plain) {
     sum = Fetch0Plain(coord);
-    for (uint i = 0u; i < count; ++i) {
+    // Taps in groups of 4 (the count in this game), all fetched before any of
+    // them is added, so their latencies overlap instead of adding up. The sum
+    // keeps the same order.
+    uint i = 0u;
+    for (; i + 4u <= count; i += 4u) {
+      vec3 taps[4];
+      for (int j = 0; j < 4; ++j) {
+        vec4 offset = xe_float_constants[20 + loop_address + j * loop_step];
+        precise vec2 tap = vec2(MulZ(texel_x, offset.x) + coord.x,
+                                MulZ(texel_y, offset.y) + coord.y);
+        taps[j] = Fetch0Plain(tap);
+      }
+      for (int j = 0; j < 4; ++j) {
+        sum += taps[j];
+      }
+      loop_address += 4 * loop_step;
+    }
+    for (; i < count; ++i) {
       vec4 offset = xe_float_constants[20 + loop_address];
       precise vec2 tap = vec2(MulZ(texel_x, offset.x) + coord.x,
                               MulZ(texel_y, offset.y) + coord.y);
