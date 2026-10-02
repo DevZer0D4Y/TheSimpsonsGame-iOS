@@ -227,7 +227,7 @@ class Run:
         time.sleep(hold)
         subprocess.run(["xdotool", "keyup"] + target + [name], env=self.env())
 
-    def pad(self, control, hold):
+    def pad(self, control, hold, wait_for_release=True):
         path = os.path.join(self.run_dir, "input.cmd")
         deadline = time.time() + 5
         while os.path.exists(path) and time.time() < deadline:
@@ -240,7 +240,8 @@ class Run:
             time.sleep(0.02)
         if os.path.exists(path):
             self.note(f"pad {control}: not consumed")
-        time.sleep(hold + 0.05)
+        if wait_for_release:
+            time.sleep(hold + 0.05)
 
     def shot(self, label):
         """Screenshot of the presented guest output via the engine's trigger file."""
@@ -467,6 +468,11 @@ def main():
                 run.key(rest[0], float(rest[1]) if len(rest) > 1 else 0.15)
             elif op == "pad":
                 run.pad(rest[0], float(rest[1]) if len(rest) > 1 else 0.15)
+            elif op == "padhold":
+                # Like pad, but the script goes on while the button is held
+                # (to take screenshots or a trace during the hold).
+                run.pad(rest[0], float(rest[1]) if len(rest) > 1 else 0.15, False)
+                run.note(f"holding {rest[0]}")
             elif op == "shot":
                 run.shot(rest[0])
             elif op == "shots":

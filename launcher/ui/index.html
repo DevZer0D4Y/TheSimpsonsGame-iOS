@@ -63,13 +63,17 @@
 
   *{box-sizing:border-box; margin:0; padding:0}
   body{font-family:var(--body); color:var(--text); min-height:100vh; line-height:1.45;
-    background-color:var(--sky-bottom);
+    background-color:var(--sky-bottom)}
+  /* The sky sits on its own fixed layer so it is painted once, not again with
+     every change on the page: the launcher window is software-rendered, and
+     repainting the clouds kept a CPU core busy while the game was running. */
+  body::before{content:""; position:fixed; inset:0; z-index:-1; pointer-events:none;
+    will-change:transform;
     background-image:var(--cloud), var(--cloud), var(--cloud), var(--cloud), var(--stars),
       linear-gradient(180deg, var(--sky-top) 0%, var(--sky-bottom) 100%);
     background-repeat:no-repeat, no-repeat, no-repeat, no-repeat, repeat, no-repeat;
     background-size:340px auto, 430px auto, 300px auto, 470px auto, 260px 260px, 100% 100%;
-    background-position:-70px 120px, calc(100% + 90px) 24px, 80% 64%, 4% 92%, 0 0, 0 0;
-    background-attachment:fixed;}
+    background-position:-70px 120px, calc(100% + 90px) 24px, 80% 64%, 4% 92%, 0 0, 0 0}
 
   .wrap{max-width:1120px; margin:0 auto; padding:22px 24px 60px}
   .hidden{display:none !important}
@@ -80,9 +84,9 @@
   header{display:flex; align-items:center; gap:16px}
   .donut{width:58px; height:58px; border-radius:50%; flex:none; position:relative; cursor:pointer;
     background:radial-gradient(circle at 50% 50%, var(--sky-top) 0 9px, var(--ink) 9px 11.5px, var(--pink) 11.5px 22px, #E9A24A 22px 25.5px, var(--ink) 25.5px 29px);
-    box-shadow:0 4px 0 var(--ink); animation:spin 18s linear infinite}
+    box-shadow:0 4px 0 var(--ink)}
   :root[data-theme="dark"] .donut{background:radial-gradient(circle at 50% 50%, #0d1735 0 9px, var(--ink) 9px 11.5px, var(--pink) 11.5px 22px, #E9A24A 22px 25.5px, var(--ink) 25.5px 29px)}
-  .donut.fast{animation-duration:.6s}
+  .donut.fast{animation:spin .6s linear 2}
   .donut i{position:absolute; width:6px; height:2.5px; border-radius:2px}
   @keyframes spin{to{transform:rotate(360deg)}}
   .titles{display:flex; flex-direction:column; align-items:flex-start}
@@ -136,7 +140,7 @@
     height:clamp(290px, 47vh, 430px); box-shadow:0 7px 0 var(--shadow);
     background:var(--cloud) no-repeat 12% 30% / 360px auto, var(--cloud) no-repeat 92% 70% / 420px auto,
       linear-gradient(180deg, var(--sky-top), var(--sky-bottom))}
-  .hero img{width:100%; height:100%; object-fit:cover; object-position:50% 28%; display:block; transition:opacity .8s}
+  .hero img{width:100%; height:100%; object-fit:cover; object-position:50% 28%; display:block; transition:opacity .5s}
   .hero.noart img{display:none}
   .hero .placeholder{display:none; position:absolute; inset:0; align-items:center; justify-content:center;
     font-family:var(--display); font-size:26px; color:#fff; letter-spacing:.6px; padding:0 40px 80px;
@@ -931,15 +935,18 @@ document.querySelectorAll("nav button").forEach(b => b.onclick = () => {
   if (tab) tab.click();
 }
 
-/* hero art rotation */
+/* hero art rotation: a new picture every 15 s, and none while the game runs,
+   the Play tab is closed or the launcher isn't on screen, so the launcher costs
+   no CPU next to the game. */
 let artList = [], artIdx = 0, artVersion = 0, shownArtVersion = -1;
 setInterval(() => {
-  if (artList.length < 2) return;
+  if (artList.length < 2 || (lastStatus && lastStatus.running) ||
+      document.visibilityState !== "visible" || $("#tab-play").classList.contains("hidden")) return;
   artIdx = (artIdx + 1) % artList.length;
   const img = $("#heroimg");
   img.style.opacity = 0;
-  setTimeout(() => { img.src = "/art/" + artList[artIdx] + "?v=" + artVersion; img.style.opacity = 1; }, 600);
-}, 9000);
+  setTimeout(() => { img.src = "/art/" + artList[artIdx] + "?v=" + artVersion; img.style.opacity = 1; }, 500);
+}, 15000);
 
 /* status polling */
 let lastStatus = null;
