@@ -143,7 +143,9 @@ key each button is on. The default layout:
 
 Every control can be changed in the launcher's **Keyboard & mouse** section, where an action can
 have several keys, mouse buttons included, and the wheel and side buttons can be bound. The camera
-can also be put on keys (Look up, down, left and right), on top of the mouse. In the
+can also be put on keys (Look up, down, left and right), on top of the mouse. The keys that open
+the in-game overlays (F1 controls, F4 settings, F3 FPS overlay, ` console) can be changed there
+too. In the
 game, F4 opens the settings, with the controls under Input > Keybinds (press *Save to config* to
 keep changes made there).
 

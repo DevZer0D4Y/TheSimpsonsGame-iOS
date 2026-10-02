@@ -558,6 +558,13 @@
     </div>
 
     <div class="card">
+      <h2>In-game overlay keys</h2>
+      <p class="muted">The keys that open the game's own overlays, one keyboard key each. They work
+        whether you play with a controller or with keyboard &amp; mouse.</p>
+      <table class="ctrltable" id="overlaytable"></table>
+    </div>
+
+    <div class="card">
       <h2>Game</h2>
       <div class="grid">
         <div class="field">
@@ -617,7 +624,7 @@
   <div class="modal hidden" id="capturemodal">
     <div class="box" style="width:480px">
       <div class="head"><span>Choose a key</span><button class="smallbtn" id="capturecancel">Cancel</button></div>
-      <div class="capturebox" id="capturebox" tabindex="0">Press a key, click a mouse button here, or turn the wheel
+      <div class="capturebox" id="capturebox" tabindex="0"><span id="capturelead">Press a key, click a mouse button here, or turn the wheel</span>
         <div class="sub">for <b id="captureaction"></b></div></div>
     </div>
   </div>
@@ -1323,6 +1330,12 @@ const CONTROLS = [
   ["keybind_lstick_press", "Left stick click", "LS"],
   ["keybind_rstick_press", "Right stick click", "RS"],
 ];
+const OVERLAY_KEYS = [
+  ["bind_controls", "Keyboard & mouse controls list"],
+  ["bind_settings", "Settings, keys can be changed there too"],
+  ["bind_debug_overlay", "FPS & debug overlay"],
+  ["bind_console", "Console"],
+];
 let binds = {}, bindDefaults = {};
 // Browser key codes to the game's key names.
 const CODE_NAMES = {Space:"Space", Enter:"Enter", NumpadEnter:"NumpadEnter", Escape:"Escape",
@@ -1351,17 +1364,37 @@ const KEY_LABELS = {LMB:"Left click", RMB:"Right click", MMB:"Middle click", Mou
   Semicolon:";", Slash:"/", Backslash:"\\", LBracket:"[", RBracket:"]", Quote:"'",
   Left:"←", Right:"→", Up:"↑", Down:"↓", Return:"Enter"};
 function splitKeys(v){ return (v || "").split(",").map(k => k.trim()).filter(Boolean); }
-function renderControls(){
+function keyCounts(){
   const counts = {};
-  for (const [key] of CONTROLS) for (const k of splitKeys(binds[key])) counts[k] = (counts[k] || 0) + 1;
+  for (const [key] of CONTROLS.concat(OVERLAY_KEYS))
+    for (const k of splitKeys(binds[key])) counts[k] = (counts[k] || 0) + 1;
+  return counts;
+}
+function keyChips(keys, counts){
+  return keys.length
+    ? keys.map(k => `<span class="keychip${counts[k] > 1 ? " dupe" : ""}" title="${counts[k] > 1 ? "Also used by another action" : k}">${KEY_LABELS[k] || k}</span>`).join("")
+    : `<span class="keychip none">unbound</span>`;
+}
+function renderOverlayKeys(counts){
+  const table = $("#overlaytable");
+  table.innerHTML = "";
+  for (const [key, label] of OVERLAY_KEYS) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `<td class="act">${label}</td><td>${keyChips(splitKeys(binds[key]), counts)}</td>
+      <td class="rowbtns"><button class="smallbtn" data-act="set">Change</button><button class="smallbtn" data-act="reset" title="Default">↺</button></td>`;
+    tr.querySelector('[data-act="set"]').onclick = () => openCapture(key, label, false, true);
+    tr.querySelector('[data-act="reset"]').onclick = () => { binds[key] = bindDefaults[key]; renderControls(); scheduleSave(); };
+    table.appendChild(tr);
+  }
+}
+function renderControls(){
+  const counts = keyCounts();
+  renderOverlayKeys(counts);
   const table = $("#ctrltable");
   table.innerHTML = "";
   for (const [key, label, pad] of CONTROLS) {
     const tr = document.createElement("tr");
-    const keys = splitKeys(binds[key]);
-    const chips = keys.length
-      ? keys.map(k => `<span class="keychip${counts[k] > 1 ? " dupe" : ""}" title="${counts[k] > 1 ? "Also used by another action" : k}">${KEY_LABELS[k] || k}</span>`).join("")
-      : `<span class="keychip none">unbound</span>`;
+    const chips = keyChips(splitKeys(binds[key]), counts);
     tr.innerHTML = `<td class="act">${label}${pad ? `<span class="pad">${pad}</span>` : ""}</td>
       <td>${chips}</td>
       <td class="rowbtns"><button class="smallbtn" data-act="set">Change</button><button class="smallbtn" data-act="add" title="Add another key">+</button><button class="smallbtn" data-act="clear" title="Remove the keys">✕</button><button class="smallbtn" data-act="reset" title="Default">↺</button></td>`;
@@ -1373,15 +1406,19 @@ function renderControls(){
   }
 }
 let capture = null;
-function openCapture(key, label, add){
-  capture = {key, add};
+function openCapture(key, label, add, keyboardOnly){
+  capture = {key, add, keyboardOnly: !!keyboardOnly};
+  $("#capturelead").textContent = keyboardOnly ? "Press a key"
+    : "Press a key, click a mouse button here, or turn the wheel";
   $("#captureaction").textContent = label;
   $("#capturemodal").classList.remove("hidden");
   $("#capturebox").focus();
 }
 function closeCapture(){ capture = null; $("#capturemodal").classList.add("hidden"); }
-function finishCapture(name){
+function finishCapture(name, fromMouse){
   if (!capture || !name) return;
+  // The overlay keys are read from keyboard events only.
+  if (fromMouse && capture.keyboardOnly) return;
   const keys = capture.add ? splitKeys(binds[capture.key]) : [];
   if (!keys.includes(name)) keys.push(name);
   binds[capture.key] = keys.join(",");
@@ -1394,9 +1431,9 @@ window.addEventListener("keydown", e => {
   e.preventDefault(); e.stopPropagation();
   finishCapture(codeToKeyName(e.code));
 }, true);
-$("#capturebox").addEventListener("mousedown", e => { e.preventDefault(); finishCapture(MOUSE_NAMES[e.button]); });
+$("#capturebox").addEventListener("mousedown", e => { e.preventDefault(); finishCapture(MOUSE_NAMES[e.button], true); });
 $("#capturebox").addEventListener("contextmenu", e => e.preventDefault());
-$("#capturebox").addEventListener("wheel", e => { e.preventDefault(); if (e.deltaY) finishCapture(e.deltaY < 0 ? "WheelUp" : "WheelDown"); }, {passive:false});
+$("#capturebox").addEventListener("wheel", e => { e.preventDefault(); if (e.deltaY) finishCapture(e.deltaY < 0 ? "WheelUp" : "WheelDown", true); }, {passive:false});
 $("#capturecancel").onclick = closeCapture;
 $("#ctrlresetall").onclick = () => {
   for (const [key] of CONTROLS) binds[key] = bindDefaults[key];
@@ -1431,7 +1468,7 @@ async function loadSettings(){
   $("#s-mnk_sensitivity").value = v.mnk_sensitivity;
   $("#senslabel").textContent = Number(v.mnk_sensitivity).toFixed(1);
   $("#s-mnk_invert_y").checked = !!v.mnk_invert_y;
-  for (const [key] of CONTROLS) { binds[key] = v[key] ?? ""; bindDefaults[key] = (s.defaults || {})[key] ?? ""; }
+  for (const [key] of CONTROLS.concat(OVERLAY_KEYS)) { binds[key] = v[key] ?? ""; bindDefaults[key] = (s.defaults || {})[key] ?? ""; }
   renderControls();
   $("#s-user_language").value = String(v.user_language);
   $("#s-subtitles").checked = !!v.subtitles;

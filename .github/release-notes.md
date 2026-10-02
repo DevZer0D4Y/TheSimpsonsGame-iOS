@@ -9,6 +9,7 @@ launcher installs the game from your own ISO.
 - Controls can also be changed while playing: F4 opens the settings, with the controls under Input > Keybinds. The mouse is released while the settings or the console are open, so they can be clicked.
 - New default layout: W A S D to move, the mouse to look around, Space to jump, left click to attack, right click for the special attack, E for actions, Shift to target, Ctrl to walk, 1 to 4 or the arrow keys to switch character, Tab for the to-do list and Esc to pause. Enter and Backspace confirm and go back in menus.
 - The camera can be turned with keys too: bind Look up, down, left and right in the launcher (#33).
+- The keys that open the in-game overlays (controls list F1, settings F4, FPS overlay F3, console `) can be changed in the launcher, and a key changed in the game's own settings now stays changed after a restart.
 - Quick key taps and clicks are no longer missed.
 
 ### Launcher
