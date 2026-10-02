@@ -119,7 +119,7 @@ instead of building a separate renderer next to it. Stages, in order:
   memory native resolves write), `native_resolve_debug_memory_only_all` (every resolve writes
   only the memory), `native_resolve_debug_verify_stencil_capture`.
 
-## State (2026-10-01)
+## State (2026-10-02)
 
 - Shaders: `aot_export_path` exports runtime translations in the served format;
   `TRACE_SHADER_STORAGE=<cache>:45410809` makes the replayer load a shader storage the way the
@@ -128,7 +128,18 @@ instead of building a separate renderer next to it. Stages, in order:
   variants), which the release workflow unpacks into `native_shaders/`.
 - EDRAM transfers: transfers into render targets cleared right after binding are held back
   over consecutive clears and done only outside the cleared area (the shadow map pass: 0.7 ms
-  at 2x down to almost nothing).
+  at 2x down to almost nothing). A draw proves it overwrites render targets entirely either
+  with the XDK clear shader (positions read from its vertex buffer) or with any vertex shader
+  the CPU interpreter can run (`native_rt_cpu_vs_overwrite_proofs`), which covers the
+  full-screen post-processing passes - the effect chains that reinterpret EDRAM at other
+  pitches (the super burp's glow) then skip copying dead data. Proofs are checked with
+  `native_rt_debug_poison_overwrites`, which fills each proven area with garbage before the draw.
+- Clears: the XDK's clear draws are done as clears of the attachments
+  (`native_rt_clear_draws_as_clears`) when the draw replaces everything it writes with the
+  constants from its vertex buffer, so AMD GPUs fast-clear compressed targets instead of drawing
+  every pixel (about 0.45 ms at 2x).
+- Post passes: the native post-processing shaders fetch their texture taps in batches (5 or 4
+  at a time, the counts this game uses), so the latencies overlap (about 0.45 ms at 2x).
 - Stencil: depth resolves of an area whose stencil is known to be uniform (cleared, not
   written since) skip capturing it (`native_resolve_uniform_stencil`, on, about 1 ms at 2x).
 - Compression: native resolves write 8_8_8_8, 2_10_10_10 and depth textures through a view of
@@ -137,4 +148,11 @@ instead of building a separate renderer next to it. Stages, in order:
 - GPU time per frame on the Steam Deck replaying captured frames (with the streaming the
   running game does): t09 gameplay about 4.3 ms at 1x and 10.5 ms at 2x, Springfield about
   4.8 ms at 1x and 10.9 ms at 2x (16.7 ms at 2x before the upload and compression work).
-  Live, Springfield at 2x runs at about 59 FPS with the GPU at its power limit (1400 MHz).
+  Replays keep the GPU clock low, so only A/B runs made one after the other compare. With the
+  batched post passes and native clears, t09 at 2x went from 12.8 to 11.8 ms in such an A/B.
+  Live, Springfield at 2x runs at about 59 FPS; the GPU now needs about 1100 MHz there instead
+  of 1200 at the same frame rate, which leaves headroom for effects.
+- Where 2x GPU time goes (t09, natives): the three post passes about 35% (346B alone 17%),
+  resolves about 20% (two depth resolves nothing samples yet about 9%, the post-processing
+  chain's color resolves about 6%), world draws most of the rest. Hand-written world shaders
+  gain little over their translations (E170: 5%).

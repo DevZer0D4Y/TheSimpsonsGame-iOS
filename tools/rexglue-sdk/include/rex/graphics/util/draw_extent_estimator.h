@@ -36,7 +36,27 @@ class DrawExtentEstimator {
   uint32_t EstimateVertexMaxY(const Shader& vertex_shader);
   uint32_t EstimateMaxY(bool try_to_estimate_vertex_max_y, const Shader& vertex_shader);
 
+  // The positions (x, y, z, w) the vertex shader exports for vertices 0 to
+  // vertex_count - 1 of an auto-indexed draw, by running it on the CPU. False
+  // when they can't be known exactly: the shader can't be interpreted, or a
+  // vertex is killed or doesn't export a complete position.
+  bool GetAutoIndexedVertexPositions(const Shader& vertex_shader, uint32_t vertex_count,
+                                     float (*positions_out)[4]);
+
  private:
+  class PositionExportSink : public ShaderInterpreter::ExportSink {
+   public:
+    void Export(ucode::ExportRegister export_register, const float* value,
+                uint32_t value_mask) override;
+    void Reset() {
+      position_mask = 0;
+      vertex_kill = 0;
+    }
+    float position[4] = {};
+    uint32_t position_mask = 0;
+    uint32_t vertex_kill = 0;
+  };
+
   class PositionYExportSink : public ShaderInterpreter::ExportSink {
    public:
     void Export(ucode::ExportRegister export_register, const float* value,
