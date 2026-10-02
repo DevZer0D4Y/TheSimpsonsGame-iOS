@@ -51,7 +51,8 @@ The game boots, plays its videos, saves and loads, and runs its levels. See
 - Render resolution scaling (supersampling), anisotropic filtering and FXAA.
 - A launcher that installs the game from your ISO, manages settings, patches and save backups,
   adds the game to Steam, and updates itself.
-- Controller support, with experimental keyboard and mouse emulation.
+- Controller support, and keyboard and mouse controls with rebindable keys and an in-game list of
+  the controls.
 
 ## Requirements
 
@@ -99,9 +100,10 @@ protection history.
 
 ## Configuration
 
-Most settings are in the launcher's **Settings** tab. They are written to `simpsons.toml` next to
-the game executable, inside a block the launcher manages. Settings outside that block can be
-edited by hand.
+Most settings are in the launcher's **Settings** tab, saved as soon as you change them. They are
+written to `simpsons.toml` next to the game executable, inside a block the launcher manages.
+Settings outside that block can be edited by hand. The launcher has a light and a dark theme; the
+button at its top right switches between them.
 
 Saves and the shader cache are stored in:
 
@@ -118,7 +120,32 @@ this off).
 **Image quality.** FXAA anti-aliasing is on by default for new installs and smooths the
 cel-shading outlines at little cost. A render scale of 2x or 3x supersamples the whole image, which
 gives the outlines their cleanest look. On a Steam Deck, 1x holds 60 FPS; 2x looks much sharper
-and runs at about 50 FPS in Springfield, the busiest area.
+and runs at about 59 FPS in Springfield, the busiest area, with occasional drops.
+
+**Keyboard and mouse.** Turn on *Play with keyboard & mouse* in the launcher's Settings tab. The
+game then takes the mouse whenever its window is active, and lets go of it when you switch to
+another window. The game's own prompts show controller buttons; press F1 in the game to see which
+key each button is on. The default layout:
+
+| Action | Keys |
+|---|---|
+| Move | W A S D |
+| Look around | Mouse |
+| Jump, confirm | Space, Enter |
+| Attack | Left click |
+| Special attack (hold), back | Right click, Backspace |
+| Action: talk, use, pick up | E |
+| Target (hold) | Shift |
+| Walk (hold) | Ctrl |
+| Switch character | 1 to 4, arrow keys |
+| To-do list | Tab |
+| Pause | Esc |
+
+Every control can be changed in the launcher's **Keyboard & mouse** section, where an action can
+have several keys, mouse buttons included, and the wheel and side buttons can be bound. The camera
+can also be put on keys (Look up, down, left and right), on top of the mouse. In the
+game, F4 opens the settings, with the controls under Input > Keybinds (press *Save to config* to
+keep changes made there).
 
 ## Known issues
 
@@ -243,18 +270,18 @@ build output.
 
 The goal is for this to be the best way to play the game. In rough order:
 
-- **Fully native renderer.** The game draws through the Xbox 360 GPU's command stream, which the
-  runtime decodes and translates. That layer is being replaced step by step with rendering driven
-  directly by the game's Direct3D calls, with the current renderer kept as a fallback throughout.
-  The most expensive shaders already have native replacements. A native renderer is also what the
-  features below build on.
+- **Fully native renderer.** The Xbox 360 GPU emulation is being replaced piece by piece with
+  native rendering, each step checked to give exactly the same image. Done: every shader compiled
+  ahead of time, native replacements for the most expensive shaders, render-to-texture and copies
+  done natively instead of through the emulated EDRAM, and render targets sized like native ones.
+  Next: real vertex and index buffers, and textures and buffers uploaded when the game loads them
+  instead of watching its memory. A native renderer is also what the features below build on.
 - **No slowdowns or stutters.** A steady 60 FPS everywhere, including at 2x internal resolution
   on the Steam Deck, with no shader compilation hitches.
 - **Widescreen.** Wider aspect ratios such as 21:9 without stretching.
-- **Keyboard and mouse.** Proper keyboard controls with rebinding, instead of the current
-  controller emulation.
 - **Controller prompts.** Button icons that match the controller you have connected (Xbox,
-  PlayStation, Nintendo, Steam Deck) in every in-game prompt, menu and tutorial.
+  PlayStation, Nintendo, Steam Deck), or your keyboard keys, in every in-game prompt, menu and
+  tutorial.
 - **Game fixes.** Fixes for bugs in the original game.
 - **Restored content.** Unused content from the original game, brought back where it works.
 - **Mod support.** A mod loader and tools for replacing and adding scripts, models, objects and

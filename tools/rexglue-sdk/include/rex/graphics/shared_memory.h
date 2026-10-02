@@ -12,7 +12,9 @@
 
 #include <atomic>
 #include <cstdint>
+#include <memory>
 #include <mutex>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -89,6 +91,11 @@ class SharedMemory {
   // which pages count as streamed (see RequestRanges).
   void OnGuestFrameEnd();
 
+  // For the trace player, which reports the memory it writes with exact
+  // invalidations (no write faults): counts the writes as write faults, so
+  // pages the trace rewrites every frame become streamed like in the game.
+  void MarkRangeFaultedForStreaming(uint32_t start, uint32_t length);
+
   // Marks the range and, if not exact_range, potentially its surroundings
   // (to up to the first GPU-written page, as an access violation exception
   // count optimization) as modified by the CPU, also invalidating GPU-written
@@ -161,6 +168,12 @@ class SharedMemory {
   // overall bounds of pages to be uploaded.
   virtual bool UploadRanges(
       const std::vector<std::pair<uint32_t, uint32_t>>& upload_page_ranges) = 0;
+  // For UploadRanges, after MakeRangeValid: copies guest pages to the upload
+  // buffer, remembering what streamed pages were uploaded with (see
+  // streamed_page_shadows_).
+  void CopyPagesForUpload(uint32_t page_first, uint32_t page_count, uint8_t* dest);
+  // Set by implementations whose UploadRanges copies with CopyPagesForUpload.
+  bool streamed_page_shadows_supported_ = false;
 
   const std::vector<std::pair<uint32_t, uint32_t>>& trace_download_ranges() {
     return trace_download_ranges_;
@@ -262,6 +275,18 @@ class SharedMemory {
   // Set while RequestValidatedRanges uploads for an allow_streamed request,
   // read by MakeRangeValid (both on the command processor thread).
   bool upload_allow_streamed_ = false;
+  // gpu_stream_skip_unchanged: the bytes each streamed page was last uploaded
+  // with, which is what the GPU copy of the page holds until anything else
+  // changes it (another upload, or a GPU write, which erase the copy here). A
+  // streamed request whose bytes in the page still match skips the page's
+  // upload: a streamed page usually changes because of other data sharing it,
+  // and draws reusing a buffer would otherwise upload it again each time (each
+  // upload waits for the GPU to finish all earlier work). Only touched on the
+  // command processor thread.
+  std::unordered_map<uint32_t, std::unique_ptr<uint8_t[]>> streamed_page_shadows_;
+  std::vector<std::pair<uint32_t, uint32_t>> kept_upload_ranges_;
+  void DropUnchangedStreamedPages(const std::pair<uint32_t, uint32_t>* ranges, size_t count);
+  void EraseStreamedPageShadows(uint32_t page_first, uint32_t page_last);
 
   static std::pair<uint32_t, uint32_t> MemoryInvalidationCallbackThunk(
       void* context_ptr, uint32_t physical_address_start, uint32_t length, bool exact_range);

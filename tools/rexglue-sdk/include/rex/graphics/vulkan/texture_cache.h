@@ -156,8 +156,10 @@ class VulkanTextureCache final : public TextureCache {
   // the base level starting at dest_base, stored as a single 2D tiled level with
   // the resolve's row pitch, the same format and endianness, with data that
   // currently matches guest memory. Returns the number of targets written.
+  // scaled: the textures are resolution-scaled (resolved from a render target
+  // at the scaled resolution).
   uint32_t FindNativeResolveTargets(uint32_t dest_base, uint32_t dest_pitch_texels,
-                                    xenos::TextureFormat format, xenos::Endian endian,
+                                    xenos::TextureFormat format, xenos::Endian endian, bool scaled,
                                     NativeResolveTarget* targets_out);
   // Pushes the barrier for writing the target as a color attachment.
   void BeginNativeResolveWrite(const NativeResolveTarget& target);
@@ -383,6 +385,14 @@ class VulkanTextureCache final : public TextureCache {
   static bool IsNativeResolveTextureFormat(xenos::TextureFormat format);
   // Integer format of the same size for writing raw texel bits.
   static VkFormat GetNativeResolveViewFormat(VkFormat host_format);
+ public:
+  // Formats native resolves can write through a view of the format itself with
+  // native_resolve_unorm_views (the float round trip is exact for them).
+  static bool IsNativeResolveUnormFormat(VkFormat host_format);
+  // Whether a native resolve view format is the texture's own (unorm, or float
+  // depth) rather than a raw integer one.
+  static bool IsNativeResolveOwnFormatView(VkFormat view_format);
+ private:
   bool IsColorAttachmentFormatSupported(VkFormat format);
 
   VulkanCommandProcessor& command_processor_;

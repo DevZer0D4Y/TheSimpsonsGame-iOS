@@ -653,6 +653,18 @@ void Window::OnMouseWheel(MouseEvent& e, WindowDestructionReceiver& destruction_
   }
 }
 
+void Window::OnMouseRelativeMove(MouseEvent& e, WindowDestructionReceiver& destruction_receiver) {
+  PropagateEventThroughInputListeners(
+      [&e](auto listener) {
+        listener->OnMouseRelativeMove(e);
+        return e.is_handled();
+      },
+      destruction_receiver);
+  if (destruction_receiver.IsWindowDestroyed()) {
+    return;
+  }
+}
+
 void Window::OnTouchEvent(TouchEvent& e, WindowDestructionReceiver& destruction_receiver) {
   PropagateEventThroughInputListeners(
       [&e](auto listener) {

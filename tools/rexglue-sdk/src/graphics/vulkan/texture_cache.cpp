@@ -35,6 +35,9 @@
 
 REXCVAR_DEFINE_BOOL(non_seamless_cube_map, false, "GPU", "Use non-seamless cube map sampling");
 
+REXCVAR_DECLARE(std::string, native_rt_original_resolution_targets);
+REXCVAR_DECLARE(bool, native_resolve_unorm_views);
+
 REXCVAR_DEFINE_BOOL(vulkan_sparse_scaled_resolve_buffer, true, "GPU/Vulkan",
                     "With draw resolution scaling, allocate the scaled resolve buffer sparsely "
                     "when supported (off: one allocation of the whole buffer, for drivers whose "
@@ -1181,13 +1184,27 @@ std::unique_ptr<TextureCache::Texture> VulkanTextureCache::CreateTexture(Texture
   // the resolved memory would produce - float color output may go through a
   // lower-precision export format and round differently.
   VkFormat native_resolve_format = GetNativeResolveViewFormat(formats[0]);
+  // native_resolve_unorm_views: unorm textures are written through their own
+  // format, so no integer view format keeps them from being compressed.
+  bool native_resolve_own_format =
+      REXCVAR_GET(native_resolve_unorm_views) &&
+      (IsNativeResolveUnormFormat(formats[0]) ||
+       // Depth only (color float render targets need the integer view to keep
+       // NaNs).
+       (formats[0] == VK_FORMAT_R32_SFLOAT && (key.format == xenos::TextureFormat::k_24_8 ||
+                                               key.format == xenos::TextureFormat::k_24_8_FLOAT)));
+  if (native_resolve_own_format) {
+    native_resolve_format = formats[0];
+  }
   bool native_resolve_destination =
       native_resolve_textures_enabled_ && native_resolve_format != VK_FORMAT_UNDEFINED &&
       key.tiled && key.dimension == xenos::DataDimension::k2DOrStacked &&
       depth_or_array_size == 1 && !key.mip_max_level &&
       // With draw resolution scaling, resolves write the scaled textures of
-      // resolved memory (at the scaled size, like the render targets).
-      key.scaled_resolve == IsDrawResolutionScaled() &&
+      // resolved memory (at the scaled size, like the render targets), and
+      // original resolution render targets the unscaled ones.
+      (key.scaled_resolve == IsDrawResolutionScaled() ||
+       (!key.scaled_resolve && !REXCVAR_GET(native_rt_original_resolution_targets).empty())) &&
       IsNativeResolveTextureFormat(key.format) &&
       IsColorAttachmentFormatSupported(native_resolve_format) &&
       IsColorAttachmentFormatSupported(formats[0]) &&
@@ -1196,8 +1213,10 @@ std::unique_ptr<TextureCache::Texture> VulkanTextureCache::CreateTexture(Texture
   uint32_t view_format_count = formats[1] != VK_FORMAT_UNDEFINED ? 2 : 1;
   if (native_resolve_destination) {
     image_create_info.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
-    image_create_info.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
-    view_formats[view_format_count++] = native_resolve_format;
+    if (!native_resolve_own_format) {
+      image_create_info.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+      view_formats[view_format_count++] = native_resolve_format;
+    }
   }
   image_create_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
   image_create_info.queueFamilyIndexCount = 0;
@@ -1228,6 +1247,16 @@ std::unique_ptr<TextureCache::Texture> VulkanTextureCache::CreateTexture(Texture
     texture->SetNativeResolveFormat(native_resolve_format);
   }
   return texture;
+}
+
+bool VulkanTextureCache::IsNativeResolveOwnFormatView(VkFormat view_format) {
+  // GetNativeResolveViewFormat only returns integer formats.
+  return IsNativeResolveUnormFormat(view_format) || view_format == VK_FORMAT_R32_SFLOAT;
+}
+
+bool VulkanTextureCache::IsNativeResolveUnormFormat(VkFormat host_format) {
+  return host_format == VK_FORMAT_R8G8B8A8_UNORM ||
+         host_format == VK_FORMAT_A2B10G10R10_UNORM_PACK32;
 }
 
 VkFormat VulkanTextureCache::GetNativeResolveViewFormat(VkFormat host_format) {
@@ -1279,7 +1308,7 @@ bool VulkanTextureCache::IsColorAttachmentFormatSupported(VkFormat format) {
 uint32_t VulkanTextureCache::FindNativeResolveTargets(uint32_t dest_base,
                                                       uint32_t dest_pitch_texels,
                                                       xenos::TextureFormat format,
-                                                      xenos::Endian endian,
+                                                      xenos::Endian endian, bool scaled,
                                                       NativeResolveTarget* targets_out) {
   if (!native_resolve_textures_enabled_) {
     return 0;
@@ -1296,7 +1325,7 @@ uint32_t VulkanTextureCache::FindNativeResolveTargets(uint32_t dest_base,
     const TextureKey& key = texture.key();
     if (key.format != format || key.endianness != endian || !key.tiled ||
         key.dimension != xenos::DataDimension::k2DOrStacked || key.depth_or_array_size_minus_1 ||
-        key.signed_separate || key.scaled_resolve != IsDrawResolutionScaled() ||
+        key.signed_separate || bool(key.scaled_resolve) != scaled ||
         (uint32_t(key.pitch) << 5) != dest_pitch_texels ||
         texture.GetGuestMipsSize() || texture.outdated_mask()) {
       return;

@@ -158,6 +158,9 @@ bool VulkanSharedMemory::Initialize() {
     }
   }
 
+  // UploadRanges copies with CopyPagesForUpload.
+  streamed_page_shadows_supported_ = true;
+
   // The first usage will likely be uploading.
   last_usage_ = Usage::kTransferDestination;
   last_written_range_ = std::make_pair<uint32_t, uint32_t>(0, 0);
@@ -375,9 +378,8 @@ bool VulkanSharedMemory::UploadRanges(
         break;
       }
       MakeRangeValid(upload_range_start << page_size_log2(), uint32_t(upload_buffer_size), false);
-      std::memcpy(upload_buffer_mapping,
-                  memory().TranslatePhysical(upload_range_start << page_size_log2()),
-                  upload_buffer_size);
+      CopyPagesForUpload(upload_range_start, uint32_t(upload_buffer_size >> page_size_log2()),
+                         upload_buffer_mapping);
       if (upload_buffer_previous != upload_buffer && !upload_regions_.empty()) {
         assert_true(upload_buffer_previous != VK_NULL_HANDLE);
         command_buffer.CmdVkCopyBuffer(upload_buffer_previous, buffer_,

@@ -18,6 +18,7 @@ set(REXUI_CORE_SOURCES
 
 # Optional overlay dialogs
 set(REXUI_OVERLAY_SOURCES
+    overlay/controls_overlay.cpp
     overlay/debug_overlay.cpp
     overlay/console_overlay.cpp
     overlay/settings_overlay.cpp
@@ -139,6 +140,9 @@ else()
     find_package(PkgConfig REQUIRED)
     pkg_check_modules(GTK3 REQUIRED gtk+-3.0)
     pkg_check_modules(X11_XCB REQUIRED x11-xcb)
+    # XInput 2 raw mouse motion while the mouse is captured (libXi is a GTK 3
+    # dependency, so it's present wherever GTK 3 is).
+    pkg_check_modules(XI REQUIRED xi)
 
     target_include_directories(rexui PRIVATE
         ${GTK3_INCLUDE_DIRS}
@@ -147,6 +151,7 @@ else()
     target_link_libraries(rexui PUBLIC
         ${GTK3_LIBRARIES}
         ${X11_XCB_LIBRARIES}
+        ${XI_LIBRARIES}
     )
 endif()
 

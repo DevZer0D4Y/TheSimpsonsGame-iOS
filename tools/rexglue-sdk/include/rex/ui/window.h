@@ -299,6 +299,9 @@ class Window {
   // Desired state stored by the common Window, externally modifiable, read-only
   // in the implementation.
   bool IsMouseCaptureRequested() const { return mouse_capture_request_count_ != 0; }
+  // Whether OnMouseRelativeMove events are sent while the mouse is captured
+  // (otherwise relative motion has to be derived from OnMouseMove positions).
+  virtual bool ReportsRelativeMouseMotion() const { return false; }
   void CaptureMouse();
   void ReleaseMouse();
 
@@ -581,6 +584,7 @@ class Window {
   void OnMouseMove(MouseEvent& e, WindowDestructionReceiver& destruction_receiver);
   void OnMouseUp(MouseEvent& e, WindowDestructionReceiver& destruction_receiver);
   void OnMouseWheel(MouseEvent& e, WindowDestructionReceiver& destruction_receiver);
+  void OnMouseRelativeMove(MouseEvent& e, WindowDestructionReceiver& destruction_receiver);
 
   void OnTouchEvent(TouchEvent& e, WindowDestructionReceiver& destruction_receiver);
 

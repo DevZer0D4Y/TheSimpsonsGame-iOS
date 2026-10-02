@@ -546,22 +546,21 @@ class PrimitiveProcessor {
   static constexpr uint32_t GetQuadListTriangleListIndexCount(uint32_t quad_list_index_count) {
     return (quad_list_index_count / 4) * 6;
   }
+  // The vertices of a quad, in the order of the two triangles it's converted
+  // to (quad_list_triangle_order, set on initialization).
+  static inline uint32_t quad_list_triangle_vertices_[6] = {0, 1, 2, 0, 2, 3};
   template <typename Index, typename IndexTransform>
   static void QuadListToTriangleList(Index* dest, const Index* source, uint32_t source_index_count,
                                      const IndexTransform& index_transform) {
     uint32_t quad_count = source_index_count / 4;
     for (uint32_t i = 0; i < quad_count; ++i) {
-      // TODO(Triang3l): Find the correct order.
-      // v0, v1, v2.
-      Index common_index_0 = index_transform(*(source++));
-      *(dest++) = common_index_0;
-      *(dest++) = index_transform(*(source++));
-      Index common_index_2 = index_transform(*(source++));
-      *(dest++) = common_index_2;
-      // v0, v2, v3.
-      *(dest++) = common_index_0;
-      *(dest++) = common_index_2;
-      *(dest++) = index_transform(*(source++));
+      Index quad[4];
+      for (uint32_t j = 0; j < 4; ++j) {
+        quad[j] = index_transform(*(source++));
+      }
+      for (uint32_t j = 0; j < 6; ++j) {
+        *(dest++) = quad[quad_list_triangle_vertices_[j]];
+      }
     }
   }
 

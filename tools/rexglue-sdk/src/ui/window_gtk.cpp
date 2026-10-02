@@ -24,6 +24,7 @@
 #include <rex/ui/window_gtk.h>
 
 #include <X11/Xlib-xcb.h>
+#include <X11/extensions/XInput2.h>
 #include <gdk/gdkx.h>
 #include <xcb/xcb.h>
 
@@ -317,6 +318,11 @@ GTKWindow::GTKWindow(WindowedAppContext& app_context, const std::string_view tit
 
 GTKWindow::~GTKWindow() {
   EnterDestructor();
+  ShutdownRawMouseMotion();
+  if (blank_cursor_) {
+    g_object_unref(blank_cursor_);
+    blank_cursor_ = nullptr;
+  }
   if (window_) {
     // Set window_ to null to ignore events from now on since this ui::GTKWindow
     // is entering an indeterminate state.
@@ -424,6 +430,192 @@ bool GTKWindow::OpenImpl() {
   }
 
   return true;
+}
+
+void GTKWindow::ApplyNewMouseCapture() {
+  if (!drawing_area_ || mouse_grabbed_) {
+    return;
+  }
+  GdkWindow* drawing_area_window = gtk_widget_get_window(drawing_area_);
+  if (!drawing_area_window) {
+    return;
+  }
+  GdkDisplay* display = gtk_widget_get_display(drawing_area_);
+  if (!blank_cursor_) {
+    blank_cursor_ = gdk_cursor_new_for_display(display, GDK_BLANK_CURSOR);
+  }
+  InitializeRawMouseMotion();
+  // Pointer events from anywhere go to the window while grabbed, so clicks
+  // don't land in other windows behind the hidden cursor.
+  GdkGrabStatus status =
+      gdk_seat_grab(gdk_display_get_default_seat(display), drawing_area_window,
+                    GDK_SEAT_CAPABILITY_POINTER, TRUE,
+                    GetCursorVisibility() == CursorVisibility::kHidden ? blank_cursor_ : nullptr,
+                    nullptr, nullptr, nullptr);
+  if (status != GDK_GRAB_SUCCESS) {
+    REXLOG_WARN("GTKWindow: failed to grab the pointer ({})", int(status));
+    return;
+  }
+  mouse_grabbed_ = true;
+  relative_mouse_motion_remainder_x_ = 0.0;
+  relative_mouse_motion_remainder_y_ = 0.0;
+  if (IsMouseLocked()) {
+    WarpPointerToCenter();
+  }
+}
+
+void GTKWindow::ApplyNewMouseRelease() {
+  if (!mouse_grabbed_) {
+    return;
+  }
+  mouse_grabbed_ = false;
+  if (drawing_area_) {
+    gdk_seat_ungrab(gdk_display_get_default_seat(gtk_widget_get_display(drawing_area_)));
+  }
+}
+
+void GTKWindow::ApplyNewCursorVisibility(CursorVisibility old_cursor_visibility) {
+  (void)old_cursor_visibility;
+  UpdateDrawingAreaCursor();
+}
+
+void GTKWindow::UpdateDrawingAreaCursor() {
+  if (!drawing_area_) {
+    return;
+  }
+  GdkWindow* drawing_area_window = gtk_widget_get_window(drawing_area_);
+  if (!drawing_area_window) {
+    return;
+  }
+  if (GetCursorVisibility() == CursorVisibility::kHidden) {
+    if (!blank_cursor_) {
+      blank_cursor_ =
+          gdk_cursor_new_for_display(gtk_widget_get_display(drawing_area_), GDK_BLANK_CURSOR);
+    }
+    gdk_window_set_cursor(drawing_area_window, blank_cursor_);
+  } else {
+    gdk_window_set_cursor(drawing_area_window, nullptr);
+  }
+}
+
+void GTKWindow::InitializeRawMouseMotion() {
+  if (raw_mouse_motion_initialized_ || !window_) {
+    return;
+  }
+  raw_mouse_motion_initialized_ = true;
+  GdkDisplay* display = gtk_widget_get_display(window_);
+  if (!GDK_IS_X11_DISPLAY(display)) {
+    return;
+  }
+  Display* xdisplay = gdk_x11_display_get_xdisplay(display);
+  int opcode, event_base, error_base;
+  if (!XQueryExtension(xdisplay, "XInputExtension", &opcode, &event_base, &error_base)) {
+    REXLOG_INFO("GTKWindow: no XInput extension, mouse motion while captured from warping");
+    return;
+  }
+  // GDK has negotiated the XInput 2 version already; raw motion is in 2.0.
+  unsigned char mask_bits[XIMaskLen(XI_LASTEVENT)] = {};
+  XISetMask(mask_bits, XI_RawMotion);
+  XIEventMask mask;
+  mask.deviceid = XIAllMasterDevices;
+  mask.mask_len = sizeof(mask_bits);
+  mask.mask = mask_bits;
+  gdk_x11_display_error_trap_push(display);
+  XISelectEvents(xdisplay, DefaultRootWindow(xdisplay), &mask, 1);
+  XFlush(xdisplay);
+  if (gdk_x11_display_error_trap_pop(display)) {
+    REXLOG_INFO("GTKWindow: XInput 2 raw motion unavailable, mouse motion while captured from "
+                "warping");
+    return;
+  }
+  raw_mouse_motion_xi_opcode_ = opcode;
+  gdk_window_add_filter(nullptr, RawMouseMotionFilterThunk, this);
+  REXLOG_INFO("GTKWindow: mouse motion while captured from XInput 2 raw motion");
+}
+
+void GTKWindow::ShutdownRawMouseMotion() {
+  if (raw_mouse_motion_xi_opcode_ >= 0) {
+    gdk_window_remove_filter(nullptr, RawMouseMotionFilterThunk, this);
+    raw_mouse_motion_xi_opcode_ = -1;
+  }
+  if (mouse_grabbed_) {
+    mouse_grabbed_ = false;
+    if (drawing_area_) {
+      gdk_seat_ungrab(gdk_display_get_default_seat(gtk_widget_get_display(drawing_area_)));
+    }
+  }
+}
+
+GdkFilterReturn GTKWindow::RawMouseMotionFilterThunk(GdkXEvent* xevent, GdkEvent* event,
+                                                     gpointer user_data) {
+  (void)event;
+  return reinterpret_cast<GTKWindow*>(user_data)->RawMouseMotionFilter(xevent);
+}
+
+GdkFilterReturn GTKWindow::RawMouseMotionFilter(void* xevent_ptr) {
+  auto* xevent = static_cast<XEvent*>(xevent_ptr);
+  if (xevent->type != GenericEvent || xevent->xcookie.extension != raw_mouse_motion_xi_opcode_ ||
+      xevent->xcookie.evtype != XI_RawMotion) {
+    return GDK_FILTER_CONTINUE;
+  }
+  // GDK fetches the event data before running the filters.
+  const auto* raw_event = static_cast<const XIRawEvent*>(xevent->xcookie.data);
+  if (!raw_event || !IsMouseLocked() || !HasFocus()) {
+    return GDK_FILTER_REMOVE;
+  }
+  // Values of the set valuators in order; 0 and 1 are relative X and Y for
+  // mice and touchpads.
+  double dx = 0.0, dy = 0.0;
+  const double* value = raw_event->raw_values;
+  int valuator_count = std::min(raw_event->valuators.mask_len * 8, 2);
+  for (int i = 0; i < valuator_count; ++i) {
+    if (XIMaskIsSet(raw_event->valuators.mask, i)) {
+      (i ? dy : dx) = *(value++);
+    }
+  }
+  SendRelativeMouseMotion(dx, dy);
+  // Keep the hidden pointer inside the window, so focus stays and nothing
+  // under it reacts when the grab ends. Warping doesn't cause raw motion.
+  if (++raw_mouse_motion_events_since_warp_ >= 8) {
+    raw_mouse_motion_events_since_warp_ = 0;
+    WarpPointerToCenter();
+  }
+  return GDK_FILTER_REMOVE;
+}
+
+void GTKWindow::SendRelativeMouseMotion(double dx, double dy) {
+  relative_mouse_motion_remainder_x_ += dx;
+  relative_mouse_motion_remainder_y_ += dy;
+  auto whole_x = int32_t(relative_mouse_motion_remainder_x_);
+  auto whole_y = int32_t(relative_mouse_motion_remainder_y_);
+  if (!whole_x && !whole_y) {
+    return;
+  }
+  relative_mouse_motion_remainder_x_ -= whole_x;
+  relative_mouse_motion_remainder_y_ -= whole_y;
+  WindowDestructionReceiver destruction_receiver(this);
+  MouseEvent e(this, MouseEvent::Button::kNone, whole_x, whole_y);
+  OnMouseRelativeMove(e, destruction_receiver);
+}
+
+void GTKWindow::WarpPointerToCenter() {
+  if (!drawing_area_) {
+    return;
+  }
+  GdkWindow* drawing_area_window = gtk_widget_get_window(drawing_area_);
+  if (!drawing_area_window) {
+    return;
+  }
+  GtkAllocation allocation;
+  gtk_widget_get_allocation(drawing_area_, &allocation);
+  int root_x, root_y;
+  gdk_window_get_root_coords(drawing_area_window, allocation.width / 2, allocation.height / 2,
+                             &root_x, &root_y);
+  GdkDisplay* display = gtk_widget_get_display(drawing_area_);
+  GdkDevice* pointer = gdk_seat_get_pointer(gdk_display_get_default_seat(display));
+  if (pointer) {
+    gdk_device_warp(pointer, gdk_window_get_screen(drawing_area_window), root_x, root_y);
+  }
 }
 
 void GTKWindow::RequestCloseImpl() {
@@ -658,10 +850,12 @@ bool GTKWindow::HandleMouse(GdkEvent* event, WindowDestructionReceiver& destruct
         case 3:
           button = MouseEvent::Button::kRight;
           break;
-        case 4:
+        // 4 to 7 are the scroll wheel (GDK_SCROLL events in GTK 3), 8 and 9
+        // the side buttons.
+        case 8:
           button = MouseEvent::Button::kX1;
           break;
-        case 5:
+        case 9:
           button = MouseEvent::Button::kX2;
           break;
         default:
@@ -675,13 +869,46 @@ bool GTKWindow::HandleMouse(GdkEvent* event, WindowDestructionReceiver& destruct
       auto scroll_event = reinterpret_cast<const GdkEventScroll*>(event);
       x = scroll_event->x;
       y = scroll_event->y;
-      scroll_x = scroll_event->delta_x * MouseEvent::kScrollPerDetent;
-      // In GDK, positive is towards the bottom of the screen, not forward from
-      // the user.
-      scroll_y = -scroll_event->delta_y * MouseEvent::kScrollPerDetent;
+      // Wheel detents arrive as directions (the deltas are only for smooth
+      // scrolling).
+      switch (scroll_event->direction) {
+        case GDK_SCROLL_UP:
+          scroll_y = MouseEvent::kScrollPerDetent;
+          break;
+        case GDK_SCROLL_DOWN:
+          scroll_y = -int32_t(MouseEvent::kScrollPerDetent);
+          break;
+        case GDK_SCROLL_LEFT:
+          scroll_x = -int32_t(MouseEvent::kScrollPerDetent);
+          break;
+        case GDK_SCROLL_RIGHT:
+          scroll_x = MouseEvent::kScrollPerDetent;
+          break;
+        default:
+          scroll_x = scroll_event->delta_x * MouseEvent::kScrollPerDetent;
+          // In GDK, positive is towards the bottom of the screen, not forward
+          // from the user.
+          scroll_y = -scroll_event->delta_y * MouseEvent::kScrollPerDetent;
+          break;
+      }
     } break;
     default:
       return false;
+  }
+
+  if (event->type == GDK_MOTION_NOTIFY && IsMouseLocked() && raw_mouse_motion_xi_opcode_ < 0) {
+    // No raw motion: the distance from the center the pointer is kept at.
+    GtkAllocation allocation;
+    gtk_widget_get_allocation(drawing_area_, &allocation);
+    int32_t center_x = allocation.width / 2;
+    int32_t center_y = allocation.height / 2;
+    if (x != center_x || y != center_y) {
+      SendRelativeMouseMotion(double(x - center_x), double(y - center_y));
+      if (destruction_receiver.IsWindowDestroyed()) {
+        return true;
+      }
+      WarpPointerToCenter();
+    }
   }
 
   MouseEvent e(this, button, x, y, scroll_x, scroll_y);

@@ -9,19 +9,58 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <algorithm>
+#include <vector>
+#include <functional>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
+#include <map>
+#include <string>
+#include <utility>
 
 #include <rex/assert.h>
 #include <rex/dbg.h>
 #include <rex/graphics/flags.h>
 #include <rex/graphics/vulkan/command_processor.h>
 #include <rex/graphics/vulkan/deferred_command_buffer.h>
+#include <rex/logging.h>
 #include <rex/math.h>
 #include <rex/perf/counter.h>
 
+namespace rex::graphics {
+extern uint64_t g_upload_request_stats[3 + 32];
+extern uint64_t g_streamed_skip_stats[2];
+extern std::map<std::pair<uint32_t, uint32_t>, std::pair<uint64_t, uint64_t>>
+    g_upload_request_ranges;
+}  // namespace rex::graphics
+
 namespace rex::graphics::vulkan {
+
+namespace {
+// Debugging aid: REX_CMD_STATS=1 logs the average mix of commands per executed command buffer.
+struct CommandStats {
+  bool enabled = std::getenv("REX_CMD_STATS") != nullptr;
+  uint64_t executions = 0;
+  uint64_t counts[64] = {};
+  uint64_t buffer_barriers = 0;
+  uint64_t image_barriers = 0;
+  std::map<std::pair<uint32_t, uint32_t>, uint64_t> barrier_stages;
+};
+CommandStats& GetCommandStats() {
+  static CommandStats stats;
+  return stats;
+}
+constexpr const char* kCommandStatNames[] = {
+    "BeginRenderPass", "BeginQuery", "BindDescriptorSets", "BindIndexBuffer", "BindPipeline",
+    "BindVertexBuffers", "ClearAttachments", "ClearColorImage", "CopyBuffer", "FillBuffer",
+    "CopyBufferToImage", "CopyImageToBuffer", "CopyQueryPoolResults", "Dispatch", "Draw",
+    "DrawIndexed", "EndQuery", "EndRenderPass", "BeginRendering", "EndRendering",
+    "PipelineBarrier", "PushConstants", "ResetQueryPool", "SetBlendConstants", "SetDepthBias",
+    "SetScissor", "SetStencilCompareMask", "SetStencilReference", "SetStencilWriteMask",
+    "SetViewport", "WriteTimestamp", "CopyImage"};
+}  // namespace
 
 DeferredCommandBuffer::DeferredCommandBuffer(const VulkanCommandProcessor& command_processor,
                                              size_t initial_size)
@@ -42,10 +81,14 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
       command_processor_.GetVulkanDevice()->functions();
   const uintmax_t* stream = command_stream_.data();
   size_t stream_remaining = command_stream_.size();
+  CommandStats& command_stats = GetCommandStats();
   while (stream_remaining) {
     const CommandHeader& header = *reinterpret_cast<const CommandHeader*>(stream);
     stream += kCommandHeaderSizeElements;
     stream_remaining -= kCommandHeaderSizeElements;
+    if (command_stats.enabled) {
+      ++command_stats.counts[uint32_t(header.command) & 63];
+    }
 
     switch (header.command) {
       case Command::kVkBeginRenderPass: {
@@ -162,6 +205,15 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
                 rex::align(sizeof(ArgsVkCopyBufferToImage), alignof(VkBufferImageCopy))));
       } break;
 
+      case Command::kVkCopyImage: {
+        auto& args = *reinterpret_cast<const ArgsVkCopyImage*>(stream);
+        dfn.vkCmdCopyImage(command_buffer, args.src_image, args.src_image_layout, args.dst_image,
+                           args.dst_image_layout, args.region_count,
+                           reinterpret_cast<const VkImageCopy*>(
+                               reinterpret_cast<const uint8_t*>(stream) +
+                               rex::align(sizeof(ArgsVkCopyImage), alignof(VkImageCopy))));
+      } break;
+
       case Command::kVkCopyImageToBuffer: {
         auto& args = *reinterpret_cast<const ArgsVkCopyImageToBuffer*>(stream);
         dfn.vkCmdCopyImageToBuffer(
@@ -273,6 +325,12 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
               reinterpret_cast<const uint8_t*>(stream) + barrier_offset_bytes);
           barrier_offset_bytes += sizeof(VkImageMemoryBarrier) * args.image_memory_barrier_count;
         }
+        if (command_stats.enabled) {
+          ++command_stats.barrier_stages[{uint32_t(args.src_stage_mask),
+                                          uint32_t(args.dst_stage_mask)}];
+          command_stats.buffer_barriers += args.buffer_memory_barrier_count;
+          command_stats.image_barriers += args.image_memory_barrier_count;
+        }
         dfn.vkCmdPipelineBarrier(command_buffer, args.src_stage_mask, args.dst_stage_mask,
                                  args.dependency_flags, args.memory_barrier_count, memory_barriers,
                                  args.buffer_memory_barrier_count, buffer_memory_barriers,
@@ -348,6 +406,60 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
 
     stream += header.arguments_size_elements;
     stream_remaining -= header.arguments_size_elements;
+  }
+  static const uint64_t stats_every = [] {
+    const char* every = std::getenv("REX_CMD_STATS_EVERY");
+    return every ? std::max(uint64_t(1), uint64_t(std::strtoull(every, nullptr, 10))) : uint64_t(20);
+  }();
+  if (command_stats.enabled && ++command_stats.executions % stats_every == 0) {
+    std::string line;
+    for (size_t i = 0; i < std::size(kCommandStatNames); ++i) {
+      if (command_stats.counts[i]) {
+        line += fmt::format(" {}={:.1f}", kCommandStatNames[i], command_stats.counts[i] / double(stats_every));
+      }
+    }
+    REXGPU_INFO("[cmd-stats] per command buffer:{} | buffer barriers {:.1f}, image barriers {:.1f}",
+                line, command_stats.buffer_barriers / double(stats_every), command_stats.image_barriers / double(stats_every));
+    for (const auto& [stages, count] : command_stats.barrier_stages) {
+      REXGPU_INFO("[cmd-stats]   barrier src={:08X} dst={:08X}: {:.1f}", stages.first,
+                  stages.second, count / double(stats_every));
+    }
+    {
+      std::string histogram;
+      for (uint32_t i = 0; i < 32; ++i) {
+        if (g_upload_request_stats[3 + i]) {
+          histogram += fmt::format(" <{}B:{:.1f}", uint64_t(1) << i,
+                                   g_upload_request_stats[3 + i] / double(stats_every));
+        }
+      }
+      REXGPU_INFO("[cmd-stats] upload requests {:.1f}, requested {:.1f} KB, uploaded {:.1f} KB "
+                  "(unchanged streamed pages skipped {:.1f}, requests skipped {:.1f}) |{}",
+                  g_upload_request_stats[0] / double(stats_every), g_upload_request_stats[1] / (double(stats_every) * 1024.0),
+                  g_upload_request_stats[2] / (double(stats_every) * 1024.0), g_streamed_skip_stats[0] / double(stats_every),
+                  g_streamed_skip_stats[1] / double(stats_every), histogram);
+      g_streamed_skip_stats[0] = 0;
+      g_streamed_skip_stats[1] = 0;
+      std::memset(g_upload_request_stats, 0, sizeof(g_upload_request_stats));
+      if (!g_upload_request_ranges.empty()) {
+        std::vector<std::pair<uint64_t, std::pair<uint32_t, uint32_t>>> ranked;
+        for (const auto& [range, entry] : g_upload_request_ranges) {
+          ranked.emplace_back(entry.second, range);
+        }
+        std::sort(ranked.begin(), ranked.end(), std::greater<>());
+        for (size_t i = 0; i < std::min(ranked.size(), size_t(25)); ++i) {
+          const auto& entry = g_upload_request_ranges[ranked[i].second];
+          REXGPU_INFO("[cmd-stats]   range {:08X}+{:X}: {:.1f} requests, {:.1f} KB uploaded",
+                      ranked[i].second.first, ranked[i].second.second, entry.first / double(stats_every),
+                      entry.second / (double(stats_every) * 1024.0));
+        }
+        REXGPU_INFO("[cmd-stats]   {} distinct ranges", g_upload_request_ranges.size());
+        g_upload_request_ranges.clear();
+      }
+    }
+    std::memset(command_stats.counts, 0, sizeof(command_stats.counts));
+    command_stats.buffer_barriers = 0;
+    command_stats.image_barriers = 0;
+    command_stats.barrier_stages.clear();
   }
 }
 

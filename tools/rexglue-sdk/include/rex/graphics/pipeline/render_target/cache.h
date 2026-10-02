@@ -177,6 +177,13 @@ class RenderTargetCache {
   bool IsDrawResolutionScaled() const {
     return draw_resolution_scale_x() > 1 || draw_resolution_scale_y() > 1;
   }
+  // With draw resolution scaling, depth render targets at the EDRAM bases and
+  // pitches listed in native_rt_original_resolution_targets (shadow maps, for
+  // instance) are rendered and resolved at the guest resolution, like without
+  // scaling. Only valid for render targets drawn without pixel shaders - the
+  // translated pixel shaders assume the global scale.
+  bool IsOriginalResolutionRenderTarget(uint32_t base_tiles, uint32_t pitch_tiles_at_32bpp,
+                                        bool is_depth) const;
 
   // Virtual (both the common code and the implementation may do something
   // here), don't call from destructors (does work not needed for shutdown
@@ -251,6 +258,9 @@ class RenderTargetCache {
       uint32_t is_depth : 1;                                      // 22
       // Ignoring the blending precision and sRGB.
       uint32_t resource_format : xenos::kRenderTargetFormatBits;  // 26
+      // With draw resolution scaling, rendered at the guest resolution instead
+      // (IsOriginalResolutionRenderTarget).
+      uint32_t original_resolution : 1;  // 27
     };
 
     RenderTargetKey() : key(0) { static_assert_size(*this, sizeof(key)); }
@@ -301,6 +311,13 @@ class RenderTargetCache {
                          uint32_t(1) << uint32_t(msaa_samples), GetFormatName());
     }
   };
+  // Resolution scale of a render target (IsOriginalResolutionRenderTarget).
+  uint32_t GetRenderTargetScaleX(RenderTargetKey key) const {
+    return key.original_resolution ? 1 : draw_resolution_scale_x();
+  }
+  uint32_t GetRenderTargetScaleY(RenderTargetKey key) const {
+    return key.original_resolution ? 1 : draw_resolution_scale_y();
+  }
 
   class RenderTarget {
    public:
@@ -489,10 +506,24 @@ class RenderTargetCache {
   // other ones use the newly available space without restarting the whole
   // render pass (on Vulkan, the actually used height is specified in
   // VkFramebuffer).
-  uint32_t GetRenderTargetHeight(uint32_t pitch_tiles_at_32bpp,
-                                 xenos::MsaaSamples msaa_samples) const;
+  // scale_y: the vertical resolution scale of the render target, the global
+  // one if 0.
+  uint32_t GetRenderTargetHeight(uint32_t pitch_tiles_at_32bpp, xenos::MsaaSamples msaa_samples,
+                                 uint32_t scale_y = 0) const;
 
   virtual RenderTarget* CreateRenderTarget(RenderTargetKey key) = 0;
+  // For implementations sizing host render targets by use (instead of covering
+  // the whole EDRAM addressing period from the base): how many rows of tiles
+  // (of the render target's pitch) the render target being created is about to
+  // be drawn to, 0 if unknown. Set around GetOrCreateRenderTarget.
+  uint32_t render_target_create_tile_rows_ = 0;
+  // Called before ownership of base-relative tiles below tile_rows rows (of the
+  // render target's pitch) is given to the render target, so implementations
+  // sizing host render targets by use can make sure they cover the rows.
+  virtual void EnsureRenderTargetTileRows([[maybe_unused]] RenderTargetKey key,
+                                          [[maybe_unused]] uint32_t tile_rows) {}
+  // The render target with the key if it has been created, nullptr otherwise.
+  RenderTarget* FindRenderTarget(RenderTargetKey key) const;
 
   // Whether depth buffer is encoded differently on the host, thus after
   // aliasing naively, precision may be lost - host depth must only be

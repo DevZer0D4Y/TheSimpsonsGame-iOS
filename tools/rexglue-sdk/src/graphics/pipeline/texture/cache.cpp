@@ -322,14 +322,27 @@ void TextureCache::BeginFrame() {
   ResetTextureBindings();
 }
 
-void TextureCache::MarkRangeAsResolved(uint32_t start_unscaled, uint32_t length_unscaled) {
+void TextureCache::MarkRangeAsResolved(uint32_t start_unscaled, uint32_t length_unscaled,
+                                       bool unscaled) {
   if (length_unscaled == 0) {
     return;
   }
   start_unscaled &= 0x1FFFFFFF;
   length_unscaled = std::min(length_unscaled, 0x20000000 - start_unscaled);
 
-  if (IsDrawResolutionScaled()) {
+  if (IsDrawResolutionScaled() && unscaled) {
+    // Not scaled resolve memory anymore.
+    uint32_t page_first = start_unscaled >> 12;
+    uint32_t page_last = (start_unscaled + length_unscaled - 1) >> 12;
+    auto global_lock = global_critical_region_.Acquire();
+    for (uint32_t page = page_first; page <= page_last; ++page) {
+      uint32_t block = page >> 5;
+      scaled_resolve_pages_[block] &= ~(UINT32_C(1) << (page & 31));
+      if (!scaled_resolve_pages_[block]) {
+        scaled_resolve_pages_l2_[block >> 6] &= ~(UINT64_C(1) << (block & 63));
+      }
+    }
+  } else if (IsDrawResolutionScaled()) {
     uint32_t page_first = start_unscaled >> 12;
     uint32_t page_last = (start_unscaled + length_unscaled - 1) >> 12;
     uint32_t block_first = page_first >> 5;
