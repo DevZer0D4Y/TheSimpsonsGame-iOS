@@ -299,6 +299,14 @@ SETTINGS_SCHEMA = {
         "keybind_rstick_left": "",
         "keybind_rstick_right": "",
     }.items()},
+    # Keys that open the in-game overlays (one key each). The runtime keeps
+    # these until the overlays register, so a saved key survives a restart.
+    **{k: ("str", d, False) for k, d in {
+        "bind_controls": "F1",
+        "bind_settings": "F4",
+        "bind_debug_overlay": "F3",
+        "bind_console": "Backtick",
+    }.items()},
     # game
     "user_language": ("int", 1, True),
     # Always show subtitles, even in a new game's first cutscene (the engine
@@ -318,7 +326,8 @@ SETTINGS_SCHEMA = {
 
 # Settings left out of the config while at their default, so the runtime's own
 # default applies (and a later change of it reaches the player).
-OMIT_WHEN_DEFAULT = {k for k in SETTINGS_SCHEMA if k.startswith("keybind_")} | {"mnk_invert_y"}
+OMIT_WHEN_DEFAULT = ({k for k in SETTINGS_SCHEMA if k.startswith(("keybind_", "bind_"))}
+                     | {"mnk_invert_y"})
 
 LOGO_MOVIES = ("ealogo", "ealogo_sd", "foxlogo", "foxlogo_sd",
                "gracielogo", "gracielogo_sd")

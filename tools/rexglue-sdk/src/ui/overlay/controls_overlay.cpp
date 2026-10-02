@@ -70,7 +70,7 @@ std::string FormatBinding(std::string_view binding) {
       {"Mouse4", "Mouse 4"},  {"Mouse5", "Mouse 5"},  {"WheelUp", "Wheel up"},
       {"WheelDown", "Wheel down"}, {"Control", "Ctrl"},  {"Escape", "Esc"},
       {"Return", "Enter"},    {"Left", "Left arrow"}, {"Right", "Right arrow"},
-      {"Up", "Up arrow"},     {"Down", "Down arrow"},
+      {"Up", "Up arrow"},     {"Down", "Down arrow"},   {"Backtick", "`"},
   };
   std::string result;
   size_t start = 0;
@@ -106,6 +106,11 @@ std::string FormatBinding(std::string_view binding) {
 
 constexpr std::chrono::seconds kHintDuration(10);
 
+// The key an overlay keybind (bind_controls, bind_settings) is on now.
+std::string BindKey(const char* cvar) {
+  return FormatBinding(rex::cvar::GetFlagByName(cvar));
+}
+
 }  // namespace
 
 ControlsOverlayDialog::ControlsOverlayDialog(ImGuiDrawer* imgui_drawer, bool hint_only)
@@ -132,7 +137,8 @@ void ControlsOverlayDialog::OnDraw(ImGuiIO& io) {
     ImGui::SetNextWindowBgAlpha(0.65f);
     if (ImGui::Begin("##controls_hint", nullptr, flags)) {
       ImGui::SetWindowFontScale(FontScale(io));
-      ImGui::TextUnformatted("Keyboard & mouse: press F1 to see the controls");
+      std::string hint = "Keyboard & mouse: press " + BindKey("bind_controls") + " to see the controls";
+      ImGui::TextUnformatted(hint.c_str());
     }
     ImGui::End();
     return;
@@ -167,8 +173,11 @@ void ControlsOverlayDialog::OnDraw(ImGuiIO& io) {
       ImGui::EndTable();
     }
     ImGui::Separator();
-    ImGui::TextUnformatted("Change keys in the launcher, or in game with F4 (Input > Keybinds).");
-    ImGui::TextUnformatted("F1 closes this.");
+    std::string change = "Change keys in the launcher, or in game with " + BindKey("bind_settings") +
+                         " (Input > Keybinds).";
+    std::string close = BindKey("bind_controls") + " closes this.";
+    ImGui::TextUnformatted(change.c_str());
+    ImGui::TextUnformatted(close.c_str());
   }
   ImGui::End();
 }

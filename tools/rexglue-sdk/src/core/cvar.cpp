@@ -48,6 +48,15 @@ std::unordered_map<std::string, size_t>& GetRegistryIndex() {
   return index;
 }
 
+// Config values of flags not registered when the config was loaded, such as
+// the overlay keybinds the app registers once its window exists. They are
+// applied when the flag is registered, so a saved value isn't lost at the
+// next start. Guarded by the registry mutex.
+std::unordered_map<std::string, std::string>& GetDeferredConfigValues() {
+  static std::unordered_map<std::string, std::string> values;
+  return values;
+}
+
 // Convert flag name to environment variable: gpu_vsync -> REX_GPU_VSYNC
 std::string FlagNameToEnvVar(std::string_view name) {
   std::string result = "REX_";
@@ -82,7 +91,14 @@ void ApplyTomlTable(const toml::table& table, const std::string& prefix) {
       if (SetFlagByName(full_key, value_str)) {
         REXLOG_DEBUG("Config: {} = {}", full_key, value_str);
       } else {
-        REXLOG_WARN("Config: unknown cvar '{}'", full_key);
+        std::lock_guard lock(GetRegistryMutex());
+        if (GetRegistryIndex().count(full_key)) {
+          REXLOG_WARN("Config: invalid value for '{}'", full_key);
+        } else {
+          // Possibly registered later; applied then.
+          GetDeferredConfigValues()[full_key] = value_str;
+          REXLOG_DEBUG("Config: '{}' isn't registered (yet)", full_key);
+        }
       }
     }
   }
@@ -186,6 +202,17 @@ std::optional<size_t> RegisterFlag(FlagEntry entry) {
   size_t pos = storage.size();
   index[entry.name] = pos;
   storage.push_back(std::move(entry));
+  auto& deferred = GetDeferredConfigValues();
+  if (auto it_value = deferred.find(storage[pos].name); it_value != deferred.end()) {
+    const FlagEntry& registered = storage[pos];
+    if (ValidateConstraints(registered, it_value->second) && registered.setter(it_value->second)) {
+      REXLOG_DEBUG("Config: {} = {} (registered after the config was loaded)", registered.name,
+                   it_value->second);
+    } else {
+      REXLOG_WARN("Config: invalid value for '{}'", registered.name);
+    }
+    deferred.erase(it_value);
+  }
   return pos;
 }
 
