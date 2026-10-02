@@ -204,6 +204,8 @@ class VulkanCommandProcessor : public CommandProcessor {
   // render pass will also be closed.
   bool SubmitBarriers(bool force_end_render_pass);
 
+  bool IsHostOcclusionQueryActive() const { return active_occlusion_query_.valid; }
+
   // If not started yet, begins a render pass from the render target cache.
   // Submission must be open.
   void SubmitBarriersAndEnterRenderTargetCacheRenderPass(

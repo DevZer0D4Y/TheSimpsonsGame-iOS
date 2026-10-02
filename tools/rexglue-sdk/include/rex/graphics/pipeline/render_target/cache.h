@@ -607,6 +607,11 @@ class RenderTargetCache {
   // EDRAM memory are committed with a memory barrier.
   void PixelShaderInterlockFullEdramBarrierPlaced();
 
+  // Runs vertex shaders on the CPU (stateful, so also from const queries).
+  DrawExtentEstimator& draw_extent_estimator() const {
+    return const_cast<DrawExtentEstimator&>(draw_extent_estimator_);
+  }
+
  private:
   const RegisterFile& register_file_;
   uint32_t draw_resolution_scale_x_;

@@ -4085,6 +4085,11 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
                                     normalized_color_mask, *vertex_shader)) {
     return draw_fail("render_target_update");
   }
+  if (render_target_cache_->ClearDrawAsAttachmentClear(normalized_depth_control,
+                                                       normalized_color_mask, *vertex_shader,
+                                                       pixel_shader)) {
+    return true;
+  }
 
   // Create the pipeline (for this, need the render pass from the render target
   // cache), translating the shaders - doing this now to obtain the used

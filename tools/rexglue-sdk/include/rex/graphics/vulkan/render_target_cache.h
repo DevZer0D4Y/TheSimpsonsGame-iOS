@@ -153,6 +153,14 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   bool Update(bool is_rasterization_done, reg::RB_DEPTHCONTROL normalized_depth_control,
               uint32_t normalized_color_mask, const Shader& vertex_shader) override;
   // Binding information for the last successful update.
+  // Native renderer (native_rt_clear_draws_as_clears): a draw of the XDK
+  // clear shaders that replaces everything it writes with constant values in
+  // a rectangle, done as a clear of the attachments there. Returns true if
+  // done, and the draw must then not be issued. After Update.
+  bool ClearDrawAsAttachmentClear(reg::RB_DEPTHCONTROL normalized_depth_control,
+                                  uint32_t normalized_color_mask, const Shader& vertex_shader,
+                                  const Shader* pixel_shader);
+
   RenderPassKey last_update_render_pass_key() const { return last_update_render_pass_key_; }
   VkRenderPass last_update_render_pass() const { return last_update_render_pass_; }
   const Framebuffer* last_update_framebuffer() const { return last_update_framebuffer_; }
@@ -1002,17 +1010,21 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
     VulkanTextureCache::NativeResolveTarget targets[VulkanTextureCache::kMaxNativeResolveTargets];
   };
   bool InitializeNativeResolve(uint32_t shared_memory_binding_count);
-  // For a draw clearing a rectangle with the XDK clear shader: the render
-  // targets (bit 0 depth, bits 1-4 color) it overwrites entirely inside the
-  // rectangle, so ownership transfers of their old contents there are dead.
-  // exact_edges_out (optional) tells whether the rectangle's edges are on
-  // pixel boundaries, so the draw writes nothing outside it at any resolution
-  // scale or sample count.
+  // For a draw of one rectangle (with the XDK clear shader, or any vertex
+  // shader the CPU can run): the render targets (bit 0 depth, bits 1-4 color)
+  // it overwrites entirely inside the rectangle, so ownership transfers of
+  // their old contents there are dead. exact_edges_out (optional) tells
+  // whether the rectangle's edges are on pixel boundaries, so the draw writes
+  // nothing outside it at any resolution scale or sample count. Only the
+  // candidate targets are checked. With depth_without_stencil, the depth
+  // counts as overwritten when only the depth is replaced.
   uint32_t GetDrawOverwrittenRenderTargets(reg::RB_DEPTHCONTROL normalized_depth_control,
                                            uint32_t normalized_color_mask,
                                            const Shader& vertex_shader,
                                            Transfer::Rectangle& rectangle_out,
-                                           bool* exact_edges_out = nullptr) const;
+                                           bool* exact_edges_out = nullptr,
+                                           uint32_t candidate_targets = UINT32_MAX,
+                                           bool depth_without_stencil = false) const;
   // With native_rt_skip_overwritten_transfers, transfers into render targets
   // that the draws right after binding them clear are held back while
   // consecutive clears keep overwriting them, then performed only outside the
