@@ -100,9 +100,12 @@ REXCVAR_DEFINE_INT32(gpu_wait_stats, 0, "GPU",
                      "game, WAIT_REG_MEM, host GPU fences, swaps) every N frames "
                      "(0 = off; diagnostic)");
 
-REXCVAR_DEFINE_BOOL(clear_memory_page_state, true, "GPU",
-                    "Refresh page-valid state from GPU-written memory at frame end. "
-                    "Disable for minor CPU overhead reduction, but may break memory coherency.")
+REXCVAR_DEFINE_BOOL(clear_memory_page_state, false, "GPU",
+                    "At every frame end, forget which guest memory pages the GPU has an "
+                    "up-to-date copy of (except GPU-written ones), so the next frame uploads "
+                    "every vertex and index buffer it uses again. Write watches already catch "
+                    "CPU writes; this costs about 4 ms of GPU time per frame in Springfield at 2x "
+                    "(hundreds of uploads that each wait for the GPU to go idle).")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_BOOL(occlusion_query_enable, true, "GPU", "Enable host occlusion query handling")

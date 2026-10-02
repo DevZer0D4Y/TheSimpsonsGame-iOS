@@ -20,6 +20,7 @@
 #include <rex/perf/counter.h>
 #include <rex/string/utf8.h>
 #include <rex/ui/overlay/console_overlay.h>
+#include <rex/ui/overlay/controls_overlay.h>
 #include <rex/ui/overlay/debug_overlay.h>
 #include <rex/ui/overlay/settings_overlay.h>
 #include <rex/graphics/flags.h>
@@ -57,6 +58,12 @@ REXCVAR_DEFINE_INT32(shutdown_watchdog_seconds, 10, "UI",
     .range(0, 3600);
 
 namespace rex {
+
+namespace {
+// Not a ReXApp member: games derive their app class from ReXApp, so its layout
+// stays as the game binary was built against.
+std::unique_ptr<ui::ControlsOverlayDialog> controls_overlay_;
+}  // namespace
 
 // --- ReXApp ---
 
@@ -434,6 +441,20 @@ bool ReXApp::SetupPresentation() {
             console_overlay_ = std::make_unique<ui::ConsoleDialog>(imgui_drawer_.get(), log_sink_);
           }
         });
+        rex::ui::RegisterBind("bind_controls", "F1", "Show the keyboard & mouse controls",
+                              [this] {
+                                if (controls_overlay_ && !controls_overlay_->hint_only()) {
+                                  controls_overlay_.reset();
+                                } else {
+                                  controls_overlay_ = std::make_unique<ui::ControlsOverlayDialog>(
+                                      imgui_drawer_.get());
+                                }
+                              });
+        if (REXCVAR_QUERY(bool, mnk_mode)) {
+          // Says once, briefly, that F1 shows the controls.
+          controls_overlay_ =
+              std::make_unique<ui::ControlsOverlayDialog>(imgui_drawer_.get(), true);
+        }
         rex::ui::RegisterBind("bind_settings", "F4", "Toggle settings overlay", [this] {
           if (settings_overlay_) {
             settings_overlay_.reset();
@@ -550,8 +571,10 @@ void ReXApp::OnDestroy() {
   rex::ui::UnregisterBind("bind_debug_overlay");
   rex::ui::UnregisterBind("bind_console");
   rex::ui::UnregisterBind("bind_settings");
+  rex::ui::UnregisterBind("bind_controls");
 
   // ImGui cleanup (reverse of setup)
+  controls_overlay_.reset();
   settings_overlay_.reset();
   console_overlay_.reset();
   debug_overlay_.reset();

@@ -12,6 +12,7 @@
 #include <rex/ui/overlay/settings_overlay.h>
 #include <rex/cvar.h>
 #include <rex/ui/keybinds.h>
+#include <rex/ui/overlay_input.h>
 #include <imgui.h>
 
 #include <algorithm>
@@ -23,9 +24,13 @@
 namespace rex::ui {
 
 SettingsDialog::SettingsDialog(ImGuiDrawer* imgui_drawer, std::filesystem::path config_path)
-    : ImGuiDialog(imgui_drawer), config_path_(std::move(config_path)) {}
+    : ImGuiDialog(imgui_drawer), config_path_(std::move(config_path)) {
+  AcquireOverlayInput();
+}
 
-SettingsDialog::~SettingsDialog() {}
+SettingsDialog::~SettingsDialog() {
+  ReleaseOverlayInput();
+}
 
 static const char* LifecycleBadge(rex::cvar::Lifecycle lc) {
   switch (lc) {

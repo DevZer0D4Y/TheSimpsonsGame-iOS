@@ -13,7 +13,10 @@
 #include <rex/input/input_driver.h>
 #include <rex/ui/window_listener.h>
 
+#include <atomic>
+#include <chrono>
 #include <cstdint>
+#include <memory>
 #include <mutex>
 #include <queue>
 #include <string>
@@ -44,6 +47,8 @@ class MnkInputDriver final : public InputDriver,
   void OnMouseDown(rex::ui::MouseEvent& e) override;
   void OnMouseUp(rex::ui::MouseEvent& e) override;
   void OnMouseMove(rex::ui::MouseEvent& e) override;
+  void OnMouseWheel(rex::ui::MouseEvent& e) override;
+  void OnMouseRelativeMove(rex::ui::MouseEvent& e) override;
 
   // WindowListener
   void OnClosing(rex::ui::UIEvent& e) override;
@@ -54,22 +59,47 @@ class MnkInputDriver final : public InputDriver,
   uint32_t UserIndex() const;
   bool IsEnabled() const;
   void CenterCursor();
+  // From GetState (the game's thread): requests capturing or releasing the
+  // mouse, which the windowing systems only allow on the UI thread.
   void UpdateMouseCapture();
+  // UI thread.
+  void ApplyMouseCapture(bool capture);
   void SetKeyState(uint16_t vk, bool down);
   void EnqueueKeystroke(uint16_t vk_pad, bool down);
+  // A right stick axis value for mouse movement at the velocity (counts per
+  // second).
+  int32_t MouseVelocityToStick(double velocity) const;
 
   rex::ui::Window* attached_window_ = nullptr;
+  // Cleared in the destructor, for calls queued for the UI thread.
+  std::shared_ptr<std::atomic<bool>> alive_ = std::make_shared<std::atomic<bool>>(true);
 
   std::mutex state_mutex_;
   bool key_down_[256] = {};
+  // Every press is reported for at least a moment, so taps shorter than the
+  // interval between the game's polls aren't lost.
+  std::chrono::steady_clock::time_point key_hold_until_[256] = {};
+  // Mouse wheel "keys" stay pressed until these times.
+  std::chrono::steady_clock::time_point wheel_up_until_{};
+  std::chrono::steady_clock::time_point wheel_down_until_{};
 
-  // Mouse delta tracking
+  // Mouse movement since the right stick was last updated.
   int32_t mouse_dx_ = 0;
   int32_t mouse_dy_ = 0;
   int32_t prev_mouse_x_ = 0;
   int32_t prev_mouse_y_ = 0;
-  bool mouse_captured_ = false;
-  bool has_focus_ = true;
+  // The right stick from mouse movement, recomputed at most every few
+  // milliseconds (the game may poll several times per frame), from the
+  // velocity over the last two updates.
+  std::chrono::steady_clock::time_point stick_update_time_{};
+  double prev_velocity_x_ = 0.0;
+  double prev_velocity_y_ = 0.0;
+  int32_t stick_rx_ = 0;
+  int32_t stick_ry_ = 0;
+  // Game thread: the capture state last requested from the UI thread.
+  bool capture_requested_ = false;
+  std::atomic<bool> mouse_captured_{false};
+  std::atomic<bool> has_focus_{true};
 
   // Keystroke queue
   std::queue<X_INPUT_KEYSTROKE> keystroke_queue_;

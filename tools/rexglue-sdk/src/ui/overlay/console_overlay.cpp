@@ -11,6 +11,7 @@
  */
 #include <rex/ui/overlay/console_overlay.h>
 #include <rex/cvar.h>
+#include <rex/ui/overlay_input.h>
 #include <imgui.h>
 #include <algorithm>
 #include <string>
@@ -38,9 +39,13 @@ static ImVec4 LevelColor(spdlog::level::level_enum level) {
 }
 
 ConsoleDialog::ConsoleDialog(ImGuiDrawer* imgui_drawer, std::shared_ptr<rex::LogCaptureSink> sink)
-    : ImGuiDialog(imgui_drawer), sink_(std::move(sink)) {}
+    : ImGuiDialog(imgui_drawer), sink_(std::move(sink)) {
+  AcquireOverlayInput();
+}
 
-ConsoleDialog::~ConsoleDialog() {}
+ConsoleDialog::~ConsoleDialog() {
+  ReleaseOverlayInput();
+}
 
 void ConsoleDialog::RefreshCategories() {
   for (auto& entry : entries_) {

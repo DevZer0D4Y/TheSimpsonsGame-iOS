@@ -99,6 +99,18 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   void Shutdown(bool from_destructor = false);
   void ClearCache() override;
 
+  // The render targets bound by the last Update are original resolution ones
+  // (IsOriginalResolutionRenderTarget), drawn at the guest resolution.
+  bool IsLastUpdateOriginalResolution() const {
+    RenderTarget* const* render_targets = last_update_accumulated_render_targets();
+    for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
+      if (render_targets[i] && render_targets[i]->key().original_resolution) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   void CompletedSubmissionUpdated();
   void EndSubmission();
 
@@ -198,6 +210,7 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   uint32_t GetMaxRenderTargetHeight() const override;
 
   RenderTarget* CreateRenderTarget(RenderTargetKey key) override;
+  void EnsureRenderTargetTileRows(RenderTargetKey key, uint32_t tile_rows) override;
 
   bool IsHostDepthEncodingDifferent(xenos::DepthRenderTargetFormat format) const override;
 
@@ -337,23 +350,65 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
     static constexpr VkImageLayout kDepthDrawLayout =
         VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
 
+    // The image of a render target and the objects referring to it, replaced
+    // together when the image grows (native_rt_size_by_use).
+    struct Image {
+      VkImage image = VK_NULL_HANDLE;
+      VkDeviceMemory memory = VK_NULL_HANDLE;
+      VkImageView view_depth_color = VK_NULL_HANDLE;
+      VkImageView view_depth_stencil = VK_NULL_HANDLE;
+      VkImageView view_stencil = VK_NULL_HANDLE;
+      VkImageView view_srgb = VK_NULL_HANDLE;
+      VkImageView view_color_transfer_separate = VK_NULL_HANDLE;
+      size_t descriptor_set_index_transfer_source = SIZE_MAX;
+      // Rows of EDRAM tiles (of the render target's pitch) the image covers.
+      uint32_t tile_rows = 0;
+    };
+
     // Takes ownership of the Vulkan objects passed to the constructor.
     VulkanRenderTarget(RenderTargetKey key, VulkanRenderTargetCache& render_target_cache,
-                       VkImage image, VkDeviceMemory memory, VkImageView view_depth_color,
-                       VkImageView view_depth_stencil, VkImageView view_stencil,
-                       VkImageView view_srgb, VkImageView view_color_transfer_separate,
-                       size_t descriptor_set_index_transfer_source)
+                       const Image& image)
         : RenderTarget(key),
           render_target_cache_(render_target_cache),
-          image_(image),
-          memory_(memory),
-          view_depth_color_(view_depth_color),
-          view_depth_stencil_(view_depth_stencil),
-          view_stencil_(view_stencil),
-          view_srgb_(view_srgb),
-          view_color_transfer_separate_(view_color_transfer_separate),
-          descriptor_set_index_transfer_source_(descriptor_set_index_transfer_source) {}
+          image_(image.image),
+          memory_(image.memory),
+          view_depth_color_(image.view_depth_color),
+          view_depth_stencil_(image.view_depth_stencil),
+          view_stencil_(image.view_stencil),
+          view_srgb_(image.view_srgb),
+          view_color_transfer_separate_(image.view_color_transfer_separate),
+          descriptor_set_index_transfer_source_(image.descriptor_set_index_transfer_source),
+          tile_rows_(image.tile_rows) {}
     ~VulkanRenderTarget();
+
+    uint32_t tile_rows() const { return tile_rows_; }
+    // native_rt_debug_regrow_interval.
+    uint32_t& debug_regrow_counter() { return debug_regrow_counter_; }
+    // Takes ownership of the new image's objects, returns the old ones (the
+    // caller destroys them once the GPU is done with them). The usage state is
+    // the caller's to update.
+    Image ReplaceImage(const Image& image) {
+      Image old_image;
+      old_image.image = image_;
+      old_image.memory = memory_;
+      old_image.view_depth_color = view_depth_color_;
+      old_image.view_depth_stencil = view_depth_stencil_;
+      old_image.view_stencil = view_stencil_;
+      old_image.view_srgb = view_srgb_;
+      old_image.view_color_transfer_separate = view_color_transfer_separate_;
+      old_image.descriptor_set_index_transfer_source = descriptor_set_index_transfer_source_;
+      old_image.tile_rows = tile_rows_;
+      image_ = image.image;
+      memory_ = image.memory;
+      view_depth_color_ = image.view_depth_color;
+      view_depth_stencil_ = image.view_depth_stencil;
+      view_stencil_ = image.view_stencil;
+      view_srgb_ = image.view_srgb;
+      view_color_transfer_separate_ = image.view_color_transfer_separate;
+      descriptor_set_index_transfer_source_ = image.descriptor_set_index_transfer_source;
+      tile_rows_ = image.tile_rows;
+      return old_image;
+    }
 
     VkImage image() const { return image_; }
 
@@ -428,6 +483,9 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
     // 2 sampled images for depth / stencil, 1 sampled image for color.
     size_t descriptor_set_index_transfer_source_;
 
+    uint32_t tile_rows_;
+    uint32_t debug_regrow_counter_ = 0;
+
     VkPipelineStageFlags current_stage_mask_ = 0;
     VkAccessFlags current_access_mask_ = 0;
     VkImageLayout current_layout_ = VK_IMAGE_LAYOUT_UNDEFINED;
@@ -451,6 +509,8 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
     uint32_t color_2_base_tiles : xenos::kEdramBaseTilesBits;  // 54
 
     uint32_t color_3_base_tiles : xenos::kEdramBaseTilesBits;  // 75
+    // The attachments are original resolution render targets.
+    uint32_t original_resolution : 1;  // 76
 
     // Including all the padding, for a stable hash.
     FramebufferKey() { Reset(); }
@@ -869,8 +929,16 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
     kColorFloat,
     kColorUint,
     kDepth,
+    // kColorFloat writing the color through a unorm view of the destination's
+    // own format (native_resolve_unorm_views), for a source of that format.
+    kColorUnorm,
+    // kDepth writing through a float view of the destination's own format.
+    kDepthFloat,
     kCount,
   };
+  static bool IsNativeResolveDepthShader(NativeResolveShader shader) {
+    return shader == NativeResolveShader::kDepth || shader == NativeResolveShader::kDepthFloat;
+  }
   enum NativeResolveFlags : uint32_t {
     kNativeResolveFlagSwapRedBlue = 1u << 0,
     kNativeResolveFlagDepthFloat24 = 1u << 1,
@@ -1007,6 +1075,24 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
 
   std::unordered_map<FramebufferKey, Framebuffer, FramebufferKey::Hasher> framebuffers_;
 
+  // native_rt_size_by_use: render target images sized by the rows of EDRAM
+  // tiles drawn to, grown (with their contents copied) when more are needed.
+  // Rows covering the whole EDRAM addressing period from the base.
+  uint32_t GetFullRenderTargetTileRows(RenderTargetKey key) const;
+  bool CreateRenderTargetImage(RenderTargetKey key, uint32_t tile_rows,
+                               VulkanRenderTarget::Image& image_out);
+  void DestroyRenderTargetImage(bool is_depth, const VulkanRenderTarget::Image& image);
+  // Objects replaced while earlier submissions may still use them, destroyed
+  // once those complete (UINT64_MAX: all, with the GPU idle).
+  struct RetiredRenderTargetImage {
+    uint64_t submission;
+    bool is_depth;
+    VulkanRenderTarget::Image image;
+  };
+  std::deque<RetiredRenderTargetImage> retired_render_target_images_;
+  std::deque<std::pair<uint64_t, VkFramebuffer>> retired_framebuffers_;
+  void DestroyRetiredRenderTargetObjects(uint64_t completed_submission);
+
   // Set 0 - EDRAM storage buffer, set 1 - source depth sampled image (and
   // unused stencil from the transfer descriptor set), HostDepthStoreConstants
   // passed via push constants.
@@ -1093,6 +1179,11 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
     // native_resolve_debug_verify_stencil_capture: a copied capture the
     // write-back compares the quad capture with.
     uint32_t verify_stencil_capture = UINT32_MAX;
+    // A texture written through a unorm view of its own format
+    // (native_resolve_unorm_views): the NativeResolvePacking of its bits.
+    uint32_t unorm_packing = UINT32_MAX;
+    // Depth written through a float view of its own format.
+    bool depth_float_view = false;
   };
   std::vector<PendingScaledResolveMemory> pending_scaled_resolve_memory_;
   VulkanTextureCache* pending_scaled_resolve_texture_cache_ = nullptr;
@@ -1110,6 +1201,18 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   VkPipeline scaled_memory_writeback_depth_pipeline_ = VK_NULL_HANDLE;
   bool scaled_memory_writeback_depth_pipeline_failed_ = false;
   bool EnsureScaledMemoryWritebackDepthPipeline();
+  // Color write-back reading a unorm view (native_resolve_unorm_views) and
+  // packing it like the native resolve; the color write-back's layout.
+  VkShaderModule scaled_memory_writeback_unorm_shader_ = VK_NULL_HANDLE;
+  VkPipeline scaled_memory_writeback_unorm_pipeline_ = VK_NULL_HANDLE;
+  bool scaled_memory_writeback_unorm_pipeline_failed_ = false;
+  bool EnsureScaledMemoryWritebackUnormPipeline();
+  // Depth write-back reading a float view of the texture's own format; the
+  // depth write-back's layout.
+  VkShaderModule scaled_memory_writeback_depth_float_shader_ = VK_NULL_HANDLE;
+  VkPipeline scaled_memory_writeback_depth_float_pipeline_ = VK_NULL_HANDLE;
+  bool scaled_memory_writeback_depth_float_pipeline_failed_ = false;
+  bool EnsureScaledMemoryWritebackDepthFloatPipeline();
   // The stencil of a lazily written depth resolve, one byte per host texel of
   // the resolved rectangle, row by row.
   struct ScaledStencilCapture {

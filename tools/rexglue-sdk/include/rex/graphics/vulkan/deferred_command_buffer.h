@@ -220,6 +220,21 @@ class DeferredCommandBuffer {
                 regions, sizeof(VkBufferImageCopy) * region_count);
   }
 
+  void CmdVkCopyImage(VkImage src_image, VkImageLayout src_image_layout, VkImage dst_image,
+                      VkImageLayout dst_image_layout, uint32_t region_count,
+                      const VkImageCopy* regions) {
+    const size_t header_size = rex::align(sizeof(ArgsVkCopyImage), alignof(VkImageCopy));
+    uint8_t* args_ptr = reinterpret_cast<uint8_t*>(
+        WriteCommand(Command::kVkCopyImage, header_size + sizeof(VkImageCopy) * region_count));
+    auto& args = *reinterpret_cast<ArgsVkCopyImage*>(args_ptr);
+    args.src_image = src_image;
+    args.src_image_layout = src_image_layout;
+    args.dst_image = dst_image;
+    args.dst_image_layout = dst_image_layout;
+    args.region_count = region_count;
+    std::memcpy(args_ptr + header_size, regions, sizeof(VkImageCopy) * region_count);
+  }
+
   void CmdVkCopyImageToBuffer(VkImage src_image, VkImageLayout src_image_layout,
                               VkBuffer dst_buffer, uint32_t region_count,
                               const VkBufferImageCopy* regions) {
@@ -421,6 +436,7 @@ class DeferredCommandBuffer {
     kVkSetStencilWriteMask,
     kVkSetViewport,
     kVkWriteTimestamp,
+    kVkCopyImage,
   };
 
   struct CommandHeader {
@@ -530,6 +546,16 @@ class DeferredCommandBuffer {
     uint32_t region_count;
     // Followed by aligned VkBufferImageCopy[].
     static_assert(alignof(VkBufferImageCopy) <= alignof(uintmax_t));
+  };
+
+  struct ArgsVkCopyImage {
+    VkImage src_image;
+    VkImageLayout src_image_layout;
+    VkImage dst_image;
+    VkImageLayout dst_image_layout;
+    uint32_t region_count;
+    // Followed by aligned VkImageCopy[].
+    static_assert(alignof(VkImageCopy) <= alignof(uintmax_t));
   };
 
   struct ArgsVkCopyImageToBuffer {

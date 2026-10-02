@@ -64,6 +64,8 @@ REXCVAR_DEFINE_INT32(native_telemetry, 0, "GPU/Vulkan",
 REXCVAR_DEFINE_INT32(native_draw_path, 0, "GPU/Vulkan",
                      "Native draw path: 0 = off, 1 = coverage accounting");
 
+REXCVAR_DECLARE(bool, native_rt_size_by_use);
+
 REXCVAR_DEFINE_BOOL(vulkan_readback_resolve, false, "GPU/Vulkan",
                     "Read render-to-texture results on the CPU")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
@@ -697,6 +699,13 @@ void VulkanCommandProcessor::InitializeShaderStorage(const std::filesystem::path
 }
 
 void VulkanCommandProcessor::TracePlaybackWroteMemory(uint32_t base_ptr, uint32_t length) {
+  // TRACE_STREAM_LEARN: the game's writes fault, the trace's don't - let pages
+  // the trace rewrites every frame become streamed (gpu_stream_dynamic_pages)
+  // like in the game.
+  static const bool stream_learn = std::getenv("TRACE_STREAM_LEARN") != nullptr;
+  if (stream_learn) {
+    shared_memory_->MarkRangeFaultedForStreaming(base_ptr, length);
+  }
   shared_memory_->MemoryInvalidationCallback(base_ptr, length, true);
   primitive_processor_->MemoryInvalidationCallback(base_ptr, length, true);
 }
@@ -4159,8 +4168,13 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
       render_target_cache_->GetPath() == RenderTargetCache::Path::kHostRenderTargets;
   uint32_t draw_resolution_scale_x, draw_resolution_scale_y;
   GetDrawRasterizationScale(draw_resolution_scale_x, draw_resolution_scale_y);
-  if (draw_resolution_scale_x != texture_cache_->draw_resolution_scale_x() ||
-      draw_resolution_scale_y != texture_cache_->draw_resolution_scale_y()) {
+  uint32_t binding_scale_x = render_target_cache_->IsLastUpdateOriginalResolution()
+                                ? 1
+                                : texture_cache_->draw_resolution_scale_x();
+  uint32_t binding_scale_y = render_target_cache_->IsLastUpdateOriginalResolution()
+                                ? 1
+                                : texture_cache_->draw_resolution_scale_y();
+  if (draw_resolution_scale_x != binding_scale_x || draw_resolution_scale_y != binding_scale_y) {
     // A multisampled surface rasterized at double resolution. Exact for clears
     // (constant output), which is all the known uses; others shade per sample.
     static bool non_clear_msaa_draw_logged = false;
@@ -6189,6 +6203,11 @@ void VulkanCommandProcessor::GetDrawRasterizationScale(uint32_t& scale_x_out,
                                                        uint32_t& scale_y_out) const {
   scale_x_out = texture_cache_ ? texture_cache_->draw_resolution_scale_x() : 1;
   scale_y_out = texture_cache_ ? texture_cache_->draw_resolution_scale_y() : 1;
+  if (render_target_cache_ && render_target_cache_->IsLastUpdateOriginalResolution()) {
+    // Drawn at the guest resolution.
+    scale_x_out = 1;
+    scale_y_out = 1;
+  }
   if (render_target_cache_ && render_target_cache_->msaa_as_single_sample()) {
     // Samples of multisampled surfaces are pixels of the host render target.
     xenos::MsaaSamples msaa_samples = register_file_->Get<reg::RB_SURFACE_INFO>().msaa_samples;
@@ -6241,6 +6260,19 @@ void VulkanCommandProcessor::UpdateDynamicState(const draw_util::ViewportInfo& v
   scissor.offset[1] *= draw_resolution_scale_y;
   scissor.extent[0] *= draw_resolution_scale_x;
   scissor.extent[1] *= draw_resolution_scale_y;
+  if (REXCVAR_GET(native_rt_size_by_use)) {
+    // Render targets sized by use may be smaller than the guest scissor, and
+    // rendering must stay within the render area.
+    if (const VulkanRenderTargetCache::Framebuffer* framebuffer =
+            render_target_cache_->last_update_framebuffer()) {
+      scissor.offset[0] = std::min(scissor.offset[0], framebuffer->host_extent.width);
+      scissor.offset[1] = std::min(scissor.offset[1], framebuffer->host_extent.height);
+      scissor.extent[0] =
+          std::min(scissor.extent[0], framebuffer->host_extent.width - scissor.offset[0]);
+      scissor.extent[1] =
+          std::min(scissor.extent[1], framebuffer->host_extent.height - scissor.offset[1]);
+    }
+  }
   VkRect2D scissor_rect;
   scissor_rect.offset.x = int32_t(scissor.offset[0]);
   scissor_rect.offset.y = int32_t(scissor.offset[1]);

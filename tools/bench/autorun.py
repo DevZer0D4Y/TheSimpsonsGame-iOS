@@ -66,7 +66,7 @@ BASE_OVERRIDES = {
     "window_width": "1280",
     "window_height": "720",
     "audio_mute": "true",
-    "mnk_mode": "true",
+    "mnk_mode": "false",  # injected pad input needs no keyboard/mouse driver; it would grab the pointer
     "draw_telemetry": "false",
     "native_telemetry": "120",
     "shader_inventory_csv": '""',

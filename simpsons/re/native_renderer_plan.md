@@ -77,15 +77,27 @@ instead of building a separate renderer next to it. Stages, in order:
    yet write the memory directly from the render target. The EDRAM buffer dump and compute
    resolve remain only as the fallback for unsupported cases (MSAA sources, exponent bias,
    gamma, non-bitwise-equivalent formats).
-3. **Render targets as surfaces** - next. Host render targets sized by use instead of EDRAM
-   row coverage, a resolution scale per target, no EDRAM address limits on size. Unlocks any
-   aspect ratio and resolution (with game-side camera and HUD changes), per-target resolution
-   (shadow maps), less memory, fewer transfers.
-4. **Geometry without emulation tricks** - rectangle lists and point sprites without geometry
-   shaders (Mali GPUs on Android have none), real vertex and index buffers instead of shaders
-   reading the guest memory mirror.
-5. **Memory** - no full guest memory mirror on the GPU and no write watching; textures and
-   buffers uploaded when the game loads or changes them (hooks on its resource code).
+3. **Render targets as surfaces** - done, except copy-free resolves. Host render targets are
+   the size of what the game draws to (`native_rt_size_by_use`: the rows of EDRAM tiles a
+   target is drawn to, grown with a copy when more are needed) instead of covering the whole
+   2048-tile EDRAM period: the main color and depth targets are 1280x720 (they were 1280x2048),
+   the shadow map 1040x1024 - about 95 MB less video memory at 2x. Each target has its own
+   resolution scale (`native_rt_original_resolution_targets`, the launcher's "Shadow
+   resolution" option). Not done: letting a texture take over a target's image instead of
+   copying it in a resolve (about 1 ms at 2x) - every color resolve in this game swaps red and
+   blue, so the texture would need swizzled views, swap-aware memory write-back and proof that
+   the next pass overwrites the whole target.
+4. **Geometry without emulation tricks** - in progress. Rectangle lists, quad lists and point
+   sprites without geometry shaders are exact (`vulkan_geometry_shader_primitives = false`, used
+   automatically on GPUs without them, such as Mali); quads are split like the geometry
+   shader's strip (`quad_list_triangle_order`). Next: real vertex and index buffers instead of
+   shaders reading the guest memory mirror.
+5. **Memory** - in progress. Uploads no longer wait for the GPU every draw: the per-frame
+   reupload of every buffer (`clear_memory_page_state`) is off, and pages the game rewrites
+   every frame are only uploaded when the bytes a draw reads changed
+   (`gpu_stream_skip_unchanged`). Next: no full guest memory mirror on the GPU and no write
+   watching; textures and buffers uploaded when the game loads or changes them (hooks on its
+   resource code).
 6. Removing the emulation paths, Windows check, Android port.
 
 ## Validation
@@ -96,8 +108,13 @@ instead of building a separate renderer next to it. Stages, in order:
 - Captures: `tools/bench/autorun.py` drives the game unattended (injected pad input, engine
   screenshots, perf, GPU clock/power) and `trace <label>` grabs a frame trace.
 - New GPU-visible code runs on llvmpipe first (`VK_ICD_FILENAMES=.../lvp_icd.x86_64.json`):
-  a GPU fault on the Steam Deck resets the GPU and can black out the session. llvmpipe can
-  replay 1x traces but not 2x ones yet.
+  a GPU fault on the Steam Deck resets the GPU and can black out the session. llvmpipe
+  replays 1x and 2x traces.
+- `TRACE_STREAM_LEARN=1` makes the replayer's memory writes count as write faults, so pages
+  the trace rewrites every frame become streamed like in the running game (needs
+  `TRACE_BENCH` of 4 or more).
+- `REX_CMD_STATS=1` logs the commands, barriers and uploads per command buffer (`=2` also the
+  most uploaded ranges, `REX_CMD_STATS_EVERY=<n>` the interval).
 - Debug modes that prove exactness: `native_resolve_debug_reload` (textures reload from the
   memory native resolves write), `native_resolve_debug_memory_only_all` (every resolve writes
   only the memory), `native_resolve_debug_verify_stencil_capture`.
@@ -113,6 +130,11 @@ instead of building a separate renderer next to it. Stages, in order:
   over consecutive clears and done only outside the cleared area (the shadow map pass: 0.7 ms
   at 2x down to almost nothing).
 - Stencil: depth resolves of an area whose stencil is known to be uniform (cleared, not
-  written since) can skip capturing it (`native_resolve_uniform_stencil`, about 1 ms at 2x);
-  off until its write-back path is validated.
-- GPU time per frame on the Steam Deck, t09 gameplay trace: about 6.3 ms at 1x, 14.2 ms at 2x.
+  written since) skip capturing it (`native_resolve_uniform_stencil`, on, about 1 ms at 2x).
+- Compression: native resolves write 8_8_8_8, 2_10_10_10 and depth textures through a view of
+  their own format (`native_resolve_unorm_views`), so AMD GPUs keep them DCC-compressed like
+  the render targets (1.1 to 1.4 ms at 2x).
+- GPU time per frame on the Steam Deck replaying captured frames (with the streaming the
+  running game does): t09 gameplay about 4.3 ms at 1x and 10.5 ms at 2x, Springfield about
+  4.8 ms at 1x and 10.9 ms at 2x (16.7 ms at 2x before the upload and compression work).
+  Live, Springfield at 2x runs at about 59 FPS with the GPU at its power limit (1400 MHz).

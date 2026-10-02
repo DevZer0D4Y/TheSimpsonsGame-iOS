@@ -34,6 +34,12 @@ REXCVAR_DEFINE_BOOL(vulkan_force_convert_quad_lists_to_triangle_lists, false, "G
                     "Force Vulkan quad list conversion to triangle lists in primitive processing, "
                     "even when geometry shaders are available")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(vulkan_geometry_shader_primitives, true, "GPU/Vulkan",
+                    "Draw quad lists, point sprites and rectangle lists with geometry shaders where "
+                    "the device has them (slightly faster on the Steam Deck). Off: converted to "
+                    "triangles and expanded in the vertex shader everywhere - the same image, and "
+                    "the only way on devices without geometry shaders such as Mali GPUs")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 namespace rex::graphics::vulkan {
 
@@ -51,7 +57,8 @@ bool VulkanPrimitiveProcessor::Initialize() {
   // Default to D3D12-like geometry-shader-based handling when available, but
   // allow opting into Vulkan fallback paths for debugging and downlevel
   // compatibility testing.
-  bool geometry_shader_primitive_emulation_allowed = device_properties.geometryShader;
+  bool geometry_shader_primitive_emulation_allowed =
+      device_properties.geometryShader && REXCVAR_GET(vulkan_geometry_shader_primitives);
   bool quad_lists_supported_without_conversion =
       geometry_shader_primitive_emulation_allowed &&
       !REXCVAR_GET(vulkan_force_convert_quad_lists_to_triangle_lists);

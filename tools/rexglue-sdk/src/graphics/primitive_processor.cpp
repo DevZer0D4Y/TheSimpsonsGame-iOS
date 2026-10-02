@@ -31,6 +31,12 @@
 REXCVAR_DEFINE_BOOL(force_convert_line_loops_to_strips, false, "GPU",
                     "Force convert line loops to strips");
 
+REXCVAR_DEFINE_INT32(quad_list_triangle_order, 2, "GPU",
+                     "Triangles quad lists are converted to: 0 = v0 v1 v2, v0 v2 v3; 1 = v0 v1 "
+                     "v3, v3 v1 v2; 2 = v0 v1 v3, v1 v2 v3 (the triangles of the 0 1 3 2 strip "
+                     "the quad list geometry shader emits, so both give the same image); 3 = v0 "
+                     "v1 v3, v2 v3 v1");
+
 REXCVAR_DEFINE_BOOL(force_convert_quad_lists_to_triangle_lists, false, "GPU",
                     "Force convert quad lists to triangle lists");
 
@@ -144,6 +150,17 @@ bool PrimitiveProcessor::InitializeCommon(bool full_32bit_vertex_indices_support
       !line_loops_supported || REXCVAR_GET(force_convert_line_loops_to_strips);
   convert_quad_lists_to_triangle_lists_ =
       !quad_lists_supported || REXCVAR_GET(force_convert_quad_lists_to_triangle_lists);
+  {
+    static constexpr uint32_t kQuadTriangleOrders[4][6] = {
+        {0, 1, 2, 0, 2, 3},
+        {0, 1, 3, 3, 1, 2},
+        {0, 1, 3, 1, 2, 3},
+        {0, 1, 3, 2, 3, 1},
+    };
+    uint32_t order = uint32_t(std::clamp(REXCVAR_GET(quad_list_triangle_order), 0, 3));
+    std::memcpy(quad_list_triangle_vertices_, kQuadTriangleOrders[order],
+                sizeof(quad_list_triangle_vertices_));
+  }
   // No override cvars as hosts are not required to support the fallback paths
   // since they require different vertex shader structure (for the fallback
   // HostVertexShaderTypes).
@@ -236,15 +253,10 @@ bool PrimitiveProcessor::InitializeCommon(bool full_32bit_vertex_indices_support
                 // TODO(Triang3l): SIMD for faster initialization?
                 for (uint32_t i = 0; i < UINT16_MAX / 4; ++i) {
                   uint16_t quad_first_index = uint16_t(i * 4);
-                  // TODO(Triang3l): Find the correct order.
-                  // v0, v1, v2.
-                  *(triangle_list_ptr++) = quad_first_index;
-                  *(triangle_list_ptr++) = quad_first_index + 1;
-                  *(triangle_list_ptr++) = quad_first_index + 2;
-                  // v0, v2, v3.
-                  *(triangle_list_ptr++) = quad_first_index;
-                  *(triangle_list_ptr++) = quad_first_index + 2;
-                  *(triangle_list_ptr++) = quad_first_index + 3;
+                  for (uint32_t j = 0; j < 6; ++j) {
+                    *(triangle_list_ptr++) =
+                        uint16_t(quad_first_index + quad_list_triangle_vertices_[j]);
+                  }
                 }
               }
             })) {

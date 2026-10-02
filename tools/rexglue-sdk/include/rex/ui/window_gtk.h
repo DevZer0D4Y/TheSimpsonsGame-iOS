@@ -37,6 +37,8 @@ class GTKWindow : public Window {
   // closed.
   GtkWidget* window() const { return window_; }
 
+  bool ReportsRelativeMouseMotion() const override { return true; }
+
  protected:
   bool OpenImpl() override;
   void RequestCloseImpl() override;
@@ -44,8 +46,13 @@ class GTKWindow : public Window {
   void ApplyNewFullscreen() override;
   void ApplyNewTitle() override;
   void ApplyNewMainMenu(MenuItem* old_main_menu) override;
-  // Mouse capture seems to happen implicitly compared to Windows.
   void FocusImpl() override;
+  // Mouse capture: a pointer grab with a blank cursor; relative motion from
+  // XInput2 raw motion (unaccelerated), or from warping the pointer back to the
+  // center of the drawing area if XInput2 isn't available.
+  void ApplyNewMouseCapture() override;
+  void ApplyNewMouseRelease() override;
+  void ApplyNewCursorVisibility(CursorVisibility old_cursor_visibility) override;
 
   std::unique_ptr<Surface> CreateSurfaceImpl(Surface::TypeFlags allowed_types) override;
   void RequestPaintImpl() override;
@@ -79,6 +86,31 @@ class GTKWindow : public Window {
   uint32_t batched_size_update_depth_ = 0;
   bool batched_size_update_contained_configure_ = false;
   bool batched_size_update_contained_draw_ = false;
+
+  void UpdateDrawingAreaCursor();
+  void InitializeRawMouseMotion();
+  void ShutdownRawMouseMotion();
+  // xevent is an XEvent.
+  static GdkFilterReturn RawMouseMotionFilterThunk(GdkXEvent* xevent, GdkEvent* event,
+                                                   gpointer user_data);
+  GdkFilterReturn RawMouseMotionFilter(void* xevent);
+  void SendRelativeMouseMotion(double dx, double dy);
+  void WarpPointerToCenter();
+  // Captured with the cursor hidden (mouse look): the pointer is kept in the
+  // window and motion is reported as relative. A capture with the cursor shown
+  // (dragging in an overlay) only redirects the pointer events.
+  bool IsMouseLocked() const {
+    return mouse_grabbed_ && GetCursorVisibility() == CursorVisibility::kHidden;
+  }
+  GdkCursor* blank_cursor_ = nullptr;
+  bool mouse_grabbed_ = false;
+  // XInput2 major opcode, or -1 if raw motion isn't available.
+  int raw_mouse_motion_xi_opcode_ = -1;
+  bool raw_mouse_motion_initialized_ = false;
+  // Sub-pixel motion not sent yet.
+  double relative_mouse_motion_remainder_x_ = 0.0;
+  double relative_mouse_motion_remainder_y_ = 0.0;
+  uint32_t raw_mouse_motion_events_since_warp_ = 0;
 };
 
 class GTKMenuItem : public MenuItem {

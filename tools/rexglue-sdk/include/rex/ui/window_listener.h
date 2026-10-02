@@ -48,6 +48,11 @@ class WindowInputListener {
   virtual void OnMouseMove(MouseEvent&) {}
   virtual void OnMouseUp(MouseEvent&) {}
   virtual void OnMouseWheel(MouseEvent&) {}
+  // While the mouse is captured, on windows that report relative motion
+  // (Window::ReportsRelativeMouseMotion): x and y are the movement since the
+  // previous event, unaccelerated where the platform allows, independent of
+  // where the (hidden) cursor is.
+  virtual void OnMouseRelativeMove(MouseEvent&) {}
 
   virtual void OnTouchEvent(TouchEvent&) {}
 };

@@ -28,6 +28,12 @@
 #include <rex/logging.h>
 #include <rex/math.h>
 
+REXCVAR_DEFINE_STRING(native_rt_original_resolution_targets, "", "GPU",
+                      "With draw resolution scaling, depth render targets rendered at the guest "
+                      "resolution instead, as EDRAM base:pitch pairs in tiles separated by commas "
+                      "(832:13 = the shadow maps of The Simpsons Game). Only for render targets "
+                      "drawn without pixel shaders");
+
 REXCVAR_DEFINE_BOOL(mrt_edram_used_range_clamp_to_min, true, "GPU",
                     "Clamp MRT EDRAM used range to minimum");
 
@@ -630,6 +636,26 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
       ((height_used << uint32_t(msaa_samples >= xenos::MsaaSamples::k2X)) +
        (xenos::kEdramTileHeightSamples - 1)) /
       xenos::kEdramTileHeightSamples * pitch_tiles_at_32bpp;
+  // Original resolution render targets (IsOriginalResolutionRenderTarget) can't
+  // be bound together with ones at the scaled resolution.
+  uint32_t original_resolution_rts = 0;
+  for (uint32_t i = 0; i < edram_bases_sorted_count; ++i) {
+    if (IsOriginalResolutionRenderTarget(edram_bases_sorted[i].first, pitch_tiles_at_32bpp,
+                                         edram_bases_sorted[i].second == 0)) {
+      original_resolution_rts |= uint32_t(1) << edram_bases_sorted[i].second;
+    }
+  }
+  bool binding_original_resolution =
+      original_resolution_rts && original_resolution_rts == depth_and_color_rts_used_bits;
+  if (original_resolution_rts && !binding_original_resolution) {
+    static bool mixed_logged = false;
+    if (!mixed_logged) {
+      mixed_logged = true;
+      REXGPU_WARN(
+          "Original resolution render target bound together with scaled ones - rendering it at "
+          "the scaled resolution for this draw");
+    }
+  }
   for (uint32_t i = 0; i < edram_bases_sorted_count; ++i) {
     const std::pair<uint32_t, uint32_t>& rt_base_index = edram_bases_sorted[i];
     uint32_t rt_base = rt_base_index.first;
@@ -640,13 +666,7 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
     rt_key.msaa_samples = GetKeyMsaaSamples(msaa_samples);
     rt_key.is_depth = rt_bit_index == 0;
     rt_key.resource_format = resource_formats[rt_bit_index];
-    if (!interlock_barrier_only) {
-      RenderTarget* render_target = GetOrCreateRenderTarget(rt_key);
-      if (!render_target) {
-        return false;
-      }
-      rts[rt_bit_index] = render_target;
-    }
+    rt_key.original_resolution = uint32_t(binding_original_resolution);
     uint32_t rt_is_64bpp = (rts_are_64bpp >> rt_bit_index) & 1;
     // The last render target can occupy the EDRAM until the base of the first
     // render target (itself in case of 1 render target) with EDRAM addressing
@@ -657,6 +677,16 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
                                         ? edram_bases_sorted[i + 1].first
                                         : (xenos::kEdramTileCount + edram_bases_sorted[0].first)) -
                                        rt_base);
+    if (!interlock_barrier_only) {
+      uint32_t rt_pitch_tiles = rt_key.GetPitchTiles();
+      render_target_create_tile_rows_ = (rt_lengths_tiles[i] + rt_pitch_tiles - 1) / rt_pitch_tiles;
+      RenderTarget* render_target = GetOrCreateRenderTarget(rt_key);
+      render_target_create_tile_rows_ = 0;
+      if (!render_target) {
+        return false;
+      }
+      rts[rt_bit_index] = render_target;
+    }
   }
 
   if (interlock_barrier_only) {
@@ -788,10 +818,48 @@ uint32_t RenderTargetCache::GetLastUpdateBoundRenderTargets(
   return rts_used;
 }
 
+bool RenderTargetCache::IsOriginalResolutionRenderTarget(uint32_t base_tiles,
+                                                         uint32_t pitch_tiles_at_32bpp,
+                                                         bool is_depth) const {
+  if (!is_depth || !IsDrawResolutionScaled()) {
+    return false;
+  }
+  // "base:pitch" pairs (EDRAM tiles), comma-separated, parsed once.
+  static const std::vector<std::pair<uint32_t, uint32_t>> targets = [] {
+    std::vector<std::pair<uint32_t, uint32_t>> parsed;
+    const std::string& list = REXCVAR_GET(native_rt_original_resolution_targets);
+    size_t position = 0;
+    while (position < list.size()) {
+      size_t end = list.find(',', position);
+      if (end == std::string::npos) {
+        end = list.size();
+      }
+      std::string entry = list.substr(position, end - position);
+      size_t colon = entry.find(':');
+      if (colon != std::string::npos) {
+        parsed.emplace_back(uint32_t(std::strtoul(entry.c_str(), nullptr, 10)),
+                            uint32_t(std::strtoul(entry.c_str() + colon + 1, nullptr, 10)));
+      }
+      position = end + 1;
+    }
+    return parsed;
+  }();
+  for (const std::pair<uint32_t, uint32_t>& target : targets) {
+    if (target.first == base_tiles && target.second == pitch_tiles_at_32bpp) {
+      return true;
+    }
+  }
+  return false;
+}
+
 uint32_t RenderTargetCache::GetRenderTargetHeight(uint32_t pitch_tiles_at_32bpp,
-                                                  xenos::MsaaSamples msaa_samples) const {
+                                                  xenos::MsaaSamples msaa_samples,
+                                                  uint32_t scale_y) const {
   if (!pitch_tiles_at_32bpp) {
     return 0;
+  }
+  if (!scale_y) {
+    scale_y = draw_resolution_scale_y();
   }
   // Down to the beginning of the render target in the next 11-bit EDRAM
   // addressing period.
@@ -801,10 +869,10 @@ uint32_t RenderTargetCache::GetRenderTargetHeight(uint32_t pitch_tiles_at_32bpp,
   static_assert(!(xenos::kTexture2DCubeMaxWidthHeight % xenos::kEdramTileHeightSamples),
                 "Maximum guest render target height is assumed to always be a multiple "
                 "of an EDRAM tile height");
-  uint32_t max_height_scaled = std::min(
-      xenos::kTexture2DCubeMaxWidthHeight * draw_resolution_scale_y(), GetMaxRenderTargetHeight());
+  uint32_t max_height_scaled =
+      std::min(xenos::kTexture2DCubeMaxWidthHeight * scale_y, GetMaxRenderTargetHeight());
   uint32_t msaa_samples_y_log2 = uint32_t(msaa_samples >= xenos::MsaaSamples::k2X);
-  uint32_t tile_height_samples_scaled = xenos::kEdramTileHeightSamples * draw_resolution_scale_y();
+  uint32_t tile_height_samples_scaled = xenos::kEdramTileHeightSamples * scale_y;
   tile_rows =
       std::min(tile_rows, (max_height_scaled << msaa_samples_y_log2) / tile_height_samples_scaled);
   assert_not_zero(tile_rows);
@@ -1091,7 +1159,14 @@ bool RenderTargetCache::PrepareHostRenderTargetsResolveClear(
     depth_render_target_key.msaa_samples = GetKeyMsaaSamples(msaa_samples);
     depth_render_target_key.is_depth = 1;
     depth_render_target_key.resource_format = resolve_info.depth_edram_info.format;
+    depth_render_target_key.original_resolution = uint32_t(IsOriginalResolutionRenderTarget(
+        resolve_info.depth_original_base, pitch_tiles_at_32bpp, true));
+    render_target_create_tile_rows_ =
+        (depth_clear_start_tiles_base_relative + depth_clear_length_tiles +
+         depth_render_target_key.GetPitchTiles() - 1) /
+        depth_render_target_key.GetPitchTiles();
     depth_render_target = GetOrCreateRenderTarget(depth_render_target_key);
+    render_target_create_tile_rows_ = 0;
     if (!depth_render_target) {
       // Failed to create the depth render target, don't clear it.
       depth_render_target_key = RenderTargetKey();
@@ -1107,7 +1182,12 @@ bool RenderTargetCache::PrepareHostRenderTargetsResolveClear(
     color_render_target_key.is_depth = 0;
     color_render_target_key.resource_format = uint32_t(GetColorResourceFormat(
         xenos::ColorRenderTargetFormat(resolve_info.color_edram_info.format)));
+    render_target_create_tile_rows_ =
+        (color_clear_start_tiles_base_relative + color_clear_length_tiles +
+         color_render_target_key.GetPitchTiles() - 1) /
+        color_render_target_key.GetPitchTiles();
     color_render_target = GetOrCreateRenderTarget(color_render_target_key);
+    render_target_create_tile_rows_ = 0;
     if (!color_render_target) {
       // Failed to create the color render target, don't clear it.
       color_render_target_key = RenderTargetKey();
@@ -1160,10 +1240,15 @@ RenderTargetCache::PrepareFullEdram1280xRenderTargetForSnapshotRestoration(
   RenderTargetKey render_target_key;
   render_target_key.pitch_tiles_at_32bpp = kPitchTilesAt32bpp;
   render_target_key.resource_format = uint32_t(GetColorResourceFormat(color_format));
+  render_target_create_tile_rows_ = kHeightTileRows;
   RenderTarget* render_target = GetOrCreateRenderTarget(render_target_key);
+  render_target_create_tile_rows_ = 0;
   if (!render_target) {
     return nullptr;
   }
+  // The whole EDRAM is restored into it (ownership is taken directly below,
+  // not through ChangeOwnership).
+  EnsureRenderTargetTileRows(render_target_key, kHeightTileRows);
   // Change ownership, but don't transfer the contents - they will be replaced
   // anyway.
   ownership_ranges_.clear();
@@ -1191,6 +1276,11 @@ void RenderTargetCache::PixelShaderInterlockFullEdramBarrierPlaced() {
   }
   ownership_ranges_.clear();
   ownership_ranges_.emplace(0, empty_range);
+}
+
+RenderTargetCache::RenderTarget* RenderTargetCache::FindRenderTarget(RenderTargetKey key) const {
+  auto it = render_targets_.find(key);
+  return it != render_targets_.end() ? it->second : nullptr;
 }
 
 RenderTargetCache::RenderTarget* RenderTargetCache::GetOrCreateRenderTarget(RenderTargetKey key) {
@@ -1304,6 +1394,12 @@ void RenderTargetCache::ChangeOwnership(RenderTargetKey dest, uint32_t start_til
   }
   uint32_t dest_pitch_tiles = dest.GetPitchTiles();
   bool dest_is_64bpp = dest.Is64bpp();
+  if (GetPath() == Path::kHostRenderTargets) {
+    // The render target must cover the tiles it's about to own (and may later
+    // be the source of transfers of).
+    EnsureRenderTargetTileRows(
+        dest, (start_tiles_base_relative + length_tiles + dest_pitch_tiles - 1) / dest_pitch_tiles);
+  }
   bool host_depth_encoding_different = dest.is_depth && GetPath() == Path::kHostRenderTargets &&
                                        IsHostDepthEncodingDifferent(dest.GetDepthFormat());
   auto change_ownership_in_extent = [&](uint32_t extent_start, uint32_t extent_end) {

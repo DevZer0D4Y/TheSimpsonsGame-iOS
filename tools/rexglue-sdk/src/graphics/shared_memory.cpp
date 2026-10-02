@@ -11,7 +11,9 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdlib>
 #include <cstring>
+#include <map>
 #include <utility>
 
 #include <rex/assert.h>
@@ -27,6 +29,12 @@ REXCVAR_DEFINE_BOOL(gpu_stream_dynamic_pages, true, "GPU",
                     "every use instead of write-protecting them after each upload (saves a "
                     "protection change and a write fault per page per frame)");
 
+REXCVAR_DEFINE_BOOL(gpu_stream_skip_unchanged, true, "GPU",
+                    "With gpu_stream_dynamic_pages, skip uploading a streamed page for a draw "
+                    "when the bytes the draw reads from it are the same as when it was last "
+                    "uploaded (every upload waits for the GPU to finish all earlier work)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 namespace rex::graphics {
 
 // Pages uploaded without being made valid (streamed), for the gpu_wait_stats
@@ -36,6 +44,14 @@ namespace rex::graphics {
 std::atomic<uint64_t> g_streamed_page_uploads{0};
 std::atomic<uint64_t> g_streamed_page_max_uploads{0};
 std::atomic<uint64_t> g_streamed_pages_over[4] = {};
+// Debugging (REX_CMD_STATS): requests that needed an upload, their requested
+// and uploaded bytes, and a log2 histogram of the requested sizes.
+uint64_t g_upload_request_stats[3 + 32] = {};
+// Debugging (REX_CMD_STATS): streamed pages whose upload was skipped as
+// unchanged, and requests that needed no upload because of that.
+uint64_t g_streamed_skip_stats[2] = {};
+// REX_CMD_STATS=2: requests that needed an upload by (start, length): count and uploaded bytes.
+std::map<std::pair<uint32_t, uint32_t>, std::pair<uint64_t, uint64_t>> g_upload_request_ranges;
 
 SharedMemory::SharedMemory(memory::Memory& memory) : memory_(memory) {
   page_size_log2_ = rex::log2_ceil(uint32_t(rex::memory::page_size()));
@@ -70,6 +86,7 @@ void SharedMemory::InitializeSparseHostGpuMemory(uint32_t granularity_log2) {
 
 void SharedMemory::ShutdownCommon() {
   ReleaseTraceDownloadRanges();
+  streamed_page_shadows_.clear();
 
   FireWatches(0, (kBufferSize - 1) >> page_size_log2_, false);
   assert_true(global_watches_.empty());
@@ -143,6 +160,7 @@ void SharedMemory::OnGuestFrameEnd() {
     std::fill(system_page_flags_faulted_previous_.begin(),
               system_page_flags_faulted_previous_.end(), 0);
     streamed_pages_active_ = false;
+    streamed_page_shadows_.clear();
     return;
   }
   streamed_pages_active_ = true;
@@ -151,6 +169,7 @@ void SharedMemory::OnGuestFrameEnd() {
   bool reset = ++streamed_pages_frames_ >= kStreamedPagesResetFrames;
   if (reset) {
     streamed_pages_frames_ = 0;
+    streamed_page_shadows_.clear();
   }
   for (uint32_t i = 0; i < num_system_page_flags_; ++i) {
     uint64_t faulted = system_page_flags_faulted_[i];
@@ -183,6 +202,21 @@ void SharedMemory::OnGuestFrameEnd() {
             uint8_t(0));
 }
 
+void SharedMemory::MarkRangeFaultedForStreaming(uint32_t start, uint32_t length) {
+  if (!length || start >= kBufferSize) {
+    return;
+  }
+  length = std::min(length, kBufferSize - start);
+  auto global_lock = global_critical_region_.Acquire();
+  if (!streamed_pages_active_) {
+    return;
+  }
+  uint32_t page_last = (start + length - 1) >> page_size_log2_;
+  for (uint32_t page = start >> page_size_log2_; page <= page_last; ++page) {
+    system_page_flags_faulted_[page >> 6] |= uint64_t(1) << (page & 63);
+  }
+}
+
 void SharedMemory::InvalidateAllPages() {
   auto global_lock = global_critical_region_.Acquire();
 
@@ -210,6 +244,7 @@ void SharedMemory::SetSystemPageBlocksValidWithGpuDataWritten() {
 }
 
 void SharedMemory::ClearCache() {
+  streamed_page_shadows_.clear();
   // Keeping GPU-written data, so "invalidated by GPU".
   FireWatches(0, (kBufferSize - 1) >> page_size_log2_, true);
   // No watches now, so no references to the pools accessible by guest threads -
@@ -399,6 +434,12 @@ void SharedMemory::MakeRangeValid(uint32_t start, uint32_t length, bool written_
   uint32_t valid_page_last = last >> page_size_log2_;
   uint32_t valid_block_first = valid_page_first >> 6;
   uint32_t valid_block_last = valid_page_last >> 6;
+
+  // The GPU copy of the pages no longer has what streamed pages were uploaded
+  // with.
+  if (written_by_gpu && !streamed_page_shadows_.empty()) {
+    EraseStreamedPageShadows(valid_page_first, valid_page_last);
+  }
 
   // In an upload for an allow_streamed request, streamed pages are neither
   // made valid nor protected, so their next request uploads them again. Pages
@@ -703,9 +744,139 @@ bool SharedMemory::RequestValidatedRanges(const std::pair<uint32_t, uint32_t>* m
   }
 
   upload_allow_streamed_ = allow_streamed && streamed_pages_active_;
+  if (upload_allow_streamed_ && streamed_page_shadows_supported_ &&
+      REXCVAR_GET(gpu_stream_skip_unchanged) && !streamed_page_shadows_.empty()) {
+    DropUnchangedStreamedPages(merged_ranges, merged_count);
+    if (upload_ranges_.empty()) {
+      upload_allow_streamed_ = false;
+      ++g_streamed_skip_stats[1];
+      return true;
+    }
+  }
+
+  {
+    static const bool upload_request_stats = std::getenv("REX_CMD_STATS") != nullptr;
+    if (upload_request_stats) {
+      uint64_t requested = 0, uploaded_pages = 0;
+      for (size_t i = 0; i < merged_count; ++i) {
+        requested += merged_ranges[i].second;
+      }
+      for (const auto& upload_range : upload_ranges_) {
+        uploaded_pages += upload_range.second;
+      }
+      ++g_upload_request_stats[0];
+      g_upload_request_stats[1] += requested;
+      g_upload_request_stats[2] += uploaded_pages << page_size_log2_;
+      ++g_upload_request_stats[3 + std::min(uint32_t(31), uint32_t(64 - rex::lzcnt(requested)))];
+      static const bool upload_request_ranges = std::strcmp(std::getenv("REX_CMD_STATS"), "2") == 0;
+      if (upload_request_ranges && merged_count == 1) {
+        auto& entry = g_upload_request_ranges[merged_ranges[0]];
+        ++entry.first;
+        entry.second += uploaded_pages << page_size_log2_;
+      }
+    }
+  }
   bool uploaded = UploadRanges(upload_ranges_);
   upload_allow_streamed_ = false;
   return uploaded;
+}
+
+void SharedMemory::DropUnchangedStreamedPages(const std::pair<uint32_t, uint32_t>* ranges,
+                                              size_t count) {
+  const uint32_t page_size = uint32_t(1) << page_size_log2_;
+  kept_upload_ranges_.clear();
+  uint64_t dropped = 0;
+  for (const std::pair<uint32_t, uint32_t>& upload_range : upload_ranges_) {
+    for (uint32_t page = upload_range.first; page < upload_range.first + upload_range.second;
+         ++page) {
+      bool unchanged = false;
+      if ((system_page_flags_streamed_[page >> 6] >> (page & 63)) & 1) {
+        auto shadow_it = streamed_page_shadows_.find(page);
+        if (shadow_it != streamed_page_shadows_.end()) {
+          // Only the bytes the request covers matter.
+          uint32_t page_start = page << page_size_log2_;
+          uint32_t page_end = page_start + page_size;
+          const uint8_t* guest = memory().TranslatePhysical(page_start);
+          const uint8_t* shadow = shadow_it->second.get();
+          unchanged = true;
+          for (size_t i = 0; i < count && unchanged; ++i) {
+            uint32_t compare_start = std::max(ranges[i].first, page_start);
+            uint32_t compare_end = std::min(ranges[i].first + ranges[i].second, page_end);
+            if (compare_start < compare_end &&
+                std::memcmp(guest + (compare_start - page_start),
+                            shadow + (compare_start - page_start), compare_end - compare_start)) {
+              unchanged = false;
+            }
+          }
+        }
+      }
+      if (unchanged) {
+        ++dropped;
+        continue;
+      }
+      if (!kept_upload_ranges_.empty() &&
+          kept_upload_ranges_.back().first + kept_upload_ranges_.back().second == page) {
+        ++kept_upload_ranges_.back().second;
+      } else {
+        kept_upload_ranges_.emplace_back(page, 1);
+      }
+    }
+  }
+  g_streamed_skip_stats[0] += dropped;
+  upload_ranges_.swap(kept_upload_ranges_);
+}
+
+void SharedMemory::EraseStreamedPageShadows(uint32_t page_first, uint32_t page_last) {
+  if (streamed_page_shadows_.empty()) {
+    return;
+  }
+  if (page_last - page_first >= streamed_page_shadows_.size()) {
+    for (auto it = streamed_page_shadows_.begin(); it != streamed_page_shadows_.end();) {
+      if (it->first >= page_first && it->first <= page_last) {
+        it = streamed_page_shadows_.erase(it);
+      } else {
+        ++it;
+      }
+    }
+  } else {
+    for (uint32_t page = page_first; page <= page_last; ++page) {
+      streamed_page_shadows_.erase(page);
+    }
+  }
+}
+
+void SharedMemory::CopyPagesForUpload(uint32_t page_first, uint32_t page_count, uint8_t* dest) {
+  const uint8_t* source = memory().TranslatePhysical(page_first << page_size_log2_);
+  if (!upload_allow_streamed_ || !REXCVAR_GET(gpu_stream_skip_unchanged)) {
+    std::memcpy(dest, source, size_t(page_count) << page_size_log2_);
+    if (page_count) {
+      EraseStreamedPageShadows(page_first, page_first + page_count - 1);
+    }
+    return;
+  }
+  const size_t page_size = size_t(1) << page_size_log2_;
+  for (uint32_t i = 0; i < page_count; ++i) {
+    uint32_t page = page_first + i;
+    const uint8_t* page_source = source + (size_t(i) << page_size_log2_);
+    uint8_t* page_dest = dest + (size_t(i) << page_size_log2_);
+    // MakeRangeValid already ran, so this is whether the page was left
+    // streamed (not made valid) by this upload.
+    if ((system_page_flags_streamed_[page >> 6] >> (page & 63)) & 1) {
+      // Copy through the shadow so it has exactly the uploaded bytes even if a
+      // guest thread is writing the page right now.
+      std::unique_ptr<uint8_t[]>& shadow = streamed_page_shadows_[page];
+      if (!shadow) {
+        shadow = std::make_unique<uint8_t[]>(page_size);
+      }
+      std::memcpy(shadow.get(), page_source, page_size);
+      std::memcpy(page_dest, shadow.get(), page_size);
+    } else {
+      std::memcpy(page_dest, page_source, page_size);
+      if (!streamed_page_shadows_.empty()) {
+        streamed_page_shadows_.erase(page);
+      }
+    }
+  }
 }
 
 bool SharedMemory::RequestRange(uint32_t start, uint32_t length, bool allow_streamed) {

@@ -13,8 +13,8 @@ The Simpsons Game — Recompiled : Launcher  (v3)
   performance samples) + support bundles for bug reports.
 """
 
-import http.server
 import hashlib
+import http.server
 import json
 import os
 import platform
@@ -39,7 +39,7 @@ from pathlib import Path
 # at build time, so packaged builds always know exactly which release they
 # are (otherwise every launcher shipped inside vX.Y.Z.W would compare itself
 # against its own release and nag "update available" forever).
-VERSION = "0.0.6.1"
+VERSION = "0.0.6.2"
 
 FROZEN = getattr(sys, "frozen", False)
 if FROZEN:
@@ -62,6 +62,8 @@ CONFIG_JSON = LAUNCHER_DIR / "launcher.json"
 DEFAULT_CONFIG = {
     "github_repo": "YesterMester/TheSimpsonsGameRecomp",
     "diagnostics_enabled": False,
+    # Launcher colour theme: "system", "light" or "dark".
+    "ui_theme": "system",
     "engine": {
         "Linux": "simpsons/out/build/linux-amd64-relwithdebinfo/simpsons",
         "Windows": "simpsons/out/build/win-amd64-relwithdebinfo/simpsons.exe",
@@ -247,6 +249,11 @@ SETTINGS_SCHEMA = {
     "present_letterbox": ("bool", True, False),
     # quality
     "resolution_scale": ("int", 1, True),
+    # Shadow maps at the original resolution while the rest renders at 2x / 3x
+    # ("" = match the render resolution, "832:13" = the game's shadow map
+    # render target). Almost the same look, about 0.7 ms faster per frame at
+    # 2x on the Steam Deck.
+    "native_rt_original_resolution_targets": ("str", "", True),
     "anisotropic_override": ("int", 3, False),
     # How the guest image is scaled to the window: bilinear, AMD FidelityFX
     # FSR 1 (spatial upscaling with sharpening) or CAS (sharpening only).
@@ -260,6 +267,38 @@ SETTINGS_SCHEMA = {
     # input
     "mnk_mode": ("bool", False, True),
     "mnk_sensitivity": ("float", 1.0, False),
+    "mnk_invert_y": ("bool", False, False),
+    # Keyboard / mouse bindings: key names separated by commas (the runtime's
+    # names - see KEYBIND_DEFAULTS). Written only when changed, so new defaults
+    # still reach everyone else.
+    **{k: ("str", d, False) for k, d in {
+        "keybind_lstick_up": "W",
+        "keybind_lstick_down": "S",
+        "keybind_lstick_left": "A",
+        "keybind_lstick_right": "D",
+        "keybind_walk": "Control",
+        "keybind_a": "Space,Enter",
+        "keybind_x": "LMB",
+        "keybind_b": "RMB,Backspace",
+        "keybind_y": "E",
+        "keybind_left_trigger": "Shift",
+        "keybind_right_trigger": "F",
+        "keybind_left_shoulder": "Q",
+        "keybind_right_shoulder": "R",
+        "keybind_dpad_up": "1,Up",
+        "keybind_dpad_right": "2,Right",
+        "keybind_dpad_down": "3,Down",
+        "keybind_dpad_left": "4,Left",
+        "keybind_back": "Tab",
+        "keybind_start": "Escape",
+        "keybind_lstick_press": "C",
+        "keybind_rstick_press": "MMB",
+        # Camera on keys (#33), unbound unless chosen.
+        "keybind_rstick_up": "",
+        "keybind_rstick_down": "",
+        "keybind_rstick_left": "",
+        "keybind_rstick_right": "",
+    }.items()},
     # game
     "user_language": ("int", 1, True),
     # Always show subtitles, even in a new game's first cutscene (the engine
@@ -276,6 +315,10 @@ SETTINGS_SCHEMA = {
     "audio_mute": ("bool", False, False),
     "audio_maxqframes": ("int", 32, True),
 }
+
+# Settings left out of the config while at their default, so the runtime's own
+# default applies (and a later change of it reaches the player).
+OMIT_WHEN_DEFAULT = {k for k in SETTINGS_SCHEMA if k.startswith("keybind_")} | {"mnk_invert_y"}
 
 LOGO_MOVIES = ("ealogo", "ealogo_sd", "foxlogo", "foxlogo_sd",
                "gracielogo", "gracielogo_sd")
@@ -372,7 +415,9 @@ def write_settings(new_values):
         while lines and not lines[-1].strip():
             lines.pop()
     block = [SETTINGS_BEGIN]
-    for k, (typ, _d, _r) in SETTINGS_SCHEMA.items():
+    for k, (typ, default, _r) in SETTINGS_SCHEMA.items():
+        if k in OMIT_WHEN_DEFAULT and values[k] == default:
+            continue
         block.append(f"{k} = {_fmt(values[k], typ)}")
     allow_tearing = not values["vsync"]
     for k in DERIVED_KEYS:
@@ -517,6 +562,7 @@ def status():
     return {
         "version": VERSION,
         "platform": PLAT,
+        "ui_theme": CONFIG.get("ui_theme", "system"),
         "engine_ready": GAME_BIN.exists(),
         "engine_date": time.strftime("%Y-%m-%d %H:%M", time.localtime(GAME_BIN.stat().st_mtime)) if GAME_BIN.exists() else None,
         "gamedata_ready": gamedata_ok(),
@@ -589,11 +635,17 @@ def ffmpeg_path():
     return shutil.which("ffmpeg")
 
 
-# The .attempted marker is written after an artwork sweep so a machine where
-# every frame extraction fails (ffmpeg can't decode VP6, unreadable movies)
-# doesn't re-run the whole sweep on every boot - that is what produced the
-# endless window storm and the minute-long startup for players whose art
-# folder stayed empty. The UI's refresh action passes force=True to retry.
+# The marker is written after an artwork sweep so a machine where every frame
+# extraction fails (unreadable movies) doesn't re-run the whole sweep on every
+# boot - that is what produced the endless window storm and the minute-long
+# startup for players whose art folder stayed empty. The UI's refresh action
+# passes force=True to retry. Sweeps by launchers before 0.0.6.2 seeked the
+# input, which gave repeated frames and, with current ffmpeg builds (the one
+# bundled on Windows), nothing at all (#7); the marker's new name makes every
+# install redo its art once.
+ART_MARKER = ".attempted-v2"
+
+
 def generate_art(force=False):
     if not gamedata_ok() or not ffmpeg_path():
         return
@@ -606,10 +658,29 @@ def generate_art(force=False):
         art_state["running"] = False
 
 
+def _extract_frame(movie, ts, out):
+    """Writes the frame of a movie at ts seconds to out; True if a frame was
+    written. The seek is on the output side: VP6 can't start decoding in the
+    middle of a stream, so seeking the input decodes garbage frames, which
+    older ffmpeg turned into repeated pictures and current builds refuse with
+    "decode error rate exceeds maximum" (exit code 69). Decoding from the start
+    takes well under a second for these movies."""
+    try:
+        subprocess.run(
+            [ffmpeg_path(), "-loglevel", "error", "-y", "-i", str(movie), "-ss", ts,
+             "-frames:v", "1", "-q:v", "3", str(out)],
+            capture_output=True, timeout=60, **POPEN_NO_WINDOW)
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+    # The exit code isn't trusted either way: a frame that was written is good
+    # even when ffmpeg also reported decode errors elsewhere in the stream.
+    return out.exists() and out.stat().st_size > 0
+
+
 def _generate_art_locked(force):
     ART_DIR.mkdir(parents=True, exist_ok=True)
-    marker = ART_DIR / ".attempted"
-    if not force and (art_files() or marker.exists()):
+    marker = ART_DIR / ART_MARKER
+    if not force and marker.exists():
         return
     movie_dir = GAMEDATA / "movies" / "en"
     if not movie_dir.is_dir():
@@ -623,52 +694,57 @@ def _generate_art_locked(force):
     rest = sorted(p for p in movie_dir.glob("*.vp6")
                   if "_sd" not in p.name and "logo" not in p.name and p not in igc)
     candidates = igc + rest
-    for old_art in ART_DIR.glob("hero*.jpg"):
-        old_art.unlink(missing_ok=True)
-    for old_fb in ART_DIR.glob(".fb*.jpg"):
-        old_fb.unlink(missing_ok=True)
-    made = 0
+    # Frames are made under temporary names and only replace the old set at the
+    # end, so the launcher keeps showing art while a sweep runs.
+    for stale in list(ART_DIR.glob(".new*.jpg")) + list(ART_DIR.glob(".fb*.jpg")):
+        stale.unlink(missing_ok=True)
+    made = []
+    seen = set()
     attempts = 0
     for mv in candidates:
         # A hard ceiling on ffmpeg invocations, not just on successes: when
         # every extraction fails, the success counter never advances and the
         # loop would otherwise walk 3 timestamps x every movie on the disc.
-        if made >= 24 or attempts >= 48:
+        if len(made) >= 24 or attempts >= 48:
             break
-        for ts in ("2.0", "6.0", "12.0"):
-            if made >= 24 or attempts >= 48:
+        for ts in ("3.0", "8.0", "14.0"):
+            if len(made) >= 24 or attempts >= 48:
                 break
-            out = ART_DIR / f"hero{made}.jpg"
             attempts += 1
-            try:
-                r = subprocess.run(
-                    [ffmpeg_path(), "-loglevel", "error", "-y", "-ss", ts, "-i", str(mv),
-                     "-frames:v", "1", "-q:v", "3", str(out)],
-                    capture_output=True, timeout=60, **POPEN_NO_WINDOW)
-                rc = r.returncode
-            except (subprocess.TimeoutExpired, OSError):
-                rc = -1
+            out = ART_DIR / f".new{attempts}.jpg"
+            if not _extract_frame(mv, ts, out):
+                out.unlink(missing_ok=True)
+                continue
+            data = out.read_bytes()
+            digest = hashlib.sha1(data).hexdigest()
+            if digest in seen:
+                out.unlink(missing_ok=True)
+                continue
+            seen.add(digest)
             # size threshold filters black/flat frames
-            if rc == 0 and out.exists() and out.stat().st_size > 45000:
-                made += 1
-            elif rc == 0 and out.exists() and out.stat().st_size > 12000:
+            if len(data) > 45000:
+                made.append(out)
+            elif len(data) > 12000:
                 # Decoded fine but too small for the main cut - keep as a
                 # fallback so a dark-ish set of movies still yields art
                 # instead of a permanently empty folder.
                 out.rename(ART_DIR / f".fb{attempts}.jpg")
             else:
                 out.unlink(missing_ok=True)
-    if made == 0:
+    if not made:
         # Promote the largest decodable frames rather than leaving nothing.
-        fallbacks = sorted(ART_DIR.glob(".fb*.jpg"),
-                           key=lambda p: p.stat().st_size, reverse=True)
-        for fb in fallbacks[:8]:
-            fb.rename(ART_DIR / f"hero{made}.jpg")
-            made += 1
-    for leftover in ART_DIR.glob(".fb*.jpg"):
+        made = sorted(ART_DIR.glob(".fb*.jpg"), key=lambda p: p.stat().st_size,
+                      reverse=True)[:8]
+    if made:
+        for old_art in ART_DIR.glob("hero*.jpg"):
+            old_art.unlink(missing_ok=True)
+        for i, frame in enumerate(made):
+            frame.replace(ART_DIR / f"hero{i}.jpg")
+    for leftover in list(ART_DIR.glob(".new*.jpg")) + list(ART_DIR.glob(".fb*.jpg")):
         leftover.unlink(missing_ok=True)
     try:
-        marker.write_text(f"made={made} attempts={attempts}\n", encoding="utf-8")
+        (ART_DIR / ".attempted").unlink(missing_ok=True)
+        marker.write_text(f"made={len(made)} attempts={attempts}\n", encoding="utf-8")
     except OSError:
         pass
 
@@ -1899,11 +1975,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
         path = parsed.path
         if path in ("/", "/index.html"):
             html = (UI_DIR / "index.html").read_text(encoding="utf-8").replace("__TOKEN__", TOKEN)
+            html = html.replace("__THEME__", CONFIG.get("ui_theme", "system"))
             return self._send(200, html.encode(), "text/html; charset=utf-8")
+        if path == "/api/ping":
+            return self._send(200, {"app": "simpsons-launcher", "version": VERSION})
         if path == "/api/status":
             return self._send(200, status())
         if path == "/api/settings":
             return self._send(200, {"values": read_settings(),
+                                    "defaults": {k: v[1] for k, v in SETTINGS_SCHEMA.items()},
                                     "restart_needed": [k for k, v in SETTINGS_SCHEMA.items() if v[2]]})
         if path == "/api/log":
             return self._send(200, {"lines": tail_game_log()})
@@ -1920,6 +2000,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             f = LAUNCHER_DIR / "icon.png"
             if f.is_file():
                 return self._send(200, f.read_bytes(), "image/png")
+        if path.startswith("/fonts/"):
+            f = (UI_DIR / "fonts" / os.path.basename(path)).resolve()
+            if f.is_file() and f.parent == (UI_DIR / "fonts").resolve() and f.suffix == ".ttf":
+                return self._send(200, f.read_bytes(), "font/ttf")
         return self._send(404, {"error": "not found"})
 
     def do_POST(self):
@@ -1942,6 +2026,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
             threading.Thread(target=run_install, args=(body.get("iso_path", ""),),
                              daemon=True).start()
             return self._send(200, {"ok": True})
+        if path == "/api/ui-theme":
+            theme = body.get("theme")
+            if theme in ("system", "light", "dark"):
+                CONFIG["ui_theme"] = theme
+                save_config()
+            return self._send(200, {"ok": True, "theme": CONFIG.get("ui_theme", "system")})
         if path == "/api/regen-art":
             threading.Thread(target=generate_art, kwargs={"force": True}, daemon=True).start()
             return self._send(200, {"ok": True})
@@ -1981,6 +2071,64 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
 # --------------------------------------------------------------- frontend
 
+class LauncherServer(http.server.ThreadingHTTPServer):
+    # The window's browser engine opens several connections at once, and
+    # Windows refuses connections beyond the listen backlog outright (the
+    # default here is 5) instead of letting them wait.
+    request_queue_size = 64
+    # SO_REUSEADDR lets a Windows socket bind a port another process is still
+    # listening on, so a stuck earlier launcher could end up receiving this
+    # one's connections (#37). There, take the port exclusively or move on.
+    allow_reuse_address = PLAT != "Windows"
+
+    def server_bind(self):
+        if PLAT == "Windows" and hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
+
+
+LOG_FILE = LAUNCHER_DIR / "launcher.log"
+
+
+def startup_log(message):
+    """Appends a line to launcher.log (started fresh on every launch), which
+    shows where a launcher that won't open got stuck."""
+    try:
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(time.strftime("%Y-%m-%d %H:%M:%S ") + message + "\n")
+    except OSError:
+        pass
+
+
+def wait_for_server(url, seconds=10.0):
+    """True once the launcher's own server answers at url."""
+    deadline = time.time() + seconds
+    last_error = None
+    while time.time() < deadline:
+        try:
+            # No proxy: a system proxy must not get between the window and
+            # the launcher on this computer.
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+            with opener.open(url + "api/ping", timeout=2) as r:
+                if json.loads(r.read()).get("app") == "simpsons-launcher":
+                    return True
+        except Exception as e:  # noqa: BLE001
+            last_error = e
+        time.sleep(0.2)
+    startup_log(f"the launcher's server at {url} did not answer: {last_error!r}")
+    return False
+
+
+def error_page(url):
+    return f"""<html><body style="font-family:sans-serif;background:#fff6d5;color:#222;padding:40px">
+<h2>The launcher couldn't show its window</h2>
+<p>Its built-in server at <code>{url}</code> isn't answering. Security software that blocks
+programs from talking to this computer (127.0.0.1) can cause this.</p>
+<p>Try closing every copy of the launcher and starting it again, or open
+<a href="{url}">{url}</a> in your web browser. <code>launcher.log</code> next to the launcher
+says where it got stuck; please attach it to a report on GitHub.</p></body></html>"""
+
+
 def run_native(url):
     """Native desktop window via PySide6 QWebEngineView."""
     # HAND PATCH: a Steam shortcut that needs a compatibility tool (e.g.
@@ -1994,7 +2142,7 @@ def run_native(url):
     if vendor_dir.is_dir() and str(vendor_dir) not in sys.path:
         sys.path.insert(0, str(vendor_dir))
 
-    from PySide6.QtCore import QUrl
+    from PySide6.QtCore import QTimer, QUrl
     from PySide6.QtGui import QIcon
     from PySide6.QtWebEngineWidgets import QWebEngineView
     from PySide6.QtWidgets import QApplication, QMainWindow
@@ -2006,6 +2154,22 @@ def run_native(url):
     if icon.exists():
         win.setWindowIcon(QIcon(str(icon)))
     view = QWebEngineView()
+    # A page that fails to load (the server still starting, a connection
+    # refused) is retried before giving up with an explanation instead of the
+    # browser engine's bare "site can't be reached" page (#37).
+    retries = {"left": 20}
+
+    def loaded(ok):
+        if ok:
+            return
+        if retries["left"] > 0:
+            retries["left"] -= 1
+            QTimer.singleShot(500, lambda: view.setUrl(QUrl(url)))
+        else:
+            startup_log(f"the window could not load {url}")
+            view.setHtml(error_page(url))
+
+    view.loadFinished.connect(loaded)
     view.setUrl(QUrl(url))
     win.setCentralWidget(view)
     win.resize(1180, 800)
@@ -2055,24 +2219,43 @@ def main():
         if game_proc:
             game_proc.wait()
         return
+    try:
+        LOG_FILE.write_text("", encoding="utf-8")
+    except OSError:
+        pass
+    startup_log(f"launcher {VERSION} on {PLAT} {platform.release()}, frozen={FROZEN}")
     # In the background: a full artwork sweep can take a minute on a slow
     # disk, and players were staring at nothing until it finished.
     threading.Thread(target=generate_art, daemon=True).start()
-    install_desktop_entry()
+    try:
+        install_desktop_entry()
+    except Exception as e:  # noqa: BLE001
+        startup_log(f"desktop entry: {e!r}")
     server = None
     for cand in range(PORT, PORT + 20):
         try:
-            server = http.server.ThreadingHTTPServer(("127.0.0.1", cand), Handler)
+            server = LauncherServer(("127.0.0.1", cand), Handler)
             break
-        except OSError:
+        except OSError as e:
+            startup_log(f"port {cand} unavailable: {e}")
             continue
     if server is None:
-        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        server = LauncherServer(("127.0.0.1", 0), Handler)
     port = server.server_address[1]
     url = f"http://127.0.0.1:{port}/"
     print(f"Simpsons Launcher v{VERSION}: {url}")
-    threading.Thread(target=server.serve_forever, daemon=True).start()
+    startup_log(f"serving {url}")
+
+    def serve():
+        try:
+            server.serve_forever()
+        except Exception as e:  # noqa: BLE001
+            startup_log(f"server stopped: {e!r}")
+
+    threading.Thread(target=serve, daemon=True).start()
     threading.Thread(target=check_updates, daemon=True).start()
+    if wait_for_server(url):
+        startup_log("server answers")
 
     if "--no-browser" in sys.argv:
         try:
@@ -2091,6 +2274,7 @@ def main():
             (LAUNCHER_DIR / "launcher_native_error.log").write_text(tb)
         except Exception:
             pass
+        startup_log("native window unavailable, opening a browser (launcher_native_error.log)")
         print("(native window unavailable; opening in your browser instead — "
               "details in launcher_native_error.log)")
         opened = False

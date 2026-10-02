@@ -143,9 +143,26 @@ static const std::unordered_map<std::string, VirtualKey> kKeyNames = {
     {"MMB", VirtualKey::kMButton},
 };
 
+// Accepted when parsing only, so VirtualKeyToString keeps one name per key.
+// The mouse wheel uses virtual key codes Windows leaves unassigned; it's
+// "pressed" for a moment per detent (the keyboard / mouse input driver).
+static const std::unordered_map<std::string, VirtualKey> kKeyNameAliases = {
+    {"Enter", VirtualKey::kReturn},
+    {"Ctrl", VirtualKey::kControl},
+    {"Esc", VirtualKey::kEscape},
+    {"Mouse4", VirtualKey::kXButton1},
+    {"Mouse5", VirtualKey::kXButton2},
+    {"WheelUp", static_cast<VirtualKey>(0x0A)},
+    {"WheelDown", static_cast<VirtualKey>(0x0B)},
+};
+
 VirtualKey ParseVirtualKey(std::string_view name) {
   auto it = kKeyNames.find(std::string(name));
-  return (it != kKeyNames.end()) ? it->second : VirtualKey::kNone;
+  if (it != kKeyNames.end()) {
+    return it->second;
+  }
+  auto alias_it = kKeyNameAliases.find(std::string(name));
+  return (alias_it != kKeyNameAliases.end()) ? alias_it->second : VirtualKey::kNone;
 }
 
 std::string VirtualKeyToString(VirtualKey vk) {

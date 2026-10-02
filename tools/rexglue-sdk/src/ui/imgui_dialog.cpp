@@ -12,11 +12,30 @@
 #include <rex/assert.h>
 #include <rex/ui/imgui_dialog.h>
 #include <rex/ui/imgui_drawer.h>
+#include <rex/ui/overlay_input.h>
 
 #include <imgui.h>
 
+#include <atomic>
+
 namespace rex {
 namespace ui {
+
+namespace {
+std::atomic<int> overlay_input_count{0};
+}  // namespace
+
+void AcquireOverlayInput() {
+  overlay_input_count.fetch_add(1, std::memory_order_relaxed);
+}
+
+void ReleaseOverlayInput() {
+  overlay_input_count.fetch_sub(1, std::memory_order_relaxed);
+}
+
+bool IsOverlayInputActive() {
+  return overlay_input_count.load(std::memory_order_relaxed) > 0;
+}
 
 ImGuiDialog::ImGuiDialog(ImGuiDrawer* imgui_drawer) : imgui_drawer_(imgui_drawer) {
   imgui_drawer_->AddDialog(this);
