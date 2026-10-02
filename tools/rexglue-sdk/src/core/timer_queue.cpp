@@ -10,12 +10,14 @@
  */
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <forward_list>
 
+#include <disruptorplus/spin_wait_strategy.hpp>
 #include <disruptorplus/multi_threaded_claim_strategy.hpp>
 #include <disruptorplus/ring_buffer.hpp>
 #include <disruptorplus/sequence_barrier.hpp>
-#include <disruptorplus/spin_wait_strategy.hpp>
 
 #include <rex/assert.h>
 #include <rex/thread.h>
@@ -66,10 +68,13 @@ class TimerQueue {
 
     while (!stop_token.stop_requested()) {
       {
-        // Consume new wait items and add them to sorted wait queue
+        // Consume new wait items and add them to sorted wait queue (a capped
+        // wait while there is no timer, as some standard libraries mishandle
+        // time_point::max()).
         dp::sequence_t available = claim_strategy_.wait_until_published(
             next_sequence, next_sequence - 1,
-            wait_queue_.empty() ? clock::time_point::max() : wait_queue_.front()->due_);
+            wait_queue_.empty() ? clock::now() + std::chrono::seconds(1)
+                                : wait_queue_.front()->due_);
 
         // Check for timeout
         if (available != next_sequence - 1) {
@@ -98,6 +103,9 @@ class TimerQueue {
                                                         std::memory_order_acq_rel)) {
             // Possibility to dispatch to a thread pool here
             assert_not_null(wait_item->callback_);
+            if (stats_enabled_) {
+              RecordCallback(wait_item.get());
+            }
             wait_item->callback_(wait_item->userdata_);
 
             if (wait_item->interval_ != clock::duration::zero() &&
@@ -138,10 +146,44 @@ class TimerQueue {
 
   std::jthread::id dispatch_thread_id() const { return dispatch_thread_.get_id(); }
 
+  // Debugging (REX_TIMER_STATS): callbacks per second, split into the 1 ms
+  // timestamp timer and everything else, and how late they run.
+  bool stats_enabled_ = std::getenv("REX_TIMER_STATS") != nullptr;
+  uint64_t stats_count_1ms_ = 0, stats_count_other_ = 0;
+  double stats_late_sum_us_ = 0.0, stats_late_max_us_ = 0.0;
+  clock::time_point stats_start_ = clock::now();
+  void RecordCallback(WaitItem* item) {
+    auto now = clock::now();
+    double late_us = std::chrono::duration<double, std::micro>(now - item->due_).count();
+    stats_late_sum_us_ += late_us;
+    stats_late_max_us_ = std::max(stats_late_max_us_, late_us);
+    if (item->interval_ == std::chrono::milliseconds(1)) {
+      ++stats_count_1ms_;
+    } else {
+      ++stats_count_other_;
+    }
+    double elapsed = std::chrono::duration<double>(now - stats_start_).count();
+    if (elapsed >= 5.0) {
+      uint64_t total = stats_count_1ms_ + stats_count_other_;
+      std::fprintf(stderr, "[timer-stats] %.0f/s 1ms timer, %.1f/s other, late avg %.0f us max %.0f us\n",
+                   stats_count_1ms_ / elapsed, stats_count_other_ / elapsed,
+                   total ? stats_late_sum_us_ / total : 0.0, stats_late_max_us_);
+      stats_count_1ms_ = stats_count_other_ = 0;
+      stats_late_sum_us_ = stats_late_max_us_ = 0.0;
+      stats_start_ = now;
+    }
+  }
+
  private:
   // This ring buffer will be used to introduce timers queued by the public API
   static constexpr size_t kWaitCount = 512;
   dp::ring_buffer<std::shared_ptr<WaitItem>> buffer_;
+  // Spinning costs about half a CPU core (the 1 ms timestamp timer is always
+  // due soon), but a blocking wait silences this game's audio: callbacks then
+  // run about 60 us late instead of about 0.5 ms, so the game's ~5 ms one-shot
+  // timer, which it re-arms itself, fires about 198 times a second instead of
+  // close to the audio frame rate (48000 / 256 = 187.5), and its sound engine
+  // outputs silence. REX_TIMER_STATS shows the rates.
   dp::spin_wait_strategy wait_strategy_;
   dp::multi_threaded_claim_strategy<dp::spin_wait_strategy> claim_strategy_;
   dp::sequence_barrier<dp::spin_wait_strategy> consumed_;
