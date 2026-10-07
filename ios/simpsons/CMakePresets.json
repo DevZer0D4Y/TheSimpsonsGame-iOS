@@ -1,0 +1,63 @@
+{
+    "version": 6,
+    "cmakeMinimumRequired": {
+        "major": 3,
+        "minor": 25,
+        "patch": 0
+    },
+    "configurePresets": [
+        {
+            "name": "ios-arm64-release",
+            "displayName": "iOS arm64 Release (device)",
+            "description": "iOS arm64 Release using REXGLUE_IOS_SDK; included generated sources require no game data or host codegen tool",
+            "generator": "Ninja",
+            "binaryDir": "${sourceDir}/out/build/${presetName}",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release",
+                "CMAKE_SYSTEM_NAME": "iOS",
+                "CMAKE_OSX_ARCHITECTURES": "arm64",
+                "CMAKE_OSX_SYSROOT": "iphoneos",
+                "CMAKE_OSX_DEPLOYMENT_TARGET": "16.0",
+                "CMAKE_PREFIX_PATH": "$env{REXGLUE_IOS_SDK}",
+                "rexglue_DIR": "$env{REXGLUE_IOS_SDK}/lib/cmake/rexglue",
+                "CMAKE_FIND_ROOT_PATH_MODE_PACKAGE": "BOTH",
+                "REXGLUE_HOST_TOOL": "$env{REXGLUE_HOST_TOOL}"
+            },
+            "condition": {
+                "type": "equals",
+                "lhs": "${hostSystemName}",
+                "rhs": "Darwin"
+            }
+        },
+        {
+            "name": "mac-arm64-release",
+            "displayName": "macOS arm64 Release (test build of the iOS port)",
+            "description": "macOS arm64 Release using REXGLUE_MAC_SDK; optional host tool only for code regeneration",
+            "generator": "Ninja",
+            "binaryDir": "${sourceDir}/out/build/${presetName}",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release",
+                "CMAKE_OSX_ARCHITECTURES": "arm64",
+                "CMAKE_OSX_DEPLOYMENT_TARGET": "26.0",
+                "CMAKE_PREFIX_PATH": "$env{REXGLUE_MAC_SDK}",
+                "rexglue_DIR": "$env{REXGLUE_MAC_SDK}/lib/cmake/rexglue",
+                "REXGLUE_HOST_TOOL": "$env{REXGLUE_HOST_TOOL}"
+            },
+            "condition": {
+                "type": "equals",
+                "lhs": "${hostSystemName}",
+                "rhs": "Darwin"
+            }
+        }
+    ],
+    "buildPresets": [
+        {
+            "name": "ios-arm64-release",
+            "configurePreset": "ios-arm64-release"
+        },
+        {
+            "name": "mac-arm64-release",
+            "configurePreset": "mac-arm64-release"
+        }
+    ]
+}

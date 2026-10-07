@@ -1,0 +1,6 @@
+/avconfig.h
+/ffversion.h
+
+# Required preconfigured headers for the vendored runtime build.
+!/avconfig.h
+!/ffversion.h

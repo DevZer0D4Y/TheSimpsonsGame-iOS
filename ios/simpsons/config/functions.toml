@@ -1,0 +1,265 @@
+# Functions the analyzer does not find on its own.
+#
+# Two groups. Upstream found the first by hand ("Unresolved call" stubs and
+# boot crashes); they are copied from its functions_patch.toml, minus its
+# "mega pass". That pass scanned data sections for code addresses. With this
+# SDK's analyzer nearly all of them land inside known functions: SEH
+# __try/__except scope addresses and switch-case labels. Declaring them split
+# their functions and left ~3,400 REX_FATAL stubs, against 3 without them.
+#
+# The second group is every function upstream recompiled that lies wholly
+# outside this analyzer's coverage: mostly this-adjusting vtable thunks
+# ("addi r3,r3,-N; b target") and small virtuals, reachable only through
+# vtables, so nothing branches to them.
+[functions]
+# Boot-path crash: global-constructor/init-list callback invoked during xstart.
+# Sits in the gap between discovered funcs 0x82A715D0 and 0x82A718A0.
+"0x82A71810" = {}
+# Further constructor/callback targets found via LD_PRELOAD enumeration
+# (libtrap.so): indirect-call targets the analyzer missed.
+"0x823F52B8" = {}
+"0x828332D0" = {}
+
+# Allocator-helper cluster + misc: direct-call targets found via
+# 'Unresolved call' fatal stubs once the game reached the main menu.
+"0x8269D52C" = {}
+"0x82782F90" = {}
+"0x82783258" = {}
+"0x82783400" = {}
+"0x82783740" = {}
+"0x82783918" = {}
+"0x82783B70" = {}
+"0x82783D18" = {}
+"0x82783F50" = {}
+"0x8296B118" = {}
+"0x82C42EB8" = {}
+"0x82C462F0" = {}
+
+# --- vtable-only functions outside the analyzer's coverage (from upstream) ---
+# Upstream hand-wrote the first two (vtable thunk pair, first hit playing as Lisa).
+"0x8297AEB0" = {}
+"0x8297AEC8" = {}
+"0x82267E20" = {}
+"0x8226A378" = {}
+"0x8226A390" = {}
+"0x82275CA8" = {}
+"0x82275D10" = {}
+"0x82275E18" = {}
+"0x822935D8" = {}
+"0x82293650" = {}
+"0x82293668" = {}
+"0x82293670" = {}
+"0x82293678" = {}
+"0x822936C0" = {}
+"0x822936D8" = {}
+"0x822936F0" = {}
+"0x82294510" = {}
+"0x82294520" = {}
+"0x822A34C0" = {}
+"0x822A34E8" = {}
+"0x822A3550" = {}
+"0x822A3590" = {}
+"0x822AF148" = {}
+"0x822AF180" = {}
+"0x822B1D90" = {}
+"0x822B1DA8" = {}
+"0x822B21C8" = {}
+"0x822B21E0" = {}
+"0x822B21F8" = {}
+"0x822B2210" = {}
+"0x822C42B0" = {}
+"0x822C84F0" = {}
+"0x822C8508" = {}
+"0x822D5A88" = {}
+"0x822E9188" = {}
+"0x822E91A0" = {}
+"0x822E91B8" = {}
+"0x822E91C0" = {}
+"0x822E91C8" = {}
+"0x822E9200" = {}
+"0x822E9250" = {}
+"0x822E9280" = {}
+"0x822E92A8" = {}
+"0x822E92C0" = {}
+"0x822E9328" = {}
+"0x822E9340" = {}
+"0x822E9358" = {}
+"0x822E9390" = {}
+"0x822E9398" = {}
+"0x822E93B0" = {}
+"0x822E9818" = {}
+"0x822E9830" = {}
+"0x822E9858" = {}
+"0x822E9878" = {}
+"0x822E9890" = {}
+"0x822E98A8" = {}
+"0x822EDB78" = {}
+"0x822F0DE8" = {}
+"0x822F0E10" = {}
+"0x822F0E38" = {}
+"0x822F0EF0" = {}
+"0x822F6F18" = {}
+"0x823037C0" = {}
+"0x823037E8" = {}
+"0x8230F4D8" = {}
+"0x8230F928" = {}
+"0x8230FFA0" = {}
+"0x82313D40" = {}
+"0x82317E70" = {}
+"0x82317EB8" = {}
+"0x82317EE8" = {}
+"0x82317F08" = {}
+"0x82317F40" = {}
+"0x82317F70" = {}
+"0x82317F98" = {}
+"0x82348600" = {}
+"0x8234AB50" = {}
+"0x823C3558" = {}
+"0x823C3560" = {}
+"0x8243229C" = {}
+"0x8243519C" = {}
+"0x82436CD8" = {}
+"0x824383E0" = {}
+"0x824389B8" = {}
+"0x824390D8" = {}
+"0x82439250" = {}
+"0x824C40F0" = {}
+"0x824C4100" = {}
+"0x824C4110" = {}
+"0x824C4538" = {}
+"0x824C4560" = {}
+"0x824C4588" = {}
+"0x824C45B0" = {}
+"0x824C49E0" = {}
+"0x824C4A00" = {}
+"0x824C4A28" = {}
+"0x824D0050" = {}
+"0x8251C698" = {}
+"0x8253F460" = {}
+"0x82541C5C" = {}
+"0x82541C94" = {}
+"0x825425EC" = {}
+"0x82542640" = {}
+"0x825428A4" = {}
+"0x825428F0" = {}
+"0x82562B34" = {}
+"0x826101E0" = {}
+"0x82610230" = {}
+"0x826103B0" = {}
+"0x82647F28" = {}
+"0x82676038" = {}
+"0x8268E270" = {}
+"0x8268E368" = {}
+"0x8268E378" = {}
+"0x82697218" = {}
+"0x82697E28" = {}
+"0x826DB940" = {}
+"0x826E0BE8" = {}
+"0x826E0C00" = {}
+"0x826E0C18" = {}
+"0x8272B900" = {}
+"0x8272B948" = {}
+"0x827757E8" = {}
+"0x827FB658" = {}
+"0x82863A58" = {}
+"0x82863A78" = {}
+"0x82863A98" = {}
+"0x82863AB8" = {}
+"0x82863AD8" = {}
+"0x82863AF8" = {}
+"0x82863B18" = {}
+"0x82863B38" = {}
+"0x82863B58" = {}
+"0x82863B78" = {}
+"0x82863B98" = {}
+"0x82863BB8" = {}
+"0x82863BD8" = {}
+"0x82863BF8" = {}
+"0x82863C18" = {}
+"0x82863C38" = {}
+"0x82877170" = {}
+"0x82877208" = {}
+"0x82877228" = {}
+"0x8287D350" = {}
+"0x8287D370" = {}
+"0x8288E130" = {}
+"0x8288E148" = {}
+"0x8288E160" = {}
+"0x828B7EB8" = {}
+"0x828BABC8" = {}
+"0x828EBF60" = {}
+"0x82935E68" = {}
+"0x8296B3A8" = {}
+"0x8296B3B8" = {}
+"0x8296B3C8" = {}
+"0x82970F20" = {}
+"0x82978560" = {}
+"0x82978578" = {}
+"0x82978DD8" = {}
+"0x82978DF0" = {}
+"0x82985588" = {}
+"0x82994C00" = {}
+"0x829A41E0" = {}
+"0x829F6CF8" = {}
+"0x82A0E1B8" = {}
+"0x82A50D58" = {}
+"0x82A55744" = {}
+"0x82A55884" = {}
+"0x82A5612C" = {}
+"0x82A67888" = {}
+"0x82B1C250" = {}
+"0x82B1C290" = {}
+"0x82B1C2A8" = {}
+"0x82B1C2C0" = {}
+"0x82B1C2D8" = {}
+"0x82BC9C40" = {}
+"0x82BE26C0" = {}
+"0x82BF1438" = {}
+"0x82BF1440" = {}
+"0x82BF1448" = {}
+"0x82BF1450" = {}
+"0x82BF1458" = {}
+"0x82BF1888" = {}
+"0x82BF1890" = {}
+"0x82BF1898" = {}
+"0x82BF18A0" = {}
+"0x82BFF440" = {}
+"0x82BFF450" = {}
+"0x82BFF458" = {}
+"0x82BFF460" = {}
+"0x82C3CA28" = {}
+"0x82C3CA30" = {}
+"0x82C3DB88" = {}
+"0x82C3DB90" = {}
+"0x82C43CC8" = {}
+"0x82C43CD0" = {}
+"0x82C43CE8" = {}
+"0x82C43CF8" = {}
+"0x82C43D10" = {}
+"0x82C43D18" = {}
+"0x82C43D20" = {}
+"0x82C45250" = {}
+"0x82C466C8" = {}
+"0x82C466D0" = {}
+"0x82C466D8" = {}
+"0x82C466F0" = {}
+"0x82C46700" = {}
+"0x82C46708" = {}
+"0x82C46720" = {}
+"0x82C46728" = {}
+"0x82C46730" = {}
+"0x82C46738" = {}
+"0x82C46750" = {}
+"0x82C520E8" = {}
+"0x82C6D7D8" = {}
+"0x82C6D820" = {}
+"0x82C7AEB8" = {}
+"0x82C90018" = {}
+"0x82C90038" = {}
+"0x82CB7868" = {}
+"0x82CB7928" = {}
+
+# Left out on purpose: 0x824B14D8, 0x82A54CD4, 0x82A54E48. Upstream recompiled
+# them as functions, but they are SEH funclets: __except/__finally bodies that
+# run on their parent's frame (r31) and sit in a hole in the parent's code.
+# As functions they split the parent and add unresolved-branch stubs.

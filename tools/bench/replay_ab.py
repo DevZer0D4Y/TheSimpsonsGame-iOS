@@ -23,7 +23,7 @@ import zlib
 
 import numpy as np
 
-DEFAULT_REPLAYER = "/home/deck/simpsons-test/trace_reference_dev"
+DEFAULT_REPLAYER = os.environ.get("TRACE_REPLAYER", "trace_reference_dev")
 
 
 def read_ppm(path):

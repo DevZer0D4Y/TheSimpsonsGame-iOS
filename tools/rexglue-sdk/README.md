@@ -58,3 +58,7 @@ The list above is not exhaustive. Thanks to everyone in the ReXGlue community wh
 - [XenonRecomp](https://github.com/hedge-dev/XenonRecomp) - For pioneering the modern static recompilation approach for Xbox 360. A lot of the codegen analysis logic and instruction translations are based on their work. Thank you!
 - [rexdex's recompiler](https://github.com/rexdex/recompiler) - The OG static recompiler for Xbox 360. 
 - Many others in the Xbox 360 homebrew and modding communities whose work and research have contributed to the collective knowledge that makes projects like this possible.
+
+## PowerPC assembly tests in this source distribution
+
+Prebuilt development executables are excluded. To run the optional PowerPC assembly tests, install the `powerpc-none-elf` binutils tools in `tools/binutils/` relative to this SDK. The test pipeline requires `powerpc-none-elf-as`, `powerpc-none-elf-ld` and `powerpc-none-elf-nm` (with `.exe` on Windows). These tools are not required to build the iOS app from the included generated C++ source.

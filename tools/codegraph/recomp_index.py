@@ -34,7 +34,8 @@ import sqlite3
 import sys
 import time
 
-DEFAULT_GENERATED_DIR = "/home/deck/simpsons-recomp/simpsons/generated/default"
+DEFAULT_GENERATED_DIR = os.path.abspath(os.path.join(
+    os.path.dirname(__file__), "../../simpsons/generated/default"))
 DEFAULT_DB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "recomp_index.sqlite")
 
 FUNC_DEF_RE = re.compile(r"^(?:DEFINE_REX_FUNC|PPC_FUNC_IMPL)\((?:__imp__)?(sub_[0-9A-Fa-f]{8})\)\s*\{")

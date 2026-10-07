@@ -1,0 +1,8 @@
+/protocol_list.c
+/muxer_list.c
+/demuxer_list.c
+
+# Preconfigured format/protocol tables retained with the source fork.
+!/demuxer_list.c
+!/muxer_list.c
+!/protocol_list.c

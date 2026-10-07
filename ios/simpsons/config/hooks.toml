@@ -1,0 +1,26 @@
+# Mid-function hooks. The hook bodies live in src/fps_unlock.cpp.
+
+# 60 FPS mode, part 1: the frame scheduler's swap interval. sub_82867A48 passes
+# "li r4,2" (wait two vblanks per frame) to sub_82718D48. The community 60 FPS
+# patch for this title (xenia-canary game-patches, title 45410809, by tronuo)
+# makes it 1; upstream hand-edited that into its generated code.
+[[midasm_hook]]
+name = "SimpsonsSwapIntervalHook"
+address = 0x82867A70
+registers = ["r4"]
+after_instruction = true
+
+# 60 FPS mode, part 2 (tronuo's Havok fix): sub_827A55C0 steps the Havok world
+# with a fixed 1/30 s timestep loaded from 0x82159238 ("lfs f0/f1,-28104(r30)").
+# At 60 FPS that step must be 1/60 s or physics runs at double speed.
+[[midasm_hook]]
+name = "SimpsonsHavokCompareStepHook"
+address = 0x827A563C
+registers = ["f0"]
+after_instruction = true
+
+[[midasm_hook]]
+name = "SimpsonsHavokStepHook"
+address = 0x827A5660
+registers = ["f1"]
+after_instruction = true
