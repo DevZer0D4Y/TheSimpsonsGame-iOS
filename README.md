@@ -6,6 +6,14 @@ A native iPhone and iPad port of **The Simpsons Game (Xbox 360, 2007)**, built b
 
 **[Releases](https://github.com/DevZer0D4Y/TheSimpsonsGame-iOS/releases)** · [Changelog](CHANGELOG.md) · [Detailed setup guide](ios/simpsons/README.md)
 
+If you want to support me and remain up-to-date about this and other projects, you can in different ways:
+
+Ko-Fi: https://ko-fi.com/dev_zer0
+
+Discord: https://discord.gg/uFChheZEWX
+
+YouTube: https://www.youtube.com/@develop_erZ
+
 ## Features
 
 - Direct Xbox 360 ISO/XISO loading, without extracting the disc.
