@@ -1,0 +1,25 @@
+# The Simpsons Game (Xbox 360, USA, title 45410809) - iOS build of
+# YesterMester/TheSimpsonsGameRecomp on the iOS-ported ReXGlue SDK.
+
+[project]
+name = "simpsons"
+sdk_version = "0.10.0"
+game_root = "../game_xex"
+
+[entrypoint]
+file_path = "../game_xex/default.xex"
+out_directory_path = "generated/default"
+
+# The CRT's setjmp/longjmp thunks. Lua (luaD_rawrunprotected) protects every
+# script call with them. Recompiled as plain calls they dispatch through CRT
+# vectors nothing installs, so setjmp returned garbage and every lua_State was
+# left half-built - upstream's boot blocker, which it fixed by hand-editing each
+# call site. Listing them here makes the codegen emit ppc_setjmp/ppc_longjmp.
+#   0x82A43E50  setjmp(jmp_buf)
+#   0x82A43D30  longjmp(jmp_buf, value)
+setjmp_address = 0x82A43E50
+longjmp_address = 0x82A43D30
+
+#   functions.toml  functions the analyzer misses (see the file)
+#   hooks.toml      mid-function hooks (60 FPS mode, Havok step)
+includes = ["config/functions.toml", "config/hooks.toml"]

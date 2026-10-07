@@ -6,6 +6,7 @@
 #include <dlfcn.h>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <unordered_set>
 #include <mutex>
 
@@ -23,7 +24,8 @@ static std::mutex g_mtx;
 static void init_real() {
   g_real = (resolve_fn)dlsym(RTLD_NEXT, "_ZN3rex7runtime23ResolveIndirectFunctionEj");
   if (g_real) g_trap = g_real(0x1u);   // bogus addr -> &InvalidFunctionTrap
-  g_log = fopen("/home/deck/simpsons-recomp/missing_funcs.log", "w");
+  const char* log_path = std::getenv("REX_MISSING_FUNCS_LOG");
+  g_log = fopen(log_path && *log_path ? log_path : "missing_funcs.log", "w");
 }
 
 namespace rex { namespace runtime {

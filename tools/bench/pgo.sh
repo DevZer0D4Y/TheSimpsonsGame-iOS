@@ -24,7 +24,6 @@ PROFDIR="$ROOT/tools/bench/pgo-profiles"
 PROFDATA="$PROFDIR/game.profdata"
 LAUNCHER_ENV="$ROOT/launcher/launcher-env.json"
 export PATH="$ROOT/tools/clang20/bin:$PATH"
-export LD_LIBRARY_PATH="/home/.steamos/offload/nix/store/ah4525ca553drv47jhvgpl9sl87i7a1d-libxml2-2.13.8/lib:${LD_LIBRARY_PATH:-}"
 
 rebuild_with() {
   local flags="$1"

@@ -73,8 +73,7 @@ DEFAULT_CONFIG = {
         "Windows": "tools/extract-xiso/build/extract-xiso.exe",
     },
     "lib_dirs": {
-        "Linux": ["tools/rexglue-bin/linux-amd64/lib",
-                  "/home/.steamos/offload/nix/store/ah4525ca553drv47jhvgpl9sl87i7a1d-libxml2-2.13.8/lib"],
+        "Linux": ["tools/rexglue-bin/linux-amd64/lib"],
         "Windows": [],
     },
 }

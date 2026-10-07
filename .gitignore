@@ -98,3 +98,47 @@ tools/codegraph/*.sqlite
 
 # Native renderer offline tool outputs (binaries, SPIR-V sets, frame dumps)
 tools/native-renderer/out/
+
+# iOS source release: build, signing and runtime state stay local.
+/ios/simpsons/out/
+/ios/rexglue-sdk/out/
+/ios/game_xex/
+/ios/simpsons/game/
+/ios/simpsons/userdata/
+/ios/simpsons/cache/
+/ios/simpsons/generated/default/codegen.d
+/ios/simpsons/generated/default/codegen*.stamp
+/ios/rexglue-sdk/include/**/*.orig
+/ios/rexglue-sdk/thirdparty/vulkan-memory-allocator/bin/
+*.ipa
+*.mobileprovision
+*.p12
+*.pfx
+*.xcarchive
+*.dSYM/
+CMakeUserPresets.json
+!/ios/simpsons/ios/icons/*.png
+
+# Local credentials, editor state, profiling and compiled outputs.
+.env
+.env.*
+!.env.example
+!.env.sample
+xcuserdata/
+*.xcuserstate
+*.profraw
+*.profdata
+*.gcda
+*.gcno
+*.pch
+*.dylib
+*.a
+*.xtr
+*.sav
+*.save
+
+# Prebuilt desktop developer tools; source and licenses are retained.
+/tools/libtrap.so
+/tools/rexglue-sdk/tools/binutils/*
+!/tools/rexglue-sdk/tools/binutils/LICENSE
+/tools/rexglue-sdk/thirdparty/vulkan-memory-allocator/bin/

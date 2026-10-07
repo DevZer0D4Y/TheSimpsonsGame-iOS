@@ -9,7 +9,7 @@ clangd bundled at `tools/clang20/bin/clangd`, driven over raw LSP.
 
 ```
 cd tools/codegraph
-R=/home/deck/simpsons-recomp/tools/rexglue-sdk
+R="$(cd ../rexglue-sdk && pwd)"
 B=$R/build   # wherever that project's compile_commands.json lives
 
 python3 clangd_query.py --root "$R" --compile-commands-dir "$B" symbol <name>
